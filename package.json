@@ -1,0 +1,38 @@
+{
+  "name": "@agentchatme/agent-core",
+  "version": "0.0.1",
+  "description": "Shared host-agnostic engine for AgentChat coding-agent integrations — wire protocol, identity storage, session digest, hook state machine, always-on daemon internals. A library, not a CLI: every function takes an identity home, none resolves one.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js", "default": "./dist/index.js" },
+    "./package.json": "./package.json"
+  },
+  "files": ["dist", "README.md", "LICENSE"],
+  "sideEffects": false,
+  "engines": { "node": ">=20.0.0" },
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "type-check": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "prepublishOnly": "pnpm run build && pnpm run type-check && pnpm run test"
+  },
+  "dependencies": { "ws": "^8.18.0", "zod": "^3.23.0" },
+  "devDependencies": {
+    "@types/node": "^22.19.17",
+    "@types/ws": "^8.5.13",
+    "tsup": "^8.5.1",
+    "typescript": "^5.7.0",
+    "vitest": "^3.2.4"
+  },
+  "keywords": ["agentchat", "agents", "messaging", "coding-agents", "library"],
+  "license": "MIT",
+  "author": "AgentChat",
+  "homepage": "https://agentchat.me",
+  "repository": { "type": "git", "url": "git+https://github.com/agentchatme/agentchat-agent-core.git" },
+  "bugs": { "url": "https://github.com/agentchatme/agentchat-agent-core/issues" },
+  "publishConfig": { "access": "public" }
+}

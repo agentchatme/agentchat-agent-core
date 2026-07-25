@@ -1,0 +1,146 @@
+// ─── @agentchatme/agent-core ────────────────────────────────────────────────
+//
+// The shared engine behind every AgentChat coding-agent integration
+// (Claude Code, Codex, Cursor, OpenCode, …). A LIBRARY, not a CLI.
+//
+// The one rule that shapes this whole package:
+//
+//   Every function takes an identity home. None resolves one.
+//   Nothing here knows which coding agents exist.
+//
+// That rule is not stylistic. Before it, a single shared CLI served every
+// host, so its commands had to *decide* which agent they were acting on — and
+// a function that decides can decide wrong. In practice it did: registering
+// one coding agent rewrote another's identity file, and signing out of one
+// deleted the other's credentials and stripped its wiring, because one code
+// path served both.
+//
+// An integration built on this library is a single-host binary that knows its
+// own home at compile time. There is no platform flag, no host detection, and
+// no code path that could reach a different agent's files — the mistake is
+// unrepresentable rather than merely guarded against.
+//
+// What stays here: things that must NOT drift between integrations — the wire
+// protocol, credential format, digest text, the ack state machine, daemon
+// internals. What belongs to each integration: where its home is, which file
+// its anchor lives in, what JSON shape its hooks emit, and how to spawn a
+// headless turn of its runtime.
+
+// Wire protocol — the server contract. One implementation, everywhere.
+export {
+  syncPeek,
+  syncAck,
+  lastDeliveryId,
+  getMeLite,
+  contextOf,
+  markSessionActive,
+  clearSessionActive,
+  claimReply,
+  WireError,
+  type WireConfig,
+  type SyncRow,
+  type MessageContext,
+} from './wire/index.js'
+
+// Identity — credential + pending storage, always scoped to a given home.
+export {
+  DEFAULT_API_BASE,
+  credentialsPath,
+  pendingPath,
+  statePath,
+  readCredentials,
+  resolveIdentity,
+  writeCredentials,
+  clearCredentials,
+  readPending,
+  writePending,
+  clearPending,
+  type Credentials,
+  type ResolvedIdentity,
+  type PendingRegistration,
+} from './identity/credentials.js'
+
+// Per-session hook state (continuation cap, pending ack cursor).
+export {
+  readState,
+  writeState,
+  getContinuations,
+  recordContinuation,
+  resetSession,
+  setPendingAck,
+  takePendingAck,
+  shouldOfferRegistration,
+  recordRegistrationOffer,
+  type HookState,
+} from './identity/state.js'
+
+// Digest rendering — what the agent is actually told.
+export {
+  formatSessionStart,
+  formatStopPickup,
+  formatRegistrationOffer,
+  formatAlwaysOnDown,
+  type HostCopy,
+} from './digest/summary.js'
+
+// Instruction-file anchor — fenced-block editing against an explicit path.
+export {
+  ANCHOR_START,
+  ANCHOR_END,
+  renderAnchorBlock,
+  writeAnchor,
+  removeAnchorAt,
+  hasAnchorAt,
+  readAnchorHandleAt,
+  readAnchorHandleFrom,
+  upsertAnchorBlock,
+  stripAnchorBlock,
+  type AnchorAction,
+} from './anchor/block.js'
+
+// Session hooks — decisions in, host JSON out (the integration formats).
+export {
+  sessionStart,
+  userPrompt,
+  stop,
+  hooksDisabled,
+  type HookContext,
+  type SessionStartResult,
+  type StopResult,
+} from './hooks/engine.js'
+
+export { readHookInput, type HookInput } from './hooks/hook-input.js'
+
+// Always-on daemon internals.
+export {
+  markAlwaysOnWanted,
+  clearAlwaysOnWanted,
+  alwaysOnWanted,
+  alwaysOnHealth,
+  beat,
+  HEARTBEAT_FILE,
+} from './daemon/health.js'
+
+export { acquireLeaderLock, type LockHandle } from './daemon/leader-lock.js'
+export {
+  installService,
+  uninstallService,
+  serviceStatus,
+  planForTest,
+  type ServiceOpts,
+} from './daemon/service.js'
+
+// Live WebSocket delivery + the reply-coordination the daemon uses to stand
+// down for a live session. The runtime ADAPTER (how to spawn a headless turn
+// of this host) is deliberately NOT here — it is the one part of the daemon
+// that differs per coding agent, so each integration implements
+// `RuntimeAdapter` itself.
+export { AgentWsClient, type WsClientEvents } from './daemon/ws-client.js'
+export { ReplyCoord, type CoordConfig } from './daemon/coord.js'
+export { parseInbound, senderOf } from './daemon/frames.js'
+export { describeConversation, describeSender } from './daemon/format.js'
+export type { RuntimeAdapter, TurnContext, TurnResult } from './daemon/adapter-types.js'
+
+// Utilities integrations legitimately share.
+export { log } from './util/log.js'
+export { atomicWriteFile, readJsonFile } from './util/fsutil.js'

@@ -1,0 +1,61 @@
+name: publish
+
+# OIDC trusted publishing for @agentchatme/agent-core, gated by a human
+# approval — same model as every other AgentChat package. No tokens.
+#
+# ONE-TIME npm setup (package owner, on npmjs.com) BEFORE the first tag:
+#   Trusted Publisher for @agentchatme/agent-core → repo
+#   agentchatme/agentchat-agent-core, workflow publish.yml (bare filename),
+#   environment npm-publish, allowed action "npm publish". Confirm the saved
+#   summary card renders — npm silently discards unconfirmed saves and only
+#   validates at publish time (mismatches surface as E404 on PUT).
+#
+# Release flow: bump package.json → tag `v<version>` → push → approve.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --no-frozen-lockfile
+      - run: pnpm type-check
+      - run: pnpm build
+      - run: pnpm test
+      - name: tag matches package version
+        run: |
+          pkg="v$(node -p "require('./package.json').version")"
+          [ "$pkg" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME != package $pkg"; exit 1; }
+
+  publish:
+    needs: gate
+    runs-on: ubuntu-latest
+    environment: npm-publish
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          registry-url: https://registry.npmjs.org
+      - run: npm install -g npm@latest
+      - run: pnpm install --no-frozen-lockfile
+      - run: pnpm build
+      - run: npm publish --provenance --access public
