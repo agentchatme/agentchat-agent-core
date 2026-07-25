@@ -359,7 +359,7 @@ export function installService(opts: ServiceOpts): void {
 }
 
 export function uninstallService(opts: ServiceOpts): void {
-  const label = `agentchatd-${opts.label}`
+  const label = opts.label
   const wm = winMode()
   if (wm) return uninstallWindows(label, wm)
   if (process.platform === 'linux') return uninstallSystemd(label)
@@ -368,7 +368,7 @@ export function uninstallService(opts: ServiceOpts): void {
 }
 
 export function serviceStatus(opts: ServiceOpts): string {
-  const label = `agentchatd-${opts.label}`
+  const label = opts.label
   const wm = winMode()
   if (wm) return statusWindows(label, wm)
   if (process.platform === 'linux') return statusSystemd(label)
@@ -392,7 +392,7 @@ function unitInstalled(label: string): boolean {
 }
 
 export function disableService(opts: ServiceOpts): void {
-  const label = `agentchatd-${opts.label}`
+  const label = opts.label
   if (!unitInstalled(label)) {
     throw new Error(`no ${opts.label} daemon installed — nothing to disable (run install first)`)
   }
@@ -411,7 +411,7 @@ export function disableService(opts: ServiceOpts): void {
 }
 
 export function enableService(opts: ServiceOpts): void {
-  const label = `agentchatd-${opts.label}`
+  const label = opts.label
   if (!unitInstalled(label)) {
     throw new Error(`no ${opts.label} daemon installed — run install first`)
   }
