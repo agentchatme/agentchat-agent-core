@@ -11,6 +11,11 @@
       "import": "./dist/index.js",
       "default": "./dist/index.js"
     },
+    "./daemon": {
+      "types": "./dist/daemon-entry.d.ts",
+      "import": "./dist/daemon-entry.js",
+      "default": "./dist/daemon-entry.js"
+    },
     "./package.json": "./package.json"
   },
   "files": [

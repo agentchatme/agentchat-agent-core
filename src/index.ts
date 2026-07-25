@@ -130,17 +130,11 @@ export {
   type ServiceOpts,
 } from './daemon/service.js'
 
-// Live WebSocket delivery + the reply-coordination the daemon uses to stand
-// down for a live session. The runtime ADAPTER (how to spawn a headless turn
-// of this host) is deliberately NOT here — it is the one part of the daemon
-// that differs per coding agent, so each integration implements
-// `RuntimeAdapter` itself.
-export { AgentWsClient, type WsClientEvents } from './daemon/ws-client.js'
-export { ReplyCoord, type CoordConfig } from './daemon/coord.js'
-export { parseInbound, senderOf } from './daemon/frames.js'
-export { describeConversation, describeSender } from './daemon/format.js'
-export type { RuntimeAdapter, TurnContext, TurnResult } from './daemon/adapter-types.js'
+// The daemon's socket layer lives at `@agentchatme/agent-core/daemon`, not
+// here: it depends on `ws` (CommonJS, dynamic require), which must never be
+// bundled into an integration's CLI.
 
 // Utilities integrations legitimately share.
 export { log } from './util/log.js'
+export { relativeAge, absoluteUtc, relativeWhen, formatWhen } from './util/when.js'
 export { atomicWriteFile, readJsonFile } from './util/fsutil.js'
