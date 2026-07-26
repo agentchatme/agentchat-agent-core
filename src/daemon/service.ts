@@ -19,10 +19,36 @@ import { log } from '../util/log.js'
 // integrations' services from ever colliding on a name or clobbering each
 // other's unit file. Convention is `agentchatd-<integration>`.
 
-export interface ServiceOpts {
+/**
+ * Enough to ADDRESS an already-installed service. Removing one or reading its
+ * status needs only its name — deliberately a narrower type than install, so
+ * `uninstall` and `status` cannot be made to depend on a daemon entry they have
+ * no use for.
+ */
+export interface ServiceRef {
   /** Unit/service name, e.g. `agentchatd-codex`. Must be unique per integration. */
   label: string
   home: string
+}
+
+export interface ServiceOpts extends ServiceRef {
+  /**
+   * Absolute path to the integration's DAEMON bundle — the script this service
+   * runs. Required, and deliberately not defaulted.
+   *
+   * It used to default to `process.argv[1]`, i.e. whichever binary happened to
+   * call `install`. That was the CLI, which has no daemon in it, so every
+   * installed unit ran a command that exited 1 and then restart-looped forever
+   * under `KeepAlive`/`Restart=on-failure` while the CLI cheerfully reported
+   * "Always-on is ON". Making the caller name the entry is what stops a service
+   * from being installed against a script that cannot serve it.
+   *
+   * Must also be a STABLE path. A plugin's own bundle lives in a
+   * version-scoped cache directory that the next upgrade deletes, so an
+   * integration distributed that way copies itself somewhere durable first and
+   * passes that copy here.
+   */
+  entry: string
   /** Host-specific env the service must see because a systemd/launchd service
    *  does NOT inherit the login shell (e.g. CODEX_HOME). PATH is captured
    *  automatically. */
@@ -32,7 +58,7 @@ export interface ServiceOpts {
 interface Plan {
   label: string // service/unit name
   node: string // absolute node path
-  bin: string // absolute daemon entry (dist/index.js)
+  bin: string // absolute daemon entry, supplied by the integration
   home: string
   /** Host env captured from the current shell so the service sees the same
    *  CODEX_HOME / CLAUDE_CONFIG_DIR the user installed under. */
@@ -58,7 +84,7 @@ function plan(opts: ServiceOpts): Plan {
   return {
     label: opts.label,
     node: process.execPath,
-    bin: process.argv[1] ?? '',
+    bin: path.resolve(opts.entry),
     home: path.resolve(opts.home),
     env,
   }
@@ -87,7 +113,7 @@ function systemdUnit(p: Plan): string {
     '',
     '[Service]',
     'Type=simple',
-    `ExecStart=${p.node} ${p.bin} start --home ${p.home}`,
+    `ExecStart=${p.node} ${p.bin} --home ${p.home}`,
     ...(envLines ? [envLines] : []),
     'Restart=on-failure',
     'RestartSec=5',
@@ -136,7 +162,7 @@ function launchdPlistPath(label: string): string {
 const launchdLabel = (label: string): string => `me.agentchat.${label}`
 
 function launchdPlist(p: Plan): string {
-  const args = [p.node, p.bin, 'start', '--home', p.home]
+  const args = [p.node, p.bin, '--home', p.home]
   const argXml = args.map((a) => `    <string>${a}</string>`).join('\n')
   const envXml = Object.entries(p.env)
     .map(([k, v]) => `    <key>${k}</key><string>${v}</string>`)
@@ -259,14 +285,14 @@ export function launcherVbs(command: string, env: Record<string, string>): strin
 
 /** Native-Windows launch command. */
 export function winCommandNative(p: Plan): string {
-  return `"${p.node}" "${p.bin}" start --home "${p.home}"`
+  return `"${p.node}" "${p.bin}" --home "${p.home}"`
 }
 
 /** The bash script WSL runs — a login-shell env plus the daemon. */
 export function wslScriptContent(p: Plan): string {
   const exports = Object.entries(p.env).map(([k, v]) => `export ${k}=${shQuote(v)}`)
   return (
-    ['#!/bin/bash', ...exports, `exec ${shQuote(p.node)} ${shQuote(p.bin)} start --home ${shQuote(p.home)}`].join(
+    ['#!/bin/bash', ...exports, `exec ${shQuote(p.node)} ${shQuote(p.bin)} --home ${shQuote(p.home)}`].join(
       '\n',
     ) + '\n'
   )
@@ -350,7 +376,7 @@ function statusWindows(label: string, mode: WinMode): string {
 
 export function installService(opts: ServiceOpts): void {
   const p = plan(opts)
-  if (!p.bin) throw new Error('could not resolve the daemon entrypoint (process.argv[1])')
+  if (!p.bin) throw new Error('no daemon entrypoint given (ServiceOpts.entry)')
   const wm = winMode()
   if (wm) return installWindows(p, wm)
   if (process.platform === 'linux') return installSystemd(p) // native Linux (not WSL)
@@ -358,7 +384,7 @@ export function installService(opts: ServiceOpts): void {
   throw new Error(`service install is not supported on ${process.platform} — run \`agentchatd start\` under your own supervisor`)
 }
 
-export function uninstallService(opts: ServiceOpts): void {
+export function uninstallService(opts: ServiceRef): void {
   const label = opts.label
   const wm = winMode()
   if (wm) return uninstallWindows(label, wm)
@@ -367,7 +393,7 @@ export function uninstallService(opts: ServiceOpts): void {
   throw new Error(`service uninstall is not supported on ${process.platform}`)
 }
 
-export function serviceStatus(opts: ServiceOpts): string {
+export function serviceStatus(opts: ServiceRef): string {
   const label = opts.label
   const wm = winMode()
   if (wm) return statusWindows(label, wm)

@@ -17,3 +17,10 @@ export { ReplyCoord, type CoordConfig } from './daemon/coord.js'
 export { parseInbound, senderOf } from './daemon/frames.js'
 export { describeConversation, describeSender } from './daemon/format.js'
 export type { RuntimeAdapter, TurnContext, TurnResult } from './daemon/adapter-types.js'
+
+// The loop and its entrypoint. `runDaemon` is the whole surface a normal
+// integration needs — `Daemon` and `resolveDaemonConfig` are exported for
+// tests and for anything that wants to drive the loop itself.
+export { runDaemon, type RunDaemonOpts } from './daemon/run.js'
+export { Daemon } from './daemon/loop.js'
+export { resolveDaemonConfig, wsUrlFor, type DaemonConfig, type ResolveDaemonOpts } from './daemon/config.js'

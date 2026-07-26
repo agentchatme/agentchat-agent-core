@@ -128,6 +128,7 @@ export {
   serviceStatus,
   planForTest,
   type ServiceOpts,
+  type ServiceRef,
 } from './daemon/service.js'
 
 // The daemon's socket layer lives at `@agentchatme/agent-core/daemon`, not

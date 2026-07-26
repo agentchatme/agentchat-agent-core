@@ -206,7 +206,7 @@ describe('always-on health is per agent', () => {
 describe('service units are named exactly as the integration asks', () => {
   it('uses the label verbatim — no re-prefixing', async () => {
     const { planForTest } = await import('../src/daemon/service.js')
-    const p = planForTest({ label: 'agentchatd-codex', home: homeA })
+    const p = planForTest({ label: 'agentchatd-codex', home: homeA, entry: '/opt/x/daemon.js' })
     // Re-prefixing produced `agentchatd-agentchatd-codex`, so uninstall and
     // status silently addressed a unit that never existed.
     expect(p.label).toBe('agentchatd-codex')
@@ -214,7 +214,12 @@ describe('service units are named exactly as the integration asks', () => {
 
   it('captures the host env the integration says its adapter needs', async () => {
     const { planForTest } = await import('../src/daemon/service.js')
-    const p = planForTest({ label: 'agentchatd-codex', home: homeA, env: { CODEX_HOME: '/custom/codex' } })
+    const p = planForTest({
+      label: 'agentchatd-codex',
+      home: homeA,
+      entry: '/opt/x/daemon.js',
+      env: { CODEX_HOME: '/custom/codex' },
+    })
     expect(p.env['CODEX_HOME']).toBe('/custom/codex')
     // PATH is always captured: a systemd/launchd unit does not inherit the
     // login shell, so without it the adapter cannot find its runtime binary.
