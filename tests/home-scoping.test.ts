@@ -25,6 +25,7 @@ import {
   markAlwaysOnWanted,
   clearAlwaysOnWanted,
   alwaysOnHealth,
+  alwaysOnState,
   beat,
 } from '../src/daemon/health.js'
 
@@ -172,25 +173,56 @@ describe('hook state is scoped to the home it is given', () => {
   })
 })
 
+const signIn = (home: string): void =>
+  fs.writeFileSync(
+    path.join(home, 'credentials'),
+    JSON.stringify({ api_key: 'ac_live_' + 'a'.repeat(40), handle: 'probe' }),
+  )
+const signOut = (home: string): void => fs.rmSync(path.join(home, 'credentials'), { force: true })
+
 describe('always-on health is per agent', () => {
   it('reports not-wanted until the user opts in', () => {
     expect(alwaysOnHealth(homeA)).toEqual({ wanted: false, healthy: true })
   })
 
-  it('wanted with no beacon reads as down', () => {
+  // Installed but signed out is the daemon behaving correctly — it is resident
+  // and idling, waiting for a sign-in. Reporting that as "down" nagged a
+  // signed-out user every single session about a non-problem.
+  it('installed with no identity reads as idle, not down', () => {
     markAlwaysOnWanted(homeA)
+    expect(alwaysOnState(homeA)).toBe('idle')
+    expect(alwaysOnHealth(homeA).healthy).toBe(true)
+  })
+
+  it('an identity with no beacon reads as down — the only state worth warning about', () => {
+    markAlwaysOnWanted(homeA)
+    signIn(homeA)
+    expect(alwaysOnState(homeA)).toBe('down')
     expect(alwaysOnHealth(homeA)).toEqual({ wanted: true, healthy: false })
   })
 
-  it('wanted with a fresh beacon reads as healthy', () => {
+  it('an identity with a fresh beacon reads as connected', () => {
     markAlwaysOnWanted(homeA)
+    signIn(homeA)
     beat(homeA)
+    expect(alwaysOnState(homeA)).toBe('connected')
     expect(alwaysOnHealth(homeA)).toEqual({ wanted: true, healthy: true })
+  })
+
+  it('signing out returns it to idle rather than down', () => {
+    markAlwaysOnWanted(homeA)
+    signIn(homeA)
+    beat(homeA)
+    expect(alwaysOnState(homeA)).toBe('connected')
+    signOut(homeA)
+    expect(alwaysOnState(homeA)).toBe('idle')
   })
 
   it('one agent being down says nothing about the other', () => {
     markAlwaysOnWanted(homeA)
     markAlwaysOnWanted(homeB)
+    signIn(homeA)
+    signIn(homeB)
     beat(homeB)
     expect(alwaysOnHealth(homeA).healthy).toBe(false)
     expect(alwaysOnHealth(homeB).healthy).toBe(true)

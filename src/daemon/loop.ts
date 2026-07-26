@@ -44,6 +44,9 @@ export class Daemon {
     private readonly cfg: DaemonConfig,
     private readonly adapter: RuntimeAdapter,
     ws?: AgentWsClient, // injectable for tests; defaults to a real socket
+    /** Called when the socket gives up for good (auth refused). The supervisor
+     *  above decides what happens next — this class does not end the process. */
+    private readonly onTerminal?: (reason: string) => void,
   ) {
     // Stable holder token: the same across a restart on THIS host, so a
     // restarted daemon re-claims its own in-flight messages instead of being
@@ -60,9 +63,13 @@ export class Daemon {
     // for the first interval tick to prove we're live).
     this.ws.on('ready', () => beat(this.cfg.home))
     this.ws.on('terminal', (reason: string) => {
+      // Auth refused. Do NOT end the process: this daemon is resident, and a
+      // rejected key is a state to sit out, not to die from — the user may sign
+      // in again with a good one. Setting process.exitCode here made the
+      // service manager restart the whole thing on a loop instead.
       log.error(`daemon terminal: ${reason}`)
       this.stop()
-      process.exitCode = 1
+      this.onTerminal?.(reason)
     })
   }
 

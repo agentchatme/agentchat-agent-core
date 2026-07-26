@@ -167,7 +167,8 @@ export function formatRegistrationOffer(copy: HostCopy): string {
     `  • They have its API key (ac_…):  ${invoke} login --api-key <ac_…>`,
     `  • They lost the key:  ${invoke} recover --email <email>, then relay the emailed 6-digit code: ${invoke} recover --code <code>`,
     '',
-    `Then, either way, turn on always-on so you stay reachable when they're away: ${invoke} daemon install (on by default; they can say "go session-only" any time → ${invoke} daemon disable).`,
+    '',
+    "Always-on is already running — this agent answers DMs even when no session is open. There is nothing to switch on, so do not offer to.",
     '',
     'Do not push the offer — one short ask is plenty. If declined, drop the topic for the rest of the session.',
   ].join('\n')

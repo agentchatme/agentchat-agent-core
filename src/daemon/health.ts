@@ -45,6 +45,40 @@ export function alwaysOnWanted(home: string): boolean {
   return fs.existsSync(path.join(home, ALWAYS_ON_WANTED))
 }
 
+// ─── Deliberate opt-out ─────────────────────────────────────────────────────
+//
+// Always-on is registered as part of installing the integration, not as a
+// separate opt-in. That makes "the user turned this off" a decision we have to
+// REMEMBER — otherwise the next install, upgrade or session quietly switches it
+// back on, which is the one behaviour that would genuinely anger someone.
+//
+// `wanted` cannot carry this: it is false both for "never set up" and for
+// "switched off", and those must lead to opposite actions.
+const ALWAYS_ON_OPTOUT = 'always-on.optout'
+
+/** Remember that the user switched always-on off. Survives re-install. */
+export function markAlwaysOnOptOut(home: string): void {
+  try {
+    fs.mkdirSync(home, { recursive: true })
+    fs.writeFileSync(path.join(home, ALWAYS_ON_OPTOUT), new Date().toISOString())
+  } catch {
+    /* non-fatal: worst case a later install re-enables it */
+  }
+}
+
+/** Cleared only by an explicit `daemon install` — never implicitly. */
+export function clearAlwaysOnOptOut(home: string): void {
+  try {
+    fs.rmSync(path.join(home, ALWAYS_ON_OPTOUT), { force: true })
+  } catch {
+    /* non-fatal */
+  }
+}
+
+export function alwaysOnOptedOut(home: string): boolean {
+  return fs.existsSync(path.join(home, ALWAYS_ON_OPTOUT))
+}
+
 /** Touch the liveness beacon. Called by the running daemon. */
 export function beat(home: string): void {
   try {
@@ -55,18 +89,51 @@ export function beat(home: string): void {
   }
 }
 
+/** Clear the beacon. The daemon calls this whenever it is resident but NOT
+ *  connected, so "idle" is never mistaken for "beating". */
+export function idle(home: string): void {
+  try {
+    fs.rmSync(path.join(home, HEARTBEAT_FILE), { force: true })
+  } catch {
+    /* non-fatal — a stale beacon only risks a false "healthy" for 3 minutes */
+  }
+}
+
 /**
- * The health the session-start hook acts on. `wanted:false` means the user
- * never opted into always-on (or turned it off) → the hook stays silent.
- * `wanted:true, healthy:false` means always-on was set up but the daemon isn't
- * beating → the hook warns. Pure reads (two stats), no subprocess, never throws.
+ * Always-on has THREE states, not two.
+ *
+ * It used to be a boolean pair, which could not tell "idle because nobody is
+ * signed in" apart from "installed and broken" — so a signed-out user would be
+ * nagged every session about a daemon that was behaving exactly as intended.
+ *
+ *   off       — the service is not installed (or was explicitly disabled).
+ *   idle      — installed and resident, but there is no identity to serve.
+ *               Correct and quiet: the daemon is waiting for a sign-in.
+ *   connected — holding the wire; the beacon is fresh.
+ *   down      — there IS an identity and the service is installed, but nothing
+ *               is beating. The only state worth telling a session about.
+ *
+ * Pure reads, no subprocess, never throws.
  */
-export function alwaysOnHealth(home: string): { wanted: boolean; healthy: boolean } {
-  if (!alwaysOnWanted(home)) return { wanted: false, healthy: true }
+export type AlwaysOnState = 'off' | 'idle' | 'connected' | 'down'
+
+export function alwaysOnState(home: string): AlwaysOnState {
+  if (!alwaysOnWanted(home)) return 'off'
+  // No credentials → the daemon is supposed to be idling.
+  if (!fs.existsSync(path.join(home, 'credentials'))) return 'idle'
   try {
     const age = Date.now() - fs.statSync(path.join(home, HEARTBEAT_FILE)).mtimeMs
-    return { wanted: true, healthy: age <= HEARTBEAT_STALE_MS }
+    return age <= HEARTBEAT_STALE_MS ? 'connected' : 'down'
   } catch {
-    return { wanted: true, healthy: false } // no beacon → never started, or long dead
+    return 'down' // no beacon → never started, or long dead
   }
+}
+
+/**
+ * Back-compatible view for callers that only need "should I warn?".
+ * `healthy` is false ONLY in the `down` state — an idle daemon is healthy.
+ */
+export function alwaysOnHealth(home: string): { wanted: boolean; healthy: boolean } {
+  const state = alwaysOnState(home)
+  return { wanted: state !== 'off', healthy: state !== 'down' }
 }

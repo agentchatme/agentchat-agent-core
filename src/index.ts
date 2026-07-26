@@ -128,8 +128,14 @@ export {
   markAlwaysOnWanted,
   clearAlwaysOnWanted,
   alwaysOnWanted,
+  markAlwaysOnOptOut,
+  clearAlwaysOnOptOut,
+  alwaysOnOptedOut,
   alwaysOnHealth,
+  alwaysOnState,
+  type AlwaysOnState,
   beat,
+  idle,
   HEARTBEAT_FILE,
 } from './daemon/health.js'
 
