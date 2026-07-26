@@ -29,9 +29,20 @@ Neither bug came from sharing protocol code. Both came from a single command sur
 |---|---|
 | Wire protocol — `sync` / `sync/ack`, reply coordination | Where its identity home is |
 | Credential + pending file format | Which file its anchor lives in |
-| Session digest text | What JSON shape its hooks emit |
-| Hook state machine (continuation cap, ack cursor) | How to spawn a headless turn of its runtime |
-| Daemon internals — WS client, leader lock, service install | Its packaging and front door |
+| Identity flows — register / login / recover / status / logout / doctor | How to render its anchor |
+| Session digest text | What JSON shape its hooks emit (`dialect`) |
+| Hook state machine (continuation cap, ack cursor) | How to spawn a headless turn of its runtime (`RuntimeAdapter`) |
+| Daemon — the loop, WS client, leader lock, service install | Its packaging and front door |
+
+The test for which column something belongs in: **if changing it requires a
+matching change on the server, it lives here; if changing it requires reading
+the harness's docs, it lives in the integration.**
+
+That line was drawn in the wrong place once already. The identity flows started
+out in each integration, and one week and two integrations in the copies were
+94% identical (505 vs 515 lines) and had already drifted — the Claude Code copy
+reported `"host": "codex"` in `status --json`. They are a contract with the
+AgentChat server, not a fact about a coding agent, so they moved here.
 
 The wire protocol is the thing worth sharing: two hand-maintained copies of the same server contract is how the TypeScript and Python SDKs once drifted apart on `/v1/messages/sync` and both got it wrong for weeks.
 
@@ -47,17 +58,39 @@ Rows without an ackable `delivery_id` are never surfaced — they could only re-
 
 ## Usage
 
-```ts
-import { sessionStart, resolveIdentity, type HookContext } from '@agentchatme/agent-core'
+An integration describes itself once and gets the flows back:
 
-// An integration knows its own home. It never asks which one to use.
-const ctx: HookContext = {
-  home: myIdentityHome(),                       // e.g. `${CODEX_HOME}/agentchat`
-  copy: { invoke: 'npx -y @agentchatme/codex', label: 'Codex' },
+```ts
+import { createIdentityCommands, createHookRunners, type HostProfile } from '@agentchatme/agent-core'
+
+// A profile describes THIS agent. There is no field naming another host, so
+// the commands built from it can reach exactly one home.
+const profile: HostProfile = {
+  label: 'Codex',
+  id: 'codex',
+  home: () => `${codexHome()}/agentchat`,
+  anchorFile: () => `${codexHome()}/AGENTS.md`,
+  invocation: () => 'npx -y @agentchatme/codex',
+  renderAnchor: (handle) => renderMyAnchor(handle),
 }
 
-const { context } = await sessionStart(ctx, input)
-if (context !== null) emitInMyHostsDialect(context)
+const { runRegister, runStatus, runLogout, runDoctor } = createIdentityCommands(profile)
+const { runSessionStart, runStop } = createHookRunners(
+  () => ({ home: profile.home(), copy: { invoke: profile.invocation(), label: profile.label } }),
+  myHostsDialect,          // how THIS host wants hook JSON shaped
+)
+```
+
+The always-on daemon is one call, from the `/daemon` subpath — kept out of the
+main entry because it bundles `ws` (CommonJS), which must never reach an
+integration's CLI:
+
+```ts
+import { runDaemon } from '@agentchatme/agent-core/daemon'
+
+// `adapter` is the one genuinely host-specific piece: how to spawn one
+// headless turn of this coding agent.
+await runDaemon({ home: profile.home(), adapter: new MyRuntimeAdapter(...) })
 ```
 
 ## Development
@@ -66,7 +99,9 @@ if (context !== null) emitInMyHostsDialect(context)
 pnpm install
 pnpm build
 pnpm test        # incl. tests/home-scoping.test.ts — drives every operation
-                 # against two homes and asserts the other is byte-identical
+                 # against two homes and asserts the other is byte-identical,
+                 # and tests/core-is-host-agnostic.test.ts, which fails the
+                 # build if this package ever names a coding agent in code
 pnpm type-check
 ```
 

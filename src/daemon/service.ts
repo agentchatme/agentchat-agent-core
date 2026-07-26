@@ -95,6 +95,23 @@ function run(cmd: string, args: string[]): { ok: boolean; out: string } {
   return { ok: !r.error && r.status === 0, out: `${r.stdout ?? ''}${r.stderr ?? ''}`.trim() }
 }
 
+/**
+ * Write the unit file but do NOT hand it to the OS service manager.
+ *
+ * `HOME` sandboxes where the unit file lands, but it does not sandbox
+ * `launchctl` or `systemctl` — those always address the real user's domain. So
+ * a test that exercises `daemon install` registers a REAL service on the
+ * developer's machine, pointed at a temp directory that is about to be deleted.
+ * That happened, and it left two loaded launchd jobs behind.
+ *
+ * With this set, everything up to registration still runs and can be asserted
+ * on; only the escaping side effect is skipped.
+ */
+function registrationSkipped(): boolean {
+  const v = process.env['AGENTCHAT_SERVICE_DRY_RUN']
+  return v !== undefined && v !== '' && v !== '0'
+}
+
 // ─── systemd (Linux) ─────────────────────────────────────────────────────────
 
 function systemdUnitPath(label: string): string {
@@ -129,6 +146,7 @@ function installSystemd(p: Plan): void {
   fs.mkdirSync(path.dirname(unitPath), { recursive: true })
   fs.writeFileSync(unitPath, systemdUnit(p))
   log.info(`wrote ${unitPath}`)
+  if (registrationSkipped()) return
   run('systemctl', ['--user', 'daemon-reload'])
   // enable-linger keeps user services running with no active login (VPS).
   const linger = run('loginctl', ['enable-linger', os.userInfo().username])
@@ -191,6 +209,7 @@ function installLaunchd(p: Plan): void {
   fs.mkdirSync(path.dirname(plistPath), { recursive: true })
   fs.writeFileSync(plistPath, launchdPlist(p))
   log.info(`wrote ${plistPath}`)
+  if (registrationSkipped()) return
   run('launchctl', ['unload', plistPath]) // idempotent: clear a prior load
   const loaded = run('launchctl', ['load', '-w', plistPath])
   if (!loaded.ok) throw new Error(`launchctl load failed: ${loaded.out}`)
@@ -341,6 +360,7 @@ function enableWindows(label: string, mode: WinMode): void {
   fs.mkdirSync(startup, { recursive: true })
   const startupVbs = path.join(startup, `${label}.vbs`)
   fs.copyFileSync(masterVbs, startupVbs)
+  if (registrationSkipped()) return
   if (mode === 'win32') startDetached('wscript.exe', [startupVbs])
   else startDetached('cmd.exe', ['/c', 'start', '', '/b', 'wscript.exe', winPathFromWsl(startupVbs)])
 }
