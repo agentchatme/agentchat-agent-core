@@ -110,6 +110,18 @@ export {
 } from './hooks/engine.js'
 
 export { readHookInput, type HookInput } from './hooks/hook-input.js'
+export { createHookRunners, type HookDialect, type HookRunners } from './hooks/runners.js'
+
+// The identity command set. An integration describes itself once (HostProfile)
+// and gets register/login/recover/status/logout/doctor back, rather than
+// carrying its own copy of a server contract.
+export {
+  createIdentityCommands,
+  type IdentityCommands,
+  type RegisterOpts,
+  type DoctorOpts,
+} from './identity/commands.js'
+export { anchorLabelOf, type HostProfile, type DoctorCheck, type Verdict } from './identity/host-profile.js'
 
 // Always-on daemon internals.
 export {
