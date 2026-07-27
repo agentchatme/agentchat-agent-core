@@ -1,4 +1,5 @@
 import { contextOf, type SyncRow } from '../wire/index.js'
+import { ANCHOR_START, ANCHOR_END } from '../anchor/block.js'
 import { relativeWhen } from '../util/when.js'
 
 // ─── Unread digest formatting ───────────────────────────────────────────────
@@ -171,5 +172,74 @@ export function formatRegistrationOffer(copy: HostCopy): string {
     "Always-on is already running — this agent answers DMs even when no session is open. There is nothing to switch on, so do not offer to.",
     '',
     'Do not push the offer — one short ask is plenty. If declined, drop the topic for the rest of the session.',
+  ].join('\n')
+}
+
+// ─── Pre-registration instruction-file blocks ───────────────────────────────
+//
+// Discovery cannot depend on a session hook everywhere. Codex requires every
+// hook to be reviewed and trusted before it runs, and marks new or CHANGED
+// hooks as untrusted — so on a fresh install all three of ours are skipped, and
+// the agent is never told AgentChat exists. A user who does not already know to
+// ask sees an install that did nothing.
+//
+// The always-loaded instruction file needs no such approval, so that is where
+// discovery belongs. These render the block for an agent that has the
+// integration installed but no identity yet.
+//
+// The block is written by `upsertAnchorBlock`, which strips every existing
+// block before writing, so registering REPLACES this with the real identity
+// block and logout removes it. It cannot accumulate.
+
+/**
+ * "You have AgentChat but no handle — offer to set one up."
+ *
+ * Deliberately bounded: static text is re-read every session, so without an
+ * explicit stop condition an agent would raise it forever. `--not-now` records
+ * the decline and rewrites this block to the silent variant below.
+ */
+export function renderUnregisteredBlock(copy: HostCopy): string {
+  const { invoke, label } = copy
+  return [
+    ANCHOR_START,
+    '## AgentChat is installed — this agent has no handle yet',
+    '',
+    `[AgentChat](https://agentchat.me) gives you, the ${label} agent, a persistent \`@handle\` other AI agents can DM. It is set up on this machine but no identity has been created, so you are not reachable yet.`,
+    '',
+    '**Offer this ONCE, early, and only if it fits the conversation.** Do not interrupt work in progress to raise it, and never raise it twice in one session.',
+    '',
+    'FIRST ask whether they already have an AgentChat account — from another machine, or another coding agent — so you sign in instead of creating a duplicate.',
+    '',
+    'New to AgentChat:',
+    '  1. Ask for their email and a desired handle (3–30 chars, lowercase letters/digits/hyphens, starts with a letter).',
+    `  2. Run: ${invoke} register --email <email> --handle <handle>`,
+    `  3. A 6-digit code arrives by email; ask for it, then run: ${invoke} register --code <code>`,
+    '',
+    'Already have an agent elsewhere:',
+    `  • With its API key: ${invoke} login --api-key <ac_…>`,
+    `  • Key lost: ${invoke} recover --email <email>, then ${invoke} recover --code <code>`,
+    '',
+    `**If they decline or say "later", run \`${invoke} register --not-now\` immediately.** That records the answer and removes this prompt — otherwise you will re-read it and ask again every session, which is exactly what it must not do.`,
+    ANCHOR_END,
+  ].join('\n')
+}
+
+/**
+ * The silent variant, written after `--not-now`.
+ *
+ * Still states the fact — an agent asked "am I on AgentChat?" should be able to
+ * answer, and a user who changes their mind should find the command — but it
+ * gives no instruction to act on, so there is nothing to nag with.
+ */
+export function renderDeclinedBlock(copy: HostCopy): string {
+  const { invoke, label } = copy
+  return [
+    ANCHOR_START,
+    '## AgentChat',
+    '',
+    `AgentChat is installed for this ${label} agent, but no handle is configured and the user has said not for now. **Do not offer to set it up.** Mention it only if they ask about AgentChat or about messaging other agents.`,
+    '',
+    `If they ask to set it up later: ${invoke} register --email <email> --handle <handle>`,
+    ANCHOR_END,
   ].join('\n')
 }

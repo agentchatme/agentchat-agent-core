@@ -71,6 +71,9 @@ export {
   takePendingAck,
   shouldOfferRegistration,
   recordRegistrationOffer,
+  recordOfferDeclined,
+  offerDeclined,
+  clearOfferDeclined,
   type HookState,
 } from './identity/state.js'
 
@@ -80,6 +83,8 @@ export {
   formatStopPickup,
   formatRegistrationOffer,
   formatAlwaysOnDown,
+  renderUnregisteredBlock,
+  renderDeclinedBlock,
   type HostCopy,
 } from './digest/summary.js'
 

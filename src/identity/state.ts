@@ -38,6 +38,11 @@ const StateSchema = z.object({
   // session-start hook. Keeps the unregistered-plugin nag to once a day
   // instead of once per session.
   last_offer_at: z.string().optional(),
+  // Set when the user has said "not now" to setting up a handle. Unlike the
+  // cooldown above this is PERMANENT until they change their mind, because the
+  // prompt that needs suppressing lives in the always-loaded instruction file
+  // and would otherwise be re-read — and re-acted on — every single session.
+  offer_declined_at: z.string().optional(),
 })
 
 export type HookState = z.infer<typeof StateSchema>
@@ -127,5 +132,31 @@ export function shouldOfferRegistration(home: string, now: Date = new Date()): b
 export function recordRegistrationOffer(home: string, now: Date = new Date()): void {
   const state = readState(home)
   state.last_offer_at = now.toISOString()
+  writeState(home, state)
+}
+
+/**
+ * The user said "not now".
+ *
+ * A hook-injected offer could rely on a 24-hour cooldown, because the hook
+ * re-runs and can consult state. A prompt written into the always-loaded
+ * instruction file cannot: it is static text the agent re-reads every session,
+ * with no memory that it was already declined. So the decline has to be
+ * recorded here, and the instruction file rewritten to stop asking.
+ */
+export function recordOfferDeclined(home: string, now: Date = new Date()): void {
+  const state = readState(home)
+  state.offer_declined_at = now.toISOString()
+  writeState(home, state)
+}
+
+export function offerDeclined(home: string): boolean {
+  return readState(home).offer_declined_at !== undefined
+}
+
+/** Cleared when an identity is established, so a later logout asks again. */
+export function clearOfferDeclined(home: string): void {
+  const state = readState(home)
+  delete state.offer_declined_at
   writeState(home, state)
 }

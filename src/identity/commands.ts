@@ -11,6 +11,7 @@ import {
   writePending,
   clearPending,
 } from './credentials.js'
+import { clearOfferDeclined } from './state.js'
 import { writeAnchor, removeAnchorAt, readAnchorHandleAt, hasAnchorAt } from '../anchor/block.js'
 import { syncPeek } from '../wire/index.js'
 import { anchorLabelOf, type DoctorCheck, type HostProfile, type Verdict } from './host-profile.js'
@@ -176,6 +177,9 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
           created_at: new Date().toISOString(),
         })
         clearPending(home)
+        // They have an identity now, so a previous "not now" is spent. If they
+        // ever sign out, the setup offer should be free to appear again.
+        clearOfferDeclined(home)
         console.log(
           [
             `Registered: @${pendingHandle} for ${LABEL}.`,
@@ -295,6 +299,7 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
         ...(apiBase !== DEFAULT_API_BASE ? { api_base: apiBase } : {}),
         created_at: new Date().toISOString(),
       })
+      clearOfferDeclined(home)
       console.log([`Signed in as @${me.handle} for ${LABEL}.`, ...writeOurAnchor(me.handle), RESTART_HINT].join('\n'))
       return 0
     } catch (err) {
@@ -329,6 +334,7 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
           created_at: new Date().toISOString(),
         })
         clearPending(home)
+        clearOfferDeclined(home)
         console.log(
           [
             `Recovered: @${result.handle} for ${LABEL} — a fresh API key is stored (the old key is now revoked).`,
