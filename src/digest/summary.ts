@@ -1,3 +1,4 @@
+import type { AlwaysOnState } from '../daemon/health.js'
 import { contextOf, type SyncRow } from '../wire/index.js'
 import { ANCHOR_START, ANCHOR_END } from '../anchor/block.js'
 import { relativeWhen } from '../util/when.js'
@@ -151,28 +152,64 @@ export interface HostCopy {
   label: string
 }
 
-export function formatRegistrationOffer(copy: HostCopy): string {
+/**
+ * What a session is told when the integration is installed but has no identity.
+ *
+ * Two things this must NOT do, both learned from the first real install:
+ *
+ *  • It must not read like a runbook. The earlier version was a numbered list
+ *    of CLI invocations, and agents did the natural thing with a numbered list
+ *    of CLI invocations: they pasted it at the user. Someone who just installed
+ *    a plugin got a wall of `--email`/`--code` syntax instead of "want a handle
+ *    other agents can message you at?". The commands are the AGENT'S to run;
+ *    that has to be said outright, because the format alone implies otherwise.
+ *
+ *  • It must not assert always-on is running. That line used to be
+ *    unconditional, so a session whose registration had just FAILED was told
+ *    always-on was already up — the one moment the user needed to know it was
+ *    not.
+ */
+export function formatRegistrationOffer(copy: HostCopy, alwaysOn: AlwaysOnState = 'off'): string {
   const { invoke, label } = copy
   return [
-    `The AgentChat plugin is installed but this ${label} agent has no AgentChat identity yet.`,
+    `This ${label} agent is on AgentChat but has no handle yet — no address other agents can reach it at.`,
     '',
-    'AgentChat gives you (the agent) a handle other agents can DM. If the user would like that, offer to set it up — and FIRST ask whether they already have an AgentChat account (e.g. from another machine, or a Hermes / OpenClaw agent), so you sign them in instead of creating a duplicate:',
-    `This ${label} agent gets its OWN handle — separate from any other coding agent on this machine, which is exactly what lets them DM each other. Use an email not already tied to another agent.`,
+    'If the moment is right, offer it in ONE plain sentence and let them answer. Do not paste this block,',
+    'do not list the commands, do not walk them through steps. You run the commands; they just talk to you.',
     '',
-    'NEW to AgentChat (most people):',
-    '  1. Ask for their email + a desired handle (3–30 chars, lowercase letters/digits/hyphens, must start with a letter).',
-    `  2. Run: ${invoke} register --email <email> --handle <handle>`,
-    `  3. A 6-digit code lands in their email; ask for it, then run: ${invoke} register --code <code>`,
+    'All you need from them is an email and a handle they like (3–30 characters, lowercase letters, digits',
+    'and hyphens, starting with a letter). Ask first whether they already have an AgentChat account — from',
+    'another machine, or a Hermes or OpenClaw agent — so you sign that one in instead of creating a second.',
+    `Either way this ${label} agent ends up with its own handle, separate from any other coding agent here,`,
+    'which is what lets them message each other.',
     '',
-    'ALREADY have an AgentChat agent — sign in, do NOT register a second one:',
-    `  • They have its API key (ac_…):  ${invoke} login --api-key <ac_…>`,
-    `  • They lost the key:  ${invoke} recover --email <email>, then relay the emailed 6-digit code: ${invoke} recover --code <code>`,
+    'Commands — yours to run, not to show:',
+    `  new account    ${invoke} register --email <email> --handle <handle>`,
+    `                 then, with the 6-digit code they were emailed: ${invoke} register --code <code>`,
+    `  has an API key ${invoke} login --api-key <ac_…>`,
+    `  lost the key   ${invoke} recover --email <email>, then ${invoke} recover --code <code>`,
     '',
+    alwaysOnNote(alwaysOn, invoke),
     '',
-    "Always-on is already running — this agent answers DMs even when no session is open. There is nothing to switch on, so do not offer to.",
-    '',
-    'Do not push the offer — one short ask is plenty. If declined, drop the topic for the rest of the session.',
+    `One ask is plenty. If they decline or change the subject, drop it — and \`${invoke} register --not-now\``,
+    'stops it being raised in future sessions too.',
   ].join('\n')
+}
+
+/** Says only what is true right now — see the note above about the version of
+ *  this line that claimed always-on was running no matter what. */
+function alwaysOnNote(state: AlwaysOnState, invoke: string): string {
+  switch (state) {
+    case 'connected':
+      return 'Always-on is running: this agent answers DMs even with no session open. Nothing to switch on.'
+    case 'idle':
+    case 'starting':
+      return 'Always-on is set up and will start answering DMs on its own as soon as there is a handle. Nothing to switch on.'
+    case 'off':
+      return 'Always-on is not set up here, so DMs are only seen during a session.'
+    case 'down':
+      return `Always-on is registered but not running — \`${invoke} daemon status\` says why. DMs are only seen during a session until it recovers.`
+  }
 }
 
 // ─── Pre-registration instruction-file blocks ───────────────────────────────

@@ -27,7 +27,7 @@ import {
   formatAlwaysOnDown,
   type HostCopy,
 } from '../digest/summary.js'
-import { alwaysOnHealth } from '../daemon/health.js'
+import { alwaysOnHealth, alwaysOnState } from '../daemon/health.js'
 
 // ─── Session hook engine (host-agnostic) ────────────────────────────────────
 //
@@ -169,7 +169,7 @@ export async function sessionStart(
       // quiet, not a nag.
       if (shouldOfferRegistration(ctx.home)) {
         recordRegistrationOffer(ctx.home)
-        return { context: formatRegistrationOffer(ctx.copy) }
+        return { context: formatRegistrationOffer(ctx.copy, alwaysOnState(ctx.home)) }
       }
       return none
     }

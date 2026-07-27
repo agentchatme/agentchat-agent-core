@@ -178,6 +178,14 @@ const signIn = (home: string): void =>
     path.join(home, 'credentials'),
     JSON.stringify({ api_key: 'ac_live_' + 'a'.repeat(40), handle: 'probe' }),
   )
+/** Age the registration marker past the startup grace, so "not beating" means
+ *  genuinely down rather than still coming up. */
+const aged = (home: string): void => {
+  const marker = path.join(home, 'always-on.wanted')
+  const old = new Date(Date.now() - 10 * 60_000)
+  fs.utimesSync(marker, old, old)
+}
+
 const signOut = (home: string): void => fs.rmSync(path.join(home, 'credentials'), { force: true })
 
 describe('always-on health is per agent', () => {
@@ -197,6 +205,7 @@ describe('always-on health is per agent', () => {
   it('an identity with no beacon reads as down — the only state worth warning about', () => {
     markAlwaysOnWanted(homeA)
     signIn(homeA)
+    aged(homeA) // past the startup grace; otherwise this is a cold start
     expect(alwaysOnState(homeA)).toBe('down')
     expect(alwaysOnHealth(homeA)).toEqual({ wanted: true, healthy: false })
   })
@@ -223,6 +232,7 @@ describe('always-on health is per agent', () => {
     markAlwaysOnWanted(homeB)
     signIn(homeA)
     signIn(homeB)
+    aged(homeA)
     beat(homeB)
     expect(alwaysOnHealth(homeA).healthy).toBe(false)
     expect(alwaysOnHealth(homeB).healthy).toBe(true)

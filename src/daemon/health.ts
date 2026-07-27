@@ -22,11 +22,15 @@ export const HEARTBEAT_FILE = 'daemon.heartbeat'
 // false "down" — but a genuinely dead daemon is well past it.
 const HEARTBEAT_STALE_MS = 3 * 60_000
 
-/** Record that the user wants always-on for this agent. */
+/** Record that the user wants always-on for this agent.
+ *
+ *  The file's MTIME is load-bearing: `alwaysOnState` uses it as the moment
+ *  registration happened, so a service that was just installed is not reported
+ *  as broken before its daemon has had time to draw breath. */
 export function markAlwaysOnWanted(home: string): void {
   try {
     fs.mkdirSync(home, { recursive: true })
-    fs.writeFileSync(path.join(home, ALWAYS_ON_WANTED), '')
+    fs.writeFileSync(path.join(home, ALWAYS_ON_WANTED), new Date().toISOString())
   } catch {
     /* non-fatal: worst case the hook can't nag on a later failure */
   }
@@ -109,24 +113,47 @@ export function idle(home: string): void {
  *   off       — the service is not installed (or was explicitly disabled).
  *   idle      — installed and resident, but there is no identity to serve.
  *               Correct and quiet: the daemon is waiting for a sign-in.
+ *   starting  — registered moments ago and not beating yet. Also quiet: the
+ *               service manager has not finished bringing it up.
  *   connected — holding the wire; the beacon is fresh.
  *   down      — there IS an identity and the service is installed, but nothing
  *               is beating. The only state worth telling a session about.
  *
  * Pure reads, no subprocess, never throws.
  */
-export type AlwaysOnState = 'off' | 'idle' | 'connected' | 'down'
+export type AlwaysOnState = 'off' | 'idle' | 'starting' | 'connected' | 'down'
+
+/**
+ * A service that was JUST registered has not started beating yet. Without this
+ * grace period the session that installs always-on immediately reports it as
+ * down — the user's very first impression of the feature is a warning that it
+ * is broken, moments after it was set up correctly. Generous enough to cover a
+ * launchd/systemd cold start.
+ */
+const STARTUP_GRACE_MS = 90_000
 
 export function alwaysOnState(home: string): AlwaysOnState {
   if (!alwaysOnWanted(home)) return 'off'
   // No credentials → the daemon is supposed to be idling.
   if (!fs.existsSync(path.join(home, 'credentials'))) return 'idle'
+
+  let beating = false
   try {
     const age = Date.now() - fs.statSync(path.join(home, HEARTBEAT_FILE)).mtimeMs
-    return age <= HEARTBEAT_STALE_MS ? 'connected' : 'down'
+    beating = age <= HEARTBEAT_STALE_MS
   } catch {
-    return 'down' // no beacon → never started, or long dead
+    beating = false
   }
+  if (beating) return 'connected'
+
+  // Not beating — but if it was only just registered, it is still coming up.
+  try {
+    const since = Date.now() - fs.statSync(path.join(home, ALWAYS_ON_WANTED)).mtimeMs
+    if (since <= STARTUP_GRACE_MS) return 'starting'
+  } catch {
+    /* fall through to down */
+  }
+  return 'down'
 }
 
 /**
@@ -135,5 +162,6 @@ export function alwaysOnState(home: string): AlwaysOnState {
  */
 export function alwaysOnHealth(home: string): { wanted: boolean; healthy: boolean } {
   const state = alwaysOnState(home)
+  // `starting` is healthy: nothing is wrong, it is simply not up yet.
   return { wanted: state !== 'off', healthy: state !== 'down' }
 }

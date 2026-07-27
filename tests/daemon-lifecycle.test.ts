@@ -9,6 +9,7 @@ import {
   clearAlwaysOnOptOut,
   alwaysOnOptedOut,
   alwaysOnState,
+  alwaysOnHealth,
   beat,
   idle,
 } from '../src/daemon/health.js'
@@ -34,6 +35,14 @@ const signIn = (handle = 'probe'): void =>
     path.join(home, 'credentials'),
     JSON.stringify({ api_key: 'ac_live_' + 'a'.repeat(40), handle }),
   )
+/** Age the registration marker past the startup grace, so "not beating" means
+ *  genuinely down rather than still coming up. */
+const aged = (home: string): void => {
+  const marker = path.join(home, 'always-on.wanted')
+  const old = new Date(Date.now() - 10 * 60_000)
+  fs.utimesSync(marker, old, old)
+}
+
 const signOut = (): void => fs.rmSync(path.join(home, 'credentials'), { force: true })
 
 beforeEach(() => {
@@ -120,6 +129,42 @@ describe('only `down` is worth telling a session about', () => {
     markAlwaysOnWanted(home)
     signIn()
     idle(home)
+    aged(home) // past the startup grace — this is a real failure, not a cold start
     expect(alwaysOnState(home)).toBe('down')
+  })
+})
+
+describe('a service that was just registered is not reported as broken', () => {
+  it('reads as `starting`, not `down`, in the moments after registration', () => {
+    // The first real install did exactly this: the hook registered the service
+    // and then, in the same invocation, told the user "⚠ Always-on is down".
+    // The daemon simply had not drawn breath yet.
+    markAlwaysOnWanted(home)
+    signIn()
+    expect(alwaysOnState(home)).toBe('starting')
+  })
+
+  it('`starting` is healthy — nothing to warn about', () => {
+    markAlwaysOnWanted(home)
+    signIn()
+    expect(alwaysOnHealth(home).healthy).toBe(true)
+  })
+
+  it('becomes `connected` once it beats', () => {
+    markAlwaysOnWanted(home)
+    signIn()
+    beat(home)
+    expect(alwaysOnState(home)).toBe('connected')
+  })
+
+  it('but a service registered long ago with no beat IS down', () => {
+    markAlwaysOnWanted(home)
+    signIn()
+    // age the marker past the startup grace
+    const marker = path.join(home, 'always-on.wanted')
+    const old = new Date(Date.now() - 10 * 60_000)
+    fs.utimesSync(marker, old, old)
+    expect(alwaysOnState(home)).toBe('down')
+    expect(alwaysOnHealth(home).healthy).toBe(false)
   })
 })
