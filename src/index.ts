@@ -128,6 +128,11 @@ export {
 } from './identity/commands.js'
 export { anchorLabelOf, type HostProfile, type DoctorCheck, type Verdict } from './identity/host-profile.js'
 
+// The agent-facing manual — one source, rendered per host. Each integration
+// decides how to DELIVER it (plugin skill file, or on disk with a pointer from
+// the always-loaded anchor); the content itself must not diverge.
+export { renderManual, type ManualCopy } from './skill/manual.js'
+
 // Always-on daemon internals.
 export {
   markAlwaysOnWanted,
