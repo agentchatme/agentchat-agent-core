@@ -28,6 +28,12 @@
 
 // Wire protocol — the server contract. One implementation, everywhere.
 export {
+  CODING_AGENTS_CLIENT_IDENTITY,
+  CODING_AGENTS_CLIENT_HEADERS,
+} from './client-identity.js'
+export { VERSION } from './version.js'
+
+export {
   syncPeek,
   syncAck,
   lastDeliveryId,

@@ -1,4 +1,5 @@
 import { log } from '../util/log.js'
+import { CODING_AGENTS_CLIENT_HEADERS } from '../client-identity.js'
 
 // ─── Reply-coordination client (/v1/reply) ───────────────────────────────────
 //
@@ -27,6 +28,7 @@ export class ReplyCoord {
     const res = await fetch(url, {
       method,
       headers: {
+        ...CODING_AGENTS_CLIENT_HEADERS,
         authorization: `Bearer ${this.cfg.apiKey}`,
         ...(body !== undefined ? { 'content-type': 'application/json' } : {}),
       },

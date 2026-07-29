@@ -121,6 +121,18 @@ export async function runDaemon(opts: RunDaemonOpts): Promise<number> {
     const watcher = fs.watch(home, (_event, filename) => {
       if (filename === null || String(filename).startsWith('credentials')) nudged = true
     })
+    // Resource exhaustion and unsupported filesystems can surface as an
+    // asynchronous `error` after fs.watch has returned. Without a listener
+    // Node treats that as fatal; polling is already the source of truth, so
+    // losing this best-effort accelerator must never take down the daemon.
+    watcher.on('error', (err) => {
+      log.warn(`credential watcher unavailable; polling instead: ${String(err)}`)
+      try {
+        watcher.close()
+      } catch {
+        /* already closed */
+      }
+    })
     watcher.unref()
   } catch {
     /* polling covers it */

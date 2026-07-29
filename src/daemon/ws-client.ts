@@ -2,6 +2,7 @@ import { WebSocket } from 'ws'
 import { EventEmitter } from 'node:events'
 import { log } from '../util/log.js'
 import { parseInbound, type SyncRow } from './frames.js'
+import { CODING_AGENTS_CLIENT_HEADERS } from '../client-identity.js'
 
 // ─── Agent WebSocket client ─────────────────────────────────────────────────
 //
@@ -94,6 +95,7 @@ export class AgentWsClient extends EventEmitter {
 
     const ws = new WebSocket(this.url, {
       headers: {
+        ...CODING_AGENTS_CLIENT_HEADERS,
         authorization: `Bearer ${this.apiKey}`,
         // Opt into the delivery-ack protocol: the server then leaves each
         // delivery 'stored' until we ack it (by message id) instead of

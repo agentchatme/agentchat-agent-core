@@ -1,6 +1,12 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { digestConversations, formatSessionStart, formatStopPickup } from '../src/digest/summary.js'
 import { syncPeek, syncAck, lastDeliveryId, type SyncRow } from '../src/wire/index.js'
+import {
+  CODING_AGENTS_CLIENT_HEADERS,
+  CODING_AGENTS_CLIENT_IDENTITY,
+} from '../src/client-identity.js'
+import { VERSION } from '../src/version.js'
+import packageJson from '../package.json'
 
 function row(overrides: Partial<SyncRow> & { id: string }): SyncRow {
   return {
@@ -136,6 +142,7 @@ describe('wire client', () => {
     expect(rows).toHaveLength(2)
     expect(calls[0]!.url).toContain('/v1/messages/sync?limit=50&after=del_')
     expect((calls[0]!.init?.headers as Record<string, string>).authorization).toContain('Bearer ac_test_')
+    expect(calls[0]!.init?.headers).toMatchObject(CODING_AGENTS_CLIENT_HEADERS)
   })
 
   it('syncPeek skips malformed rows and survives a non-array payload', async () => {
@@ -161,5 +168,19 @@ describe('wire client', () => {
     expect(lastDeliveryId(rows)).toBe(rows[2]!.delivery_id)
     expect(lastDeliveryId([row({ id: '9', delivery_id: null })])).toBeNull()
     expect(lastDeliveryId([])).toBeNull()
+  })
+})
+
+describe('client identity', () => {
+  it('uses the published core version for raw and SDK transports', () => {
+    expect(VERSION).toBe(packageJson.version)
+    expect(CODING_AGENTS_CLIENT_IDENTITY).toEqual({
+      name: 'coding_agents',
+      version: packageJson.version,
+    })
+    expect(CODING_AGENTS_CLIENT_HEADERS).toEqual({
+      'X-AgentChat-Client': 'coding_agents',
+      'X-AgentChat-Client-Version': packageJson.version,
+    })
   })
 })

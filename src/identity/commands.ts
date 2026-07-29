@@ -15,6 +15,7 @@ import { clearOfferDeclined } from './state.js'
 import { writeAnchor, removeAnchorAt, readAnchorHandleAt, hasAnchorAt } from '../anchor/block.js'
 import { syncPeek } from '../wire/index.js'
 import { anchorLabelOf, type DoctorCheck, type HostProfile, type Verdict } from './host-profile.js'
+import { CODING_AGENTS_CLIENT_IDENTITY } from '../client-identity.js'
 
 // ─── Identity commands, for exactly one agent ───────────────────────────────
 //
@@ -169,6 +170,7 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
       try {
         const result = await AgentChatClient.verify(pending.pending_id, code, {
           baseUrl: pending.api_base ?? apiBase,
+          clientIdentity: CODING_AGENTS_CLIENT_IDENTITY,
         })
         writeCredentials(home, {
           api_key: result.apiKey,
@@ -251,6 +253,7 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
         ...(opts.displayName ? { display_name: opts.displayName } : {}),
         ...(opts.description ? { description: opts.description } : {}),
         baseUrl: apiBase,
+        clientIdentity: CODING_AGENTS_CLIENT_IDENTITY,
       })
       writePending(home, {
         kind: 'register',
@@ -291,7 +294,11 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
     }
 
     try {
-      const client = new AgentChatClient({ apiKey, baseUrl: apiBase })
+      const client = new AgentChatClient({
+        apiKey,
+        baseUrl: apiBase,
+        clientIdentity: CODING_AGENTS_CLIENT_IDENTITY,
+      })
       const me = await client.getMe()
       writeCredentials(home, {
         api_key: apiKey,
@@ -326,6 +333,7 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
       try {
         const result = await AgentChatClient.recoverVerify(pending.pending_id, code, {
           baseUrl: pending.api_base ?? apiBase,
+          clientIdentity: CODING_AGENTS_CLIENT_IDENTITY,
         })
         writeCredentials(home, {
           api_key: result.apiKey,
@@ -363,7 +371,10 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
     }
 
     try {
-      const result = await AgentChatClient.recover(email, { baseUrl: apiBase })
+      const result = await AgentChatClient.recover(email, {
+        baseUrl: apiBase,
+        clientIdentity: CODING_AGENTS_CLIENT_IDENTITY,
+      })
       if (!result.pending_id) {
         console.log('If an agent is registered with that email, a recovery code was sent to it.')
         return 0
@@ -415,7 +426,11 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
     }
 
     try {
-      const client = new AgentChatClient({ apiKey: identity.apiKey, baseUrl: identity.apiBase })
+      const client = new AgentChatClient({
+        apiKey: identity.apiKey,
+        baseUrl: identity.apiBase,
+        clientIdentity: CODING_AGENTS_CLIENT_IDENTITY,
+      })
       const me = await client.getMe()
       const rows = await syncPeek({ apiKey: identity.apiKey, apiBase: identity.apiBase }, { limit: 100 })
       const unread = rows.length === 100 ? '100+' : String(rows.length)
@@ -515,7 +530,11 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
       const identity = resolveIdentity(home)
       if (identity !== null) {
         try {
-          const client = new AgentChatClient({ apiKey: identity.apiKey, baseUrl: identity.apiBase })
+          const client = new AgentChatClient({
+            apiKey: identity.apiKey,
+            baseUrl: identity.apiBase,
+            clientIdentity: CODING_AGENTS_CLIENT_IDENTITY,
+          })
           const started = Date.now()
           const me = await client.getMe()
           const verdict: Verdict = (me.status ?? 'active') === 'active' ? 'PASS' : 'WARN'

@@ -1,5 +1,6 @@
 import { z } from 'zod'
 import { log } from '../util/log.js'
+import { CODING_AGENTS_CLIENT_HEADERS } from '../client-identity.js'
 
 // ─── Raw sync/ack wire client ───────────────────────────────────────────────
 //
@@ -87,6 +88,7 @@ async function request(
   const res = await fetch(url, {
     method,
     headers: {
+      ...CODING_AGENTS_CLIENT_HEADERS,
       authorization: `Bearer ${cfg.apiKey}`,
       ...(body !== undefined ? { 'content-type': 'application/json' } : {}),
     },
