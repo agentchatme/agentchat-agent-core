@@ -1,5 +1,6 @@
 import * as fs from 'node:fs'
 import * as path from 'node:path'
+import { atomicWriteFile } from '../util/fsutil.js'
 
 // ─── Always-on health, as the session-start hook sees it ────────────────────
 //
@@ -17,6 +18,7 @@ import * as path from 'node:path'
 // two daemons, and either can be down independently.
 
 const ALWAYS_ON_WANTED = 'always-on.wanted'
+const ALWAYS_ON_INSTALLED_VERSION = 'always-on.installed-version'
 export const HEARTBEAT_FILE = 'daemon.heartbeat'
 // 3 min tolerates a brief reconnect (the daemon beats every 30s) without a
 // false "down" — but a genuinely dead daemon is well past it.
@@ -47,6 +49,27 @@ export function clearAlwaysOnWanted(home: string): void {
 
 export function alwaysOnWanted(home: string): boolean {
   return fs.existsSync(path.join(home, ALWAYS_ON_WANTED))
+}
+
+export function readAlwaysOnInstalledVersion(home: string): string | null {
+  try {
+    const version = fs.readFileSync(path.join(home, ALWAYS_ON_INSTALLED_VERSION), 'utf-8').trim()
+    return version.length > 0 ? version : null
+  } catch {
+    return null
+  }
+}
+
+export function markAlwaysOnInstalledVersion(home: string, version: string): void {
+  atomicWriteFile(path.join(home, ALWAYS_ON_INSTALLED_VERSION), `${version}\n`, 0o600)
+}
+
+export function clearAlwaysOnInstalledVersion(home: string): void {
+  try {
+    fs.rmSync(path.join(home, ALWAYS_ON_INSTALLED_VERSION), { force: true })
+  } catch {
+    /* non-fatal */
+  }
 }
 
 // ─── Deliberate opt-out ─────────────────────────────────────────────────────

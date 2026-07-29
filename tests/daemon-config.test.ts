@@ -3,7 +3,11 @@ import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import { resolveDaemonConfig, wsUrlFor } from '../src/daemon/config.js'
-import { planForTest } from '../src/daemon/service.js'
+import {
+  launchdPlist,
+  planForTest,
+  systemdUnit,
+} from '../src/daemon/service.js'
 
 // The daemon half of the "one command, one agent" rule: resolution is driven
 // ONLY by the home it is handed, and the service it installs runs ONLY the
@@ -93,5 +97,54 @@ describe('the installed service runs the entry it was given', () => {
   it('resolves a relative entry to an absolute path — a unit has no cwd', () => {
     const p = planForTest({ label: 'agentchatd-x', home: homeA, entry: 'rel/daemon.js' })
     expect(path.isAbsolute(p.bin)).toBe(true)
+  })
+
+  it('quotes systemd paths and environment values as data', () => {
+    const p = planForTest({
+      label: 'agentchatd-x',
+      home: path.join(homeA, 'space % $ " quote'),
+      entry: path.join(homeA, 'bin & daemon.js'),
+      env: { CODEX_HOME: '/tmp/a b%$"c' },
+    })
+    const unit = systemdUnit(p)
+    expect(unit).toContain('ExecStart="')
+    expect(unit).toContain('%%')
+    expect(unit).toContain('$$')
+    expect(unit).toContain('Environment="CODEX_HOME=')
+  })
+
+  it('rejects line-breaking service values before generating any platform script', () => {
+    expect(() =>
+      planForTest({
+        label: 'agentchatd-x',
+        home: homeA,
+        entry: '/stable/path/daemon.js',
+        env: { CODEX_HOME: '/tmp/line1\nEnvironment=INJECTED=1' },
+      }),
+    ).toThrow(/control character/)
+  })
+
+  it('rejects service labels that could escape a path or host command', () => {
+    expect(() =>
+      planForTest({
+        label: 'agentchatd-x; touch injected',
+        home: homeA,
+        entry: '/stable/path/daemon.js',
+      }),
+    ).toThrow(/invalid service label/)
+  })
+
+  it('XML-escapes launchd arguments, env, and log paths', () => {
+    const p = planForTest({
+      label: 'agentchatd-x',
+      home: path.join(homeA, 'a&b<c>'),
+      entry: path.join(homeA, 'daemon&<.js'),
+      env: { CLAUDE_CONFIG_DIR: '/tmp/a&b<c>' },
+    })
+    const plist = launchdPlist(p)
+    expect(plist).toContain('&amp;')
+    expect(plist).toContain('&lt;')
+    expect(plist).toContain('&gt;')
+    expect(plist).not.toContain('/tmp/a&b<c>')
   })
 })

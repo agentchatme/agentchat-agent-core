@@ -17,6 +17,26 @@ export function atomicWriteFile(filePath: string, data: string, mode?: number): 
   }
 }
 
+/** Crash-safe file replacement for shipped executable bundles. */
+export function atomicCopyFile(source: string, destination: string, mode = 0o755): void {
+  const dir = path.dirname(destination)
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
+  const tmp = path.join(dir, `.${path.basename(destination)}.${process.pid}.tmp`)
+  try {
+    fs.copyFileSync(source, tmp)
+    fs.chmodSync(tmp, mode)
+    fs.renameSync(tmp, destination)
+    fs.chmodSync(destination, mode)
+  } catch (err) {
+    try {
+      fs.rmSync(tmp, { force: true })
+    } catch {
+      /* preserve the original error */
+    }
+    throw err
+  }
+}
+
 export function readJsonFile<T>(filePath: string): T | null {
   try {
     const raw = fs.readFileSync(filePath, 'utf-8')

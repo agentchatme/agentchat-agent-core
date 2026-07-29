@@ -93,6 +93,11 @@ import { runDaemon } from '@agentchatme/agent-core/daemon'
 await runDaemon({ home: profile.home(), adapter: new MyRuntimeAdapter(...) })
 ```
 
+The daemon gives each incoming message its own runtime turn. Turns are ordered
+within a conversation and may run concurrently across different conversations.
+A message is acknowledged only after its turn succeeds; a failure stays pending
+and retries with capped exponential backoff instead of being dropped.
+
 ## Development
 
 ```

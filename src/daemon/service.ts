@@ -3,6 +3,7 @@ import * as os from 'node:os'
 import * as path from 'node:path'
 import { spawnSync, spawn } from 'node:child_process'
 import { log } from '../util/log.js'
+import { atomicWriteFile } from '../util/fsutil.js'
 
 // ─── Service lifecycle (systemd / launchd / Windows Startup) ─────────────────
 //
@@ -55,7 +56,7 @@ export interface ServiceOpts extends ServiceRef {
   env?: Record<string, string>
 }
 
-interface Plan {
+export interface Plan {
   label: string // service/unit name
   node: string // absolute node path
   bin: string // absolute daemon entry, supplied by the integration
@@ -69,6 +70,22 @@ export function planForTest(opts: ServiceOpts): Plan {
   return plan(opts)
 }
 
+function serviceValue(name: string, value: string): string {
+  // Every supported service format is line-oriented; CR/LF/NUL would either
+  // make an invalid definition or inject a new directive/script statement.
+  if (/[\0\r\n]/.test(value)) {
+    throw new Error(`invalid control character in service ${name}`)
+  }
+  return value
+}
+
+function serviceLabel(value: string): string {
+  if (!/^[A-Za-z0-9_.-]+$/.test(value)) {
+    throw new Error(`invalid service label: ${value}`)
+  }
+  return value
+}
+
 function plan(opts: ServiceOpts): Plan {
   const env: Record<string, string> = {}
   // CRITICAL: a systemd/launchd service does NOT inherit the login shell's
@@ -76,23 +93,35 @@ function plan(opts: ServiceOpts): Plan {
   // or a version-manager dir). Capture the installer's PATH so the service
   // resolves the same binaries the user does. (Without this the daemon exits
   // "claude CLI not found on PATH" and restart-loops.)
-  if (process.env['PATH']) env['PATH'] = process.env['PATH']
+  if (process.env['PATH']) env['PATH'] = serviceValue('environment value', process.env['PATH'])
   // Whatever host env the integration says its adapter needs.
   for (const [k, v] of Object.entries(opts.env ?? {})) {
-    if (typeof v === 'string' && v.length > 0) env[k] = v
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) throw new Error(`invalid service environment key: ${k}`)
+    if (typeof v === 'string' && v.length > 0) env[k] = serviceValue('environment value', v)
   }
   return {
-    label: opts.label,
-    node: process.execPath,
-    bin: path.resolve(opts.entry),
-    home: path.resolve(opts.home),
+    label: serviceLabel(opts.label),
+    node: serviceValue('Node path', process.execPath),
+    bin: serviceValue('entry path', path.resolve(opts.entry)),
+    home: serviceValue('home path', path.resolve(opts.home)),
     env,
   }
 }
 
 function run(cmd: string, args: string[]): { ok: boolean; out: string } {
   const r = spawnSync(cmd, args, { encoding: 'utf-8' })
-  return { ok: !r.error && r.status === 0, out: `${r.stdout ?? ''}${r.stderr ?? ''}`.trim() }
+  const out = [
+    typeof r.stdout === 'string' ? r.stdout : '',
+    typeof r.stderr === 'string' ? r.stderr : '',
+    r.error?.message ?? '',
+  ]
+    .filter((part) => part.length > 0)
+    .join('\n')
+    .trim()
+  return {
+    ok: !r.error && r.status === 0,
+    out,
+  }
 }
 
 /**
@@ -118,9 +147,27 @@ function systemdUnitPath(label: string): string {
   return path.join(os.homedir(), '.config', 'systemd', 'user', `${label}.service`)
 }
 
-function systemdUnit(p: Plan): string {
+/** Quote one systemd command/environment word, including specifier escaping. */
+export function systemdQuote(value: string): string {
+  return (
+    '"' +
+    value
+      .replace(/\\/g, '\\\\')
+      .replace(/\n/g, '\\n')
+      .replace(/\r/g, '\\r')
+      .replace(/\t/g, '\\t')
+      .replace(/"/g, '\\"')
+      // In a JS replacement string `$$` emits one literal dollar, so four
+      // dollars are required to produce systemd's literal-dollar escape `$$`.
+      .replace(/\$/g, '$$$$')
+      .replace(/%/g, '%%') +
+    '"'
+  )
+}
+
+export function systemdUnit(p: Plan): string {
   const envLines = Object.entries(p.env)
-    .map(([k, v]) => `Environment=${k}=${v}`)
+    .map(([k, v]) => `Environment=${systemdQuote(`${k}=${v}`)}`)
     .join('\n')
   return [
     '[Unit]',
@@ -130,7 +177,7 @@ function systemdUnit(p: Plan): string {
     '',
     '[Service]',
     'Type=simple',
-    `ExecStart=${p.node} ${p.bin} --home ${p.home}`,
+    `ExecStart=${systemdQuote(p.node)} ${systemdQuote(p.bin)} --home ${systemdQuote(p.home)}`,
     ...(envLines ? [envLines] : []),
     'Restart=on-failure',
     'RestartSec=5',
@@ -144,7 +191,7 @@ function systemdUnit(p: Plan): string {
 function installSystemd(p: Plan): void {
   const unitPath = systemdUnitPath(p.label)
   fs.mkdirSync(path.dirname(unitPath), { recursive: true })
-  fs.writeFileSync(unitPath, systemdUnit(p))
+  atomicWriteFile(unitPath, systemdUnit(p), 0o600)
   log.info(`wrote ${unitPath}`)
   if (registrationSkipped()) return
   run('systemctl', ['--user', 'daemon-reload'])
@@ -159,10 +206,27 @@ function installSystemd(p: Plan): void {
 }
 
 function uninstallSystemd(label: string): void {
-  run('systemctl', ['--user', 'disable', '--now', label])
+  if (!registrationSkipped()) {
+    const disabled = run('systemctl', ['--user', 'disable', '--now', label])
+    if (!disabled.ok) {
+      const active = run('systemctl', ['--user', 'is-active', label])
+      const state = (active.out.split(/\r?\n/, 1)[0] ?? '').trim().toLowerCase()
+      // systemctl intentionally exits non-zero for these stopped/not-present
+      // states. Anything else is ambiguous, so preserve the unit and daemon
+      // bundle rather than stranding a loaded restart policy.
+      if (!['inactive', 'failed', 'unknown'].includes(state)) {
+        throw new Error(
+          `could not stop systemd service ${label}: ${disabled.out || active.out || 'unknown error'}`,
+        )
+      }
+    }
+  }
   const unitPath = systemdUnitPath(label)
   if (fs.existsSync(unitPath)) fs.rmSync(unitPath)
-  run('systemctl', ['--user', 'daemon-reload'])
+  if (!registrationSkipped()) {
+    const reload = run('systemctl', ['--user', 'daemon-reload'])
+    if (!reload.ok) log.warn(`systemctl daemon-reload failed after uninstall: ${reload.out}`)
+  }
   log.info(`service ${label} removed`)
 }
 
@@ -179,26 +243,35 @@ function launchdPlistPath(label: string): string {
 }
 const launchdLabel = (label: string): string => `me.agentchat.${label}`
 
-function launchdPlist(p: Plan): string {
+export function xmlEscape(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;')
+}
+
+export function launchdPlist(p: Plan): string {
   const args = [p.node, p.bin, '--home', p.home]
-  const argXml = args.map((a) => `    <string>${a}</string>`).join('\n')
+  const argXml = args.map((a) => `    <string>${xmlEscape(a)}</string>`).join('\n')
   const envXml = Object.entries(p.env)
-    .map(([k, v]) => `    <key>${k}</key><string>${v}</string>`)
+    .map(([k, v]) => `    <key>${xmlEscape(k)}</key><string>${xmlEscape(v)}</string>`)
     .join('\n')
   const logPath = path.join(p.home, 'daemon.log')
   return [
     '<?xml version="1.0" encoding="UTF-8"?>',
     '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">',
     '<plist version="1.0"><dict>',
-    `  <key>Label</key><string>${launchdLabel(p.label)}</string>`,
+    `  <key>Label</key><string>${xmlEscape(launchdLabel(p.label))}</string>`,
     '  <key>ProgramArguments</key><array>',
     argXml,
     '  </array>',
     ...(envXml ? ['  <key>EnvironmentVariables</key><dict>', envXml, '  </dict>'] : []),
     '  <key>RunAtLoad</key><true/>',
     '  <key>KeepAlive</key><true/>',
-    `  <key>StandardErrorPath</key><string>${logPath}</string>`,
-    `  <key>StandardOutPath</key><string>${logPath}</string>`,
+    `  <key>StandardErrorPath</key><string>${xmlEscape(logPath)}</string>`,
+    `  <key>StandardOutPath</key><string>${xmlEscape(logPath)}</string>`,
     '</dict></plist>',
     '',
   ].join('\n')
@@ -207,7 +280,7 @@ function launchdPlist(p: Plan): string {
 function installLaunchd(p: Plan): void {
   const plistPath = launchdPlistPath(p.label)
   fs.mkdirSync(path.dirname(plistPath), { recursive: true })
-  fs.writeFileSync(plistPath, launchdPlist(p))
+  atomicWriteFile(plistPath, launchdPlist(p), 0o600)
   log.info(`wrote ${plistPath}`)
   if (registrationSkipped()) return
   run('launchctl', ['unload', plistPath]) // idempotent: clear a prior load
@@ -218,7 +291,27 @@ function installLaunchd(p: Plan): void {
 
 function uninstallLaunchd(label: string): void {
   const plistPath = launchdPlistPath(label)
-  run('launchctl', ['unload', '-w', plistPath])
+  if (!registrationSkipped()) {
+    run('launchctl', ['unload', '-w', plistPath])
+    let loaded = run('launchctl', ['list', launchdLabel(label)])
+    if (loaded.ok) {
+      // A missing/stale plist can leave a loaded job that unload-by-path
+      // cannot address. Remove by label, then prove it is gone.
+      run('launchctl', ['remove', launchdLabel(label)])
+      loaded = run('launchctl', ['list', launchdLabel(label)])
+    }
+    if (loaded.ok) {
+      throw new Error(`could not stop launchd service ${launchdLabel(label)}`)
+    }
+    if (
+      loaded.out &&
+      !/could not find service|not found|no such process|unknown service/i.test(loaded.out)
+    ) {
+      throw new Error(
+        `could not verify launchd service removal for ${launchdLabel(label)}: ${loaded.out}`,
+      )
+    }
+  }
   if (fs.existsSync(plistPath)) fs.rmSync(plistPath)
   log.info(`service ${launchdLabel(label)} removed`)
 }
@@ -287,7 +380,7 @@ const shQuote = (s: string): string => `'${s.replace(/'/g, `'\\''`)}'`
  *  line; `env` is set on the launcher process (native Windows only). */
 export function launcherVbs(command: string, env: Record<string, string>): string {
   const envLines = Object.entries(env).map(
-    ([k, v]) => `sh.Environment("Process").Item("${k}") = "${vbsEscape(v)}"`,
+    ([k, v]) => `sh.Environment("Process").Item("${vbsEscape(k)}") = "${vbsEscape(v)}"`,
   )
   return (
     [
@@ -330,10 +423,10 @@ function startDetached(cmd: string, args: string[]): void {
 function winPathFromWsl(linuxPath: string): string {
   return run('wslpath', ['-w', linuxPath]).out.trim() || linuxPath
 }
-function killLauncher(label: string, mode: WinMode): void {
+function killLauncher(label: string, mode: WinMode): { ok: boolean; out: string } {
   // Best-effort: stop the running wscript launcher, matched by our .vbs name.
   const ps = `Get-CimInstance Win32_Process -Filter "Name='wscript.exe'" | Where-Object { $_.CommandLine -like '*${label}.vbs*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }`
-  run(mode === 'win32' ? 'powershell' : 'powershell.exe', ['-NoProfile', '-Command', ps])
+  return run(mode === 'win32' ? 'powershell' : 'powershell.exe', ['-NoProfile', '-Command', ps])
 }
 
 function installWindows(p: Plan, mode: WinMode): void {
@@ -341,13 +434,17 @@ function installWindows(p: Plan, mode: WinMode): void {
   fs.mkdirSync(master, { recursive: true })
   const masterVbs = path.join(master, `${p.label}.vbs`)
   if (mode === 'win32') {
-    fs.writeFileSync(masterVbs, launcherVbs(winCommandNative(p), p.env))
+    atomicWriteFile(masterVbs, launcherVbs(winCommandNative(p), p.env), 0o600)
   } else {
     const scriptPath = path.join(master, `${p.label}.sh`)
-    fs.writeFileSync(scriptPath, wslScriptContent(p), { mode: 0o755 })
-    const distro = process.env['WSL_DISTRO_NAME'] ?? ''
+    atomicWriteFile(scriptPath, wslScriptContent(p), 0o700)
+    const distro = serviceValue('WSL distro', process.env['WSL_DISTRO_NAME'] ?? '')
     if (!distro) throw new Error('WSL_DISTRO_NAME is not set — cannot target the right WSL distro')
-    fs.writeFileSync(masterVbs, launcherVbs(`wsl.exe -d ${distro} -e bash "${scriptPath}"`, {}))
+    atomicWriteFile(
+      masterVbs,
+      launcherVbs(`wsl.exe -d "${distro}" -e bash "${scriptPath}"`, {}),
+      0o600,
+    )
   }
   log.info(`wrote ${masterVbs}`)
   enableWindows(p.label, mode)
@@ -367,14 +464,18 @@ function enableWindows(label: string, mode: WinMode): void {
 function disableWindows(label: string, mode: WinMode): void {
   const startupVbs = path.join(winStartupDir(mode), `${label}.vbs`)
   if (fs.existsSync(startupVbs)) fs.rmSync(startupVbs)
-  killLauncher(label, mode)
+  if (!registrationSkipped()) {
+    const killed = killLauncher(label, mode)
+    if (!killed.ok) {
+      throw new Error(`could not stop Windows launcher ${label}: ${killed.out || 'unknown error'}`)
+    }
+  }
 }
 function uninstallWindows(label: string, mode: WinMode): void {
-  try {
-    disableWindows(label, mode)
-  } catch {
-    /* startup dir may be unreadable; still clear the master below */
-  }
+  // If stopping cannot be verified, preserve the master scripts and durable
+  // daemon. The caller can retry without leaving a hidden restart loop pointed
+  // at a deleted executable.
+  disableWindows(label, mode)
   for (const f of [`${label}.vbs`, `${label}.sh`]) {
     const m = path.join(winMasterDir(), f)
     if (fs.existsSync(m)) fs.rmSync(m)
@@ -405,7 +506,7 @@ export function installService(opts: ServiceOpts): void {
 }
 
 export function uninstallService(opts: ServiceRef): void {
-  const label = opts.label
+  const label = serviceLabel(opts.label)
   const wm = winMode()
   if (wm) return uninstallWindows(label, wm)
   if (process.platform === 'linux') return uninstallSystemd(label)
@@ -414,12 +515,48 @@ export function uninstallService(opts: ServiceRef): void {
 }
 
 export function serviceStatus(opts: ServiceRef): string {
-  const label = opts.label
+  const label = serviceLabel(opts.label)
   const wm = winMode()
   if (wm) return statusWindows(label, wm)
   if (process.platform === 'linux') return statusSystemd(label)
   if (process.platform === 'darwin') return statusLaunchd(label)
   return `service management not supported on ${process.platform}`
+}
+
+/** Pure on-disk check used by integration self-healing and doctor. */
+export function serviceDefinitionCurrent(opts: ServiceOpts): boolean {
+  try {
+    const p = plan(opts)
+    const wm = winMode()
+    if (wm === 'win32') {
+      const file = path.join(winMasterDir(), `${p.label}.vbs`)
+      return fs.existsSync(file) && fs.readFileSync(file, 'utf-8') === launcherVbs(winCommandNative(p), p.env)
+    }
+    if (wm === 'wsl') {
+      const script = path.join(winMasterDir(), `${p.label}.sh`)
+      const vbs = path.join(winMasterDir(), `${p.label}.vbs`)
+      const distro = serviceValue('WSL distro', process.env['WSL_DISTRO_NAME'] ?? '')
+      if (!distro) return false
+      return (
+        fs.existsSync(script) &&
+        fs.existsSync(vbs) &&
+        fs.readFileSync(script, 'utf-8') === wslScriptContent(p) &&
+        fs.readFileSync(vbs, 'utf-8') ===
+          launcherVbs(`wsl.exe -d "${distro}" -e bash "${script}"`, {})
+      )
+    }
+    if (process.platform === 'linux') {
+      const file = systemdUnitPath(p.label)
+      return fs.existsSync(file) && fs.readFileSync(file, 'utf-8') === systemdUnit(p)
+    }
+    if (process.platform === 'darwin') {
+      const file = launchdPlistPath(p.label)
+      return fs.existsSync(file) && fs.readFileSync(file, 'utf-8') === launchdPlist(p)
+    }
+    return false
+  } catch {
+    return false
+  }
 }
 
 // ─── enable / disable (the away-replies opt-out) ─────────────────────────────
@@ -437,8 +574,12 @@ function unitInstalled(label: string): boolean {
   return false
 }
 
+export function serviceInstalled(opts: ServiceRef): boolean {
+  return unitInstalled(serviceLabel(opts.label))
+}
+
 export function disableService(opts: ServiceOpts): void {
-  const label = opts.label
+  const label = serviceLabel(opts.label)
   if (!unitInstalled(label)) {
     throw new Error(`no ${opts.label} daemon installed — nothing to disable (run install first)`)
   }
@@ -447,9 +588,15 @@ export function disableService(opts: ServiceOpts): void {
     disableWindows(label, wm) // drop the Startup copy, keep the master
   } else if (process.platform === 'linux') {
     // Stops it AND removes the start-on-boot link; the unit file stays.
-    run('systemctl', ['--user', 'disable', '--now', label])
+    if (!registrationSkipped()) {
+      const disabled = run('systemctl', ['--user', 'disable', '--now', label])
+      if (!disabled.ok) throw new Error(`could not disable ${label}: ${disabled.out}`)
+    }
   } else if (process.platform === 'darwin') {
-    run('launchctl', ['unload', launchdPlistPath(label)]) // plist stays on disk
+    if (!registrationSkipped()) {
+      const disabled = run('launchctl', ['unload', launchdPlistPath(label)])
+      if (!disabled.ok) throw new Error(`could not disable ${label}: ${disabled.out}`)
+    }
   } else {
     throw new Error(`not supported on ${process.platform}`)
   }
@@ -457,7 +604,7 @@ export function disableService(opts: ServiceOpts): void {
 }
 
 export function enableService(opts: ServiceOpts): void {
-  const label = opts.label
+  const label = serviceLabel(opts.label)
   if (!unitInstalled(label)) {
     throw new Error(`no ${opts.label} daemon installed — run install first`)
   }
@@ -465,9 +612,15 @@ export function enableService(opts: ServiceOpts): void {
   if (wm) {
     enableWindows(label, wm) // copy the master back into Startup + start now
   } else if (process.platform === 'linux') {
-    run('systemctl', ['--user', 'enable', '--now', label])
+    if (!registrationSkipped()) {
+      const enabled = run('systemctl', ['--user', 'enable', '--now', label])
+      if (!enabled.ok) throw new Error(`could not enable ${label}: ${enabled.out}`)
+    }
   } else if (process.platform === 'darwin') {
-    run('launchctl', ['load', '-w', launchdPlistPath(label)])
+    if (!registrationSkipped()) {
+      const enabled = run('launchctl', ['load', '-w', launchdPlistPath(label)])
+      if (!enabled.ok) throw new Error(`could not enable ${label}: ${enabled.out}`)
+    }
   } else {
     throw new Error(`not supported on ${process.platform}`)
   }

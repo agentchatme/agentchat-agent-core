@@ -49,10 +49,8 @@ export interface HostProfile {
    * it. Hosts wired by their own installer (a Claude Code plugin) omit it.
    */
   isWired?(): boolean
-  /** Extra teardown on logout; returns descriptions of what was removed. */
-  removeWiring?(): string[]
   /** Host-specific doctor checks, appended after the shared ones. */
-  extraDoctorChecks?(): DoctorCheck[]
+  extraDoctorChecks?(opts: { fix?: boolean }): DoctorCheck[]
   /** Extra lines printed after a successful logout. */
   logoutHints?(): string[]
 }

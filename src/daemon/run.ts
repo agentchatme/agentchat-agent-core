@@ -39,6 +39,8 @@ const POLL_MS = 5_000
 const TICK_MS = 250
 /** Ceiling for retry backoff when the runtime simply is not usable yet. */
 const MAX_BACKOFF_MS = 5 * 60_000
+const MAX_LOG_BYTES = 5 * 1024 * 1024
+const KEEP_LOG_BYTES = 1024 * 1024
 
 export interface RunDaemonOpts {
   /** THE identity home for the agent this daemon serves. */
@@ -61,6 +63,28 @@ function fingerprint(home: string): string | null {
   return id === null ? null : `${id.apiKey}:${id.handle ?? ''}`
 }
 
+/** Bound launchd's append-only file without losing the most recent diagnosis. */
+function boundDaemonLog(home: string): void {
+  const file = path.join(home, 'daemon.log')
+  try {
+    const size = fs.statSync(file).size
+    if (size <= MAX_LOG_BYTES) return
+    const fd = fs.openSync(file, 'r')
+    try {
+      const keep = Buffer.alloc(Math.min(KEEP_LOG_BYTES, size))
+      fs.readSync(fd, keep, 0, keep.length, size - keep.length)
+      fs.writeFileSync(
+        file,
+        `[agentchat:info] older daemon log output truncated at ${new Date().toISOString()}\n${keep.toString('utf-8')}`,
+      )
+    } finally {
+      fs.closeSync(fd)
+    }
+  } catch {
+    /* absent/unreadable log is not a runtime failure */
+  }
+}
+
 /**
  * Run the always-on daemon. Returns only on a condition that makes running
  * pointless — namely another daemon already holding this home's lock.
@@ -68,6 +92,7 @@ function fingerprint(home: string): string | null {
 export async function runDaemon(opts: RunDaemonOpts): Promise<number> {
   const home = path.resolve(opts.home)
   const workdir = opts.workdir ?? path.join(home, 'daemon-workdir')
+  boundDaemonLog(home)
 
   // Hooks default to `warn` because they run on every session start and must
   // stay silent. A resident service is the opposite case: its output goes to a
@@ -82,6 +107,8 @@ export async function runDaemon(opts: RunDaemonOpts): Promise<number> {
 
   let live: Daemon | null = null
   let liveFingerprint: string | null = null
+  let observedFingerprint: string | null = null
+  let adapterFingerprint: string | null = null
   /** A credential the server refused. Sit out until it CHANGES. */
   let refused: string | null = null
   /** Consecutive connect failures, for backoff. Reset on success or on a new
@@ -144,27 +171,44 @@ export async function runDaemon(opts: RunDaemonOpts): Promise<number> {
   for (;;) {
     if (shuttingDown) break
     const fp = fingerprint(home)
+    const identityChanged = fp !== observedFingerprint
+    if (identityChanged) {
+      disconnect(fp === null ? 'signed out' : 'identity changed')
+      observedFingerprint = fp
+      failures = 0
+      lastFailure = null
+      // A refusal applies only to the exact rejected credential.
+      if (fp !== refused) refused = null
+    }
 
     if (fp === null) {
       // Signed out, or never signed in. Idle — and forget any refusal, since
       // the next credential to appear deserves a fresh attempt.
-      disconnect('signed out')
       if (refused !== null) refused = null
     } else if (fp !== liveFingerprint) {
-      // A credential appeared, or changed underneath us. Any backoff from a
-      // previous credential is irrelevant to this one.
-      disconnect('identity changed')
-      failures = 0
       if (fp === refused) {
         // Same key the server already rejected; wait for a different one
         // rather than hammering the endpoint.
       } else {
         try {
           const cfg = await resolveDaemonConfig({ home, workdir })
-          const candidate = new Daemon(cfg, opts.adapter, undefined, (reason) => {
-            // Auth refused: stop trying THIS credential, keep the process.
-            log.warn(`credential refused (${reason}) — idling until it changes`)
-            refused = fp
+          // A new AgentChat identity must not inherit the previous identity's
+          // Codex/Claude conversation transcripts.
+          if (adapterFingerprint !== fp) {
+            opts.adapter.reset?.(`${cfg.apiBase}:${cfg.handle}`)
+            adapterFingerprint = fp
+          }
+          const candidate = new Daemon(cfg, opts.adapter, undefined, (failure) => {
+            if (failure.kind === 'socket-auth') {
+              // Auth refused: stop trying THIS credential, keep the process.
+              log.warn(`credential refused (${failure.reason}) — idling until it changes`)
+              refused = fp
+            } else {
+              // Runtime auth/setup can fail after preflight. Retry the same
+              // AgentChat identity through the normal bounded supervisor loop.
+              log.warn(`runtime became unhealthy (${failure.reason}) — re-running preflight`)
+              failures += 1
+            }
             live = null
             liveFingerprint = null
             idle(home)

@@ -10,6 +10,8 @@ import type { SyncRow } from '../wire/index.js'
 // structural loop-proofing, same as the in-session plugin.
 
 export interface TurnContext {
+  /** Trusted server message id that caused this autonomous turn. */
+  messageId?: string | undefined
   /** The AgentChat conversation the message belongs to. */
   conversationId: string
   /** @handle of the sender. */
@@ -46,6 +48,13 @@ export interface TurnResult {
 
 export interface RuntimeAdapter {
   readonly name: string
+  /**
+   * Reset conversation continuity when the authenticated AgentChat identity
+   * changes. `identityNamespace` contains no credential material; callers use
+   * the authenticated API base + handle. Adapters that persist host sessions
+   * must include it in their session key, not merely clear an in-memory map.
+   */
+  reset?(identityNamespace: string): void
   /** Verify the runtime is usable (binary present, logged in). */
   preflight(): Promise<{ ok: boolean; detail?: string }>
   /** Run one turn to handle `ctx`. Continuity per conversation is the

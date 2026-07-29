@@ -7,6 +7,7 @@ import {
 } from '../src/client-identity.js'
 import { VERSION } from '../src/version.js'
 import packageJson from '../package.json'
+import { ackableRows } from '../src/hooks/engine.js'
 
 function row(overrides: Partial<SyncRow> & { id: string }): SyncRow {
   return {
@@ -168,6 +169,19 @@ describe('wire client', () => {
     expect(lastDeliveryId(rows)).toBe(rows[2]!.delivery_id)
     expect(lastDeliveryId([row({ id: '9', delivery_id: null })])).toBeNull()
     expect(lastDeliveryId([])).toBeNull()
+  })
+})
+
+describe('cursor-safe digest prefix', () => {
+  it('never skips a malformed delivery cursor and then acknowledges past it', () => {
+    const rows = [
+      row({ id: '1' }),
+      row({ id: '2', delivery_id: null }),
+      row({ id: '3' }),
+    ]
+    const safe = ackableRows(rows)
+    expect(safe.map((item) => item.id)).toEqual(['1'])
+    expect(lastDeliveryId(safe)).toBe(rows[0]?.delivery_id)
   })
 })
 

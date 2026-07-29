@@ -106,10 +106,19 @@ async function resolveHandle(cfg: WireConfig, cachedHandle: string | null): Prom
 /** Only rows with a real delivery cursor can be surfaced — an unackable row
  *  would re-inject on every hook run forever. (The production sync path always
  *  has one; this guards the typed-nullable case.) */
-function ackableRows<T extends { delivery_id: string | null }>(rows: T[]): T[] {
-  const usable = rows.filter((r) => typeof r.delivery_id === 'string' && r.delivery_id.length > 0)
+export function ackableRows<T extends { delivery_id: string | null }>(rows: T[]): T[] {
+  const usable: T[] = []
+  for (const row of rows) {
+    // sync/ack is cursor-based: it commits everything at-or-before the last
+    // delivery id. Skipping a malformed row and keeping later rows would let
+    // that later cursor acknowledge content we never surfaced.
+    if (typeof row.delivery_id !== 'string' || row.delivery_id.length === 0) break
+    usable.push(row)
+  }
   if (usable.length < rows.length) {
-    log.warn(`${rows.length - usable.length} sync row(s) without delivery_id excluded from digest`)
+    log.warn(
+      `${rows.length - usable.length} sync row(s) excluded after the first missing delivery_id`,
+    )
   }
   return usable
 }

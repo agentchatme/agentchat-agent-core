@@ -16,6 +16,7 @@ type State = 'connecting' | 'ready' | 'reconnecting' | 'terminal' | 'closed'
 
 const BASE_BACKOFF_MS = 1_000
 const MAX_BACKOFF_MS = 60_000
+const ACK_RETRY_MS = 1_000
 // If no frame/ping arrives for this long, treat the socket as dead. The server
 // pings every 45s, so ~2 missed cycles.
 const LIVENESS_MS = 100_000
@@ -32,8 +33,12 @@ export class AgentWsClient extends EventEmitter {
   private attempt = 0
   private reconnectTimer: NodeJS.Timeout | null = null
   private livenessTimer: NodeJS.Timeout | null = null
+  private ackRetryTimer: NodeJS.Timeout | null = null
   private stopped = false
   private ackMode = false
+  private inboundPaused = false
+  private readonly pendingAcks = new Set<string>()
+  private readonly acksInFlight = new Set<string>()
 
   constructor(
     private readonly url: string,
@@ -58,6 +63,7 @@ export class AgentWsClient extends EventEmitter {
     this.stopped = true
     this.state = 'closed'
     this.clearTimers()
+    this.acksInFlight.clear()
     if (this.ws) {
       try {
         this.ws.close(1000, 'daemon shutdown')
@@ -65,6 +71,33 @@ export class AgentWsClient extends EventEmitter {
         /* already closed */
       }
       this.ws = null
+    }
+  }
+
+  /**
+   * Apply TCP backpressure while the model-turn queue is saturated. `ws`
+   * delegates this to the underlying socket; no delivered frame is discarded.
+   * A server heartbeat may close a very long pause, which is safe because all
+   * unacked messages re-drain after reconnect.
+   */
+  pauseInbound(): void {
+    if (this.inboundPaused) return
+    this.inboundPaused = true
+    try {
+      this.ws?.pause()
+    } catch {
+      /* reconnect drain remains the fallback */
+    }
+  }
+
+  resumeInbound(): void {
+    if (!this.inboundPaused) return
+    this.inboundPaused = false
+    try {
+      this.ws?.resume()
+      if (this.state === 'ready') this.armLiveness()
+    } catch {
+      /* reconnect drain remains the fallback */
     }
   }
 
@@ -80,12 +113,42 @@ export class AgentWsClient extends EventEmitter {
    * real-time push — which carries no delivery_id — be acked at all.
    */
   ack(messageId: string): void {
+    this.pendingAcks.add(messageId)
+    this.flushAcks()
+  }
+
+  private flushAcks(): void {
     if (this.state !== 'ready' || !this.ws) return
-    try {
-      this.ws.send(JSON.stringify({ type: 'ack', message_id: messageId }))
-    } catch (err) {
-      log.debug(`ack send failed for ${messageId} (will re-drain): ${String(err)}`)
+    for (const messageId of this.pendingAcks) {
+      if (this.acksInFlight.has(messageId)) continue
+      this.acksInFlight.add(messageId)
+      try {
+        this.ws.send(
+          JSON.stringify({ type: 'ack', message_id: messageId }),
+          (err?: Error) => {
+            this.acksInFlight.delete(messageId)
+            if (!err) this.pendingAcks.delete(messageId)
+            else {
+              log.debug(`ack send failed for ${messageId} (will retry): ${String(err)}`)
+              this.scheduleAckRetry()
+            }
+          },
+        )
+      } catch (err) {
+        this.acksInFlight.delete(messageId)
+        log.debug(`ack send failed for ${messageId} (will retry): ${String(err)}`)
+        this.scheduleAckRetry()
+      }
     }
+  }
+
+  private scheduleAckRetry(): void {
+    if (this.stopped || this.ackRetryTimer) return
+    this.ackRetryTimer = setTimeout(() => {
+      this.ackRetryTimer = null
+      this.flushAcks()
+    }, ACK_RETRY_MS)
+    this.ackRetryTimer.unref()
   }
 
   private open(): void {
@@ -110,8 +173,10 @@ export class AgentWsClient extends EventEmitter {
       this.attempt = 0
       this.state = 'ready'
       this.armLiveness()
+      if (this.inboundPaused) ws.pause()
       log.info('ws ready — draining + listening')
       this.emit('ready')
+      this.flushAcks()
     })
 
     ws.on('message', (data) => {
@@ -140,6 +205,7 @@ export class AgentWsClient extends EventEmitter {
     ws.on('ping', () => this.armLiveness()) // ws auto-pongs; just refresh liveness
 
     ws.on('unexpected-response', (_req, res) => {
+      if (this.stopped) return
       if (res.statusCode === 401 || res.statusCode === 403) {
         this.state = 'terminal'
         this.clearTimers()
@@ -158,6 +224,7 @@ export class AgentWsClient extends EventEmitter {
 
     ws.on('close', (code) => {
       if (this.state === 'terminal' || this.stopped) return
+      this.acksInFlight.clear()
       log.warn(`ws closed (${code}) — scheduling reconnect`)
       this.scheduleReconnect()
     })
@@ -165,12 +232,18 @@ export class AgentWsClient extends EventEmitter {
 
   private scheduleReconnect(): void {
     if (this.stopped || this.state === 'terminal') return
+    // A liveness timeout terminates the socket and may race its `close` event.
+    // Both paths request a reconnect; one timer is enough.
+    if (this.reconnectTimer) return
     this.state = 'reconnecting'
     this.clearTimers()
     const backoff = Math.min(BASE_BACKOFF_MS * 2 ** this.attempt, MAX_BACKOFF_MS)
     const jitter = backoff * (0.5 + Math.random() * 0.5) // 50–100% of backoff
     this.attempt++
-    this.reconnectTimer = setTimeout(() => this.open(), jitter)
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null
+      this.open()
+    }, jitter)
   }
 
   private armLiveness(): void {
@@ -194,6 +267,10 @@ export class AgentWsClient extends EventEmitter {
     if (this.livenessTimer) {
       clearTimeout(this.livenessTimer)
       this.livenessTimer = null
+    }
+    if (this.ackRetryTimer) {
+      clearTimeout(this.ackRetryTimer)
+      this.ackRetryTimer = null
     }
   }
 }

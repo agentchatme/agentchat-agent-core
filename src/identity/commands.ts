@@ -470,8 +470,10 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
   }
 
   /**
-   * Sign out THIS agent and remove THIS agent's wiring. There is no `--all`,
-   * because a profile has no way to reach another agent — that is the point.
+   * Sign out THIS agent. Authentication and integration installation are
+   * separate lifecycles: logout must never silently remove hooks, MCP wiring,
+   * or a resident service. There is no `--all`, because a profile has no way
+   * to reach another agent — that is the point.
    */
   function runLogout(): number {
     const home = profile.home()
@@ -483,15 +485,8 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
       any = true
       reports.push('  credentials deleted')
     }
-    if (profile.removeWiring !== undefined) {
-      try {
-        const removed = profile.removeWiring()
-        if (removed.length > 0) reports.push(`  removed ${removed.join(', ')}`)
-      } catch {
-        reports.push(`  could not fully clean up the ${LABEL} wiring`)
-      }
-    }
     if (removeAnchorAt(anchorFile) === 'removed') {
+      any = true
       reports.push(`  ${anchorLabelOf(profile)} anchor removed`)
     }
 
@@ -586,7 +581,7 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
       }
     }
 
-    if (profile.extraDoctorChecks !== undefined) checks.push(...profile.extraDoctorChecks())
+    if (profile.extraDoctorChecks !== undefined) checks.push(...profile.extraDoctorChecks(opts))
 
     console.log(checks.map((c) => `${c.verdict.padEnd(4)} ${c.name}: ${c.detail}`).join('\n'))
     return checks.some((c) => c.verdict === 'FAIL') ? 1 : 0

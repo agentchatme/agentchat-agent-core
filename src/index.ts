@@ -144,6 +144,9 @@ export {
   markAlwaysOnWanted,
   clearAlwaysOnWanted,
   alwaysOnWanted,
+  readAlwaysOnInstalledVersion,
+  markAlwaysOnInstalledVersion,
+  clearAlwaysOnInstalledVersion,
   markAlwaysOnOptOut,
   clearAlwaysOnOptOut,
   alwaysOnOptedOut,
@@ -160,9 +163,16 @@ export {
   installService,
   uninstallService,
   serviceStatus,
+  serviceInstalled,
+  serviceDefinitionCurrent,
   planForTest,
+  systemdQuote,
+  systemdUnit,
+  xmlEscape,
+  launchdPlist,
   type ServiceOpts,
   type ServiceRef,
+  type Plan,
 } from './daemon/service.js'
 
 // The daemon's socket layer lives at `@agentchatme/agent-core/daemon`, not
@@ -172,4 +182,4 @@ export {
 // Utilities integrations legitimately share.
 export { log } from './util/log.js'
 export { relativeAge, absoluteUtc, relativeWhen, formatWhen } from './util/when.js'
-export { atomicWriteFile, readJsonFile } from './util/fsutil.js'
+export { atomicWriteFile, atomicCopyFile, readJsonFile } from './util/fsutil.js'
