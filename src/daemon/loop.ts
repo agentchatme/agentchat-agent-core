@@ -12,9 +12,9 @@ import type { RuntimeAdapter, TurnContext, TurnMentionContext } from './adapter-
 
 // ─── The core loop ──────────────────────────────────────────────────────────
 //
-// WS pushes message.new → dedup → coexistence check (yield to a live session,
-// then claim the sole right to reply) → (per-conversation serialized, globally
-// capped) run one runtime turn per bounded conversation backlog → ack every
+// WS pushes message.new → dedup → atomic foreground-aware ownership claim →
+// (per-conversation serialized, globally capped) run one runtime turn per
+// bounded conversation backlog → ack every
 // represented delivery only after that turn succeeds. Failures retry the same
 // frozen batch with bounded exponential backoff and remain unacknowledged until
 // they genuinely succeed.
@@ -60,11 +60,14 @@ const RETRY_MAX_MS = Math.max(
   RETRY_BASE_MS,
   positiveBoundedEnv('AGENTCHATD_RETRY_MAX_MS', 5 * 60_000),
 )
-// When the agent's live coding session is actively working, wait this long
-// before claiming — a head start so the human-driven session (priority) can
-// grab the message first. Only applies while a session is active; the common
-// "no session, daemon only" path has zero added latency. Tunable for testing.
-const YIELD_MS = Number(process.env['AGENTCHATD_YIELD_MS'] ?? 10_000)
+// A foreground lease makes the atomic claim return "deferred". Keep the
+// unacked row locally and retry at this cadence so a crashed foreground turn
+// becomes daemon-eligible as soon as its lease expires, without requiring a
+// WebSocket reconnect to replay the delivery.
+const FOREGROUND_RECHECK_MS = positiveBoundedEnv(
+  'AGENTCHATD_FOREGROUND_RECHECK_MS',
+  2_000,
+)
 
 const delay = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
 
@@ -137,6 +140,10 @@ export class Daemon {
   private pending = 0
   private inFlight = 0
   private readonly waiters: Array<() => void> = []
+  // Identity-wide foreground priority, learned from any deferred claim. Every
+  // conversation shares this window so a large multi-conversation backlog
+  // cannot turn into one polling loop per conversation.
+  private foregroundClaimsBlockedUntil = 0
   private stopping = false
   private heartbeatTimer: NodeJS.Timeout | null = null
 
@@ -256,22 +263,13 @@ export class Daemon {
       return
     }
 
-    // ── Coexistence: agree on exactly one replier ──
-    // If the agent's live coding session is actively working, yield briefly so
-    // its hook can claim + handle this first (the human-driven session has
-    // priority). Then claim the sole right to reply; whoever wins is it.
-    if (await this.coord.isSessionActive()) {
-      log.info(`msg ${first.id}: live session active — yielding for ${YIELD_MS}ms`)
-      await delay(YIELD_MS)
-      if (this.stopping) return
-    }
-
     // Wait for an actual runtime slot before freezing the backlog. Messages
     // that arrive while another conversation is using all slots can therefore
     // join this batch instead of causing avoidable follow-up turns.
     await this.acquireSlot()
     let slotHeld = true
     try {
+      await this.waitForForegroundClaimWindow()
       if (this.stopping) {
         return
       }
@@ -281,23 +279,42 @@ export class Daemon {
       const queue = this.convQueues.get(conversationId)
       if (!queue || queue.length === 0) return
       const candidates = queue.splice(0, MAX_BATCH_MESSAGES)
-      const claimedCount = await this.coord.claimBatch(
+      const claim = await this.coord.claimBatch(
         candidates.map((row) => row.id),
       )
+      const claimedCount = claim.claimedCount
       const batch = candidates.slice(0, claimedCount)
 
       if (claimedCount < candidates.length) {
-        const conflict = candidates[claimedCount] as SyncRow
-        // A live session owns this delivery. Forget our dedup state and do NOT
-        // ack: the session's sync path still needs to see and commit it.
-        log.info(`msg ${conflict.id}: claimed by the live session — standing down`)
-        this.seen.delete(conflict.id)
-        this.markNoLongerPending()
+        if (claim.deferred) {
+          this.foregroundClaimsBlockedUntil = Math.max(
+            this.foregroundClaimsBlockedUntil,
+            Date.now() + FOREGROUND_RECHECK_MS,
+          )
+          // Nobody owns this suffix yet. A foreground turn's lease atomically
+          // prevented the daemon claim, so keep every row queued. If that turn
+          // crashes, retrying here is the delivery's failover schedule.
+          const deferred = candidates.slice(claimedCount)
+          if (deferred.length > 0) {
+            const current = this.convQueues.get(conversationId) ?? []
+            this.convQueues.set(conversationId, [...deferred, ...current])
+          }
+          log.info(
+            `msg ${deferred[0]?.id}: foreground turn owns priority — deferring daemon claim`,
+          )
+        } else {
+          const conflict = candidates[claimedCount] as SyncRow
+          // A live session already owns this delivery. Forget our dedup state
+          // and do NOT ack: the session's sync path still needs to commit it.
+          log.info(`msg ${conflict.id}: claimed by the live session — standing down`)
+          this.seen.delete(conflict.id)
+          this.markNoLongerPending()
 
-        const unclaimedTail = candidates.slice(claimedCount + 1)
-        if (unclaimedTail.length > 0) {
-          const current = this.convQueues.get(conversationId) ?? []
-          this.convQueues.set(conversationId, [...unclaimedTail, ...current])
+          const unclaimedTail = candidates.slice(claimedCount + 1)
+          if (unclaimedTail.length > 0) {
+            const current = this.convQueues.get(conversationId) ?? []
+            this.convQueues.set(conversationId, [...unclaimedTail, ...current])
+          }
         }
       }
 
@@ -366,6 +383,14 @@ export class Daemon {
       }
     } finally {
       if (slotHeld) this.releaseSlot()
+    }
+  }
+
+  private async waitForForegroundClaimWindow(): Promise<void> {
+    while (!this.stopping) {
+      const remaining = this.foregroundClaimsBlockedUntil - Date.now()
+      if (remaining <= 0) return
+      await delay(remaining)
     }
   }
 

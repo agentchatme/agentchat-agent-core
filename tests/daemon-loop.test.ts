@@ -221,6 +221,86 @@ describe('daemon delivery state machine', () => {
     daemon.stop()
   })
 
+  it('keeps an active-turn-deferred delivery locally and claims it after handoff', async () => {
+    let batchClaims = 0
+    const claimBodies: Array<Record<string, unknown>> = []
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+        const url = String(input)
+        if (url.endsWith('/claim-batch')) {
+          batchClaims += 1
+          const body = JSON.parse(String(init?.body)) as Record<string, unknown>
+          claimBodies.push(body)
+          return new Response(
+            JSON.stringify(
+              batchClaims === 1
+                ? { claimed_count: 0, deferred: true }
+                : { claimed_count: 1 },
+            ),
+            { status: 200 },
+          )
+        }
+        return new Response(JSON.stringify({ active: false }), { status: 200 })
+      }),
+    )
+
+    const adapter = new FakeAdapter([{ ok: true }])
+    const daemon = new Daemon(cfg, adapter, ws as unknown as AgentWsClient)
+    await daemon.start()
+    ws.emit('inbound', row('msg_foreground'))
+
+    await new Promise((resolve) => setTimeout(resolve, 250))
+    expect(adapter.calls).toHaveLength(0)
+    expect(ws.acks).toEqual([])
+
+    await waitFor(() => ws.acks.includes('msg_foreground'))
+    expect(adapter.calls).toHaveLength(1)
+    expect(batchClaims).toBeGreaterThanOrEqual(2)
+    expect(claimBodies.every((body) => body['defer_if_active'] === true)).toBe(true)
+    daemon.stop()
+  })
+
+  it('bounds foreground rechecks across a multi-conversation backlog', async () => {
+    let batchClaims = 0
+    let foregroundActive = true
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+        const url = String(input)
+        if (url.endsWith('/claim-batch')) {
+          batchClaims += 1
+          const body = JSON.parse(String(init?.body)) as { message_ids: string[] }
+          return new Response(
+            JSON.stringify(
+              foregroundActive
+                ? { claimed_count: 0, deferred: true }
+                : { claimed_count: body.message_ids.length },
+            ),
+            { status: 200 },
+          )
+        }
+        return new Response(JSON.stringify({ active: false }), { status: 200 })
+      }),
+    )
+
+    const adapter = new FakeAdapter([])
+    const daemon = new Daemon(cfg, adapter, ws as unknown as AgentWsClient)
+    await daemon.start()
+    for (let index = 0; index < 20; index++) {
+      ws.emit('inbound', row(`msg_${index}`, 'hello', `conv_${index}`))
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 350))
+    expect(batchClaims).toBeGreaterThan(0)
+    expect(batchClaims).toBeLessThanOrEqual(3)
+
+    foregroundActive = false
+    await waitFor(() => ws.acks.length === 20)
+    expect(adapter.calls).toHaveLength(20)
+    daemon.stop()
+  })
+
   it('freezes a running batch and leaves later arrivals for the next turn', async () => {
     let finishFirst: (result: TurnResult) => void = () => {
       throw new Error('first turn did not start')

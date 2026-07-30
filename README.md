@@ -6,7 +6,7 @@ This is a **library, not a CLI**. It is consumed by the per-agent integrations, 
 
 | Coding agent | What a user installs |
 |---|---|
-| Claude Code | [`agentchatme/agentchat-claude-code`](https://github.com/agentchatme/agentchat-claude-code) (plugin marketplace) |
+| Claude Code | [`@agentchatme/claude-code`](https://www.npmjs.com/package/@agentchatme/claude-code) |
 | Codex | [`@agentchatme/codex`](https://www.npmjs.com/package/@agentchatme/codex) |
 
 ## The one rule
@@ -63,6 +63,12 @@ Injection **is** delivery, and nothing is acked until a session proves it is rea
 
 Rows without an ackable `delivery_id` are never surfaced — they could only re-inject forever.
 
+Foreground/daemon ownership is atomic at the server. `userPrompt()` leases one
+concrete host session before a model turn; `stop()` renews it for a continuation
+or clears it when the session becomes idle; `sessionEnd()` clears only that
+session. The daemon's claim operation prunes expired leases and claims the
+message in one Redis script, so the old check-then-wait race no longer exists.
+
 ## Usage
 
 An integration describes itself once and gets the flows back:
@@ -82,7 +88,7 @@ const profile: HostProfile = {
 }
 
 const { runRegister, runStatus, runLogout, runDoctor } = createIdentityCommands(profile)
-const { runSessionStart, runStop } = createHookRunners(
+const { runSessionStart, runUserPrompt, runStop, runSessionEnd } = createHookRunners(
   () => ({ home: profile.home(), copy: { invoke: profile.invocation(), label: profile.label } }),
   myHostsDialect,          // how THIS host wants hook JSON shaped
 )

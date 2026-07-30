@@ -155,7 +155,7 @@ export async function syncPeek(
 
 /**
  * Commit every delivery at-or-before the cursor as delivered. In the
- * plugin model this is called at the moment rows are injected into the
+ * host integration this is called at the moment rows are injected into the
  * agent's context — injection IS delivery.
  */
 export async function syncAck(cfg: WireConfig, lastDeliveryId: string): Promise<number> {
@@ -189,8 +189,7 @@ export async function getMeLite(cfg: WireConfig): Promise<{ handle: string } | n
 // exactly as it does today (announce nothing, surface everything) — never hide
 // mail, never block a turn.
 
-/** Announce/refresh "this live session is actively working" so the daemon
- *  yields to it. Best-effort; a failure is a silent no-op. */
+/** Legacy single-flag activity marker retained for older integrations. */
 export async function markSessionActive(cfg: WireConfig, ttlSeconds?: number): Promise<void> {
   try {
     await request(cfg, 'PUT', '/v1/reply/active', ttlSeconds !== undefined ? { ttl_seconds: ttlSeconds } : {})
@@ -206,6 +205,35 @@ export async function clearSessionActive(cfg: WireConfig): Promise<void> {
     await request(cfg, 'DELETE', '/v1/reply/active')
   } catch {
     /* best-effort — the TTL expires it anyway */
+  }
+}
+
+/**
+ * Lease one concrete foreground turn. Unlike the legacy boolean marker, this
+ * is keyed by host session id so one terminal reaching Stop cannot clear
+ * another terminal that is still reasoning.
+ */
+export async function markForegroundTurn(
+  cfg: WireConfig,
+  sessionId: string,
+  ttlSeconds: number,
+): Promise<void> {
+  try {
+    await request(cfg, 'PUT', '/v1/reply/active', {
+      session_id: sessionId,
+      ttl_seconds: ttlSeconds,
+    })
+  } catch (err) {
+    log.warn(`foreground-turn mark failed (ignored): ${String(err)}`)
+  }
+}
+
+/** Release only this host session's foreground lease. Best-effort. */
+export async function clearForegroundTurn(cfg: WireConfig, sessionId: string): Promise<void> {
+  try {
+    await request(cfg, 'DELETE', '/v1/reply/active', { session_id: sessionId })
+  } catch {
+    // Best-effort — the lease expires after a crash or an older API rollout.
   }
 }
 

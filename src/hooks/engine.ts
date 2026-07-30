@@ -14,7 +14,8 @@ import {
   syncPeek,
   syncAck,
   lastDeliveryId,
-  markSessionActive,
+  markForegroundTurn,
+  clearForegroundTurn,
   claimReplyBatch,
   getMeLite,
   type WireConfig,
@@ -62,6 +63,10 @@ import { alwaysOnHealth, alwaysOnState } from '../daemon/health.js'
 const SESSION_START_PEEK_LIMIT = 100
 const STOP_PEEK_LIMIT = 50
 const DEFAULT_MAX_CONTINUATIONS = 5
+// Normal handoff is explicit at Stop/SessionEnd. This lease is only the crash
+// fallback, so favor preserving a long foreground deliberation over handing
+// its inbox to a separate daemon context.
+const FOREGROUND_TURN_TTL_SECONDS = 600
 
 export interface HookContext {
   /** THIS integration's identity home. Never resolved here. */
@@ -173,8 +178,8 @@ export async function sessionStart(
     const identity = resolveIdentity(ctx.home)
     if (identity === null) {
       // First-run experience: let the agent offer registration — but at most
-      // once a day, not once per session. An unregistered plugin should be
-      // quiet, not a nag.
+      // once a day, not once per session. An unregistered integration should
+      // be quiet, not a nag.
       if (shouldOfferRegistration(ctx.home)) {
         recordRegistrationOffer(ctx.home)
         return { context: formatRegistrationOffer(ctx.copy, alwaysOnState(ctx.home)) }
@@ -183,9 +188,6 @@ export async function sessionStart(
     }
 
     const cfg: WireConfig = { apiKey: identity.apiKey, apiBase: identity.apiBase }
-    // Announce this session so the always-on daemon (if the user runs one)
-    // yields incoming messages to it. Fail-open: a no-op without /v1/reply.
-    await markSessionActive(cfg)
 
     // If the user set up always-on but its daemon isn't beating, surface that —
     // independent of the inbox, since being silently unreachable is the point.
@@ -226,10 +228,14 @@ export async function userPrompt(ctx: HookContext, input: HookInput): Promise<vo
     const identity = resolveIdentity(ctx.home)
     if (identity === null) return
 
+    const cfg: WireConfig = { apiKey: identity.apiKey, apiBase: identity.apiBase }
+    // This is the exact boundary at which a foreground model turn begins.
+    // Announce it even when there was no startup digest to ack.
+    await markForegroundTurn(cfg, input.sessionId, FOREGROUND_TURN_TTL_SECONDS)
+
     const cursor = takePendingAck(ctx.home, input.sessionId)
     if (cursor === null) return
 
-    const cfg: WireConfig = { apiKey: identity.apiKey, apiBase: identity.apiBase }
     try {
       await syncAck(cfg, cursor)
     } catch (err) {
@@ -245,50 +251,73 @@ export async function userPrompt(ctx: HookContext, input: HookInput): Promise<vo
 
 export async function stop(ctx: HookContext, input: HookInput): Promise<StopResult> {
   const none: StopResult = { reason: null, commit: async () => {} }
+  let cfg: WireConfig | null = null
   try {
     if (hooksDisabled()) return none
 
     const identity = resolveIdentity(ctx.home)
     if (identity === null) return none
 
-    const cfg: WireConfig = { apiKey: identity.apiKey, apiBase: identity.apiBase }
-    // Keep announcing this session so the daemon keeps yielding — even when
-    // we're capped this sitting: a capped session still OWNS its inbox, and
-    // the daemon taking over would defeat the continuation loop-guard.
-    await markSessionActive(cfg)
+    cfg = { apiKey: identity.apiKey, apiBase: identity.apiBase }
+    // Renew before the sync/claim work. If this hook continues the model with
+    // an inbound digest, the lease protects that continuation until its next
+    // Stop. Every path that actually becomes idle clears below.
+    await markForegroundTurn(cfg, input.sessionId, FOREGROUND_TURN_TTL_SECONDS)
 
     const cap = maxContinuations()
     if (getContinuations(ctx.home, input.sessionId) >= cap) {
       log.info(
         `stop hook: continuation cap (${cap}) reached for ${input.sessionId}; leaving inbox queued`,
       )
+      await clearForegroundTurn(cfg, input.sessionId)
       return none
     }
 
     const peeked = ackableRows(await syncPeek(cfg, { limit: STOP_PEEK_LIMIT }))
-    if (peeked.length === 0) return none
+    if (peeked.length === 0) {
+      await clearForegroundTurn(cfg, input.sessionId)
+      return none
+    }
     const rows = await claimContiguousPrefix(cfg, peeked, `session:${input.sessionId}`)
-    if (rows.length === 0) return none
+    if (rows.length === 0) {
+      await clearForegroundTurn(cfg, input.sessionId)
+      return none
+    }
 
     recordContinuation(ctx.home, input.sessionId)
 
     const handle = await resolveHandle(cfg, identity.handle)
     const reason = formatStopPickup(handle, rows)
     const cursor = lastDeliveryId(rows)
+    const claimedCfg = cfg
 
     return {
       reason,
       commit: async () => {
         if (cursor === null) return
         try {
-          await syncAck(cfg, cursor)
+          await syncAck(claimedCfg, cursor)
         } catch (err) {
           log.warn(`stop ack failed (messages stay queued): ${String(err)}`)
         }
       },
     }
   } catch (err) {
+    if (cfg !== null) await clearForegroundTurn(cfg, input.sessionId)
     log.warn(`stop hook degraded to no-op: ${String(err)}`)
     return none
+  }
+}
+
+/** A host session is closing. Release only its own foreground lease. */
+export async function sessionEnd(ctx: HookContext, input: HookInput): Promise<void> {
+  try {
+    if (hooksDisabled()) return
+    const identity = resolveIdentity(ctx.home)
+    if (identity === null) return
+    const cfg: WireConfig = { apiKey: identity.apiKey, apiBase: identity.apiBase }
+    await clearForegroundTurn(cfg, input.sessionId)
+  } catch (err) {
+    log.warn(`session-end hook degraded to no-op: ${String(err)}`)
   }
 }

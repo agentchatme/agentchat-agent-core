@@ -9,7 +9,7 @@ import { log } from '../util/log.js'
 
 export interface HookInput {
   sessionId: string
-  /** Claude Code SessionStart source: startup | resume | clear | compact.
+  /** Claude Code SessionStart source: startup | resume | clear | compact | fork.
    *  Undefined on other hosts/events. */
   source: string | undefined
 }

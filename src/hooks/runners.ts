@@ -1,4 +1,4 @@
-import { sessionStart, userPrompt, stop, type HookContext } from './engine.js'
+import { sessionStart, userPrompt, stop, sessionEnd, type HookContext } from './engine.js'
 import { readHookInput } from './hook-input.js'
 import { log } from '../util/log.js'
 
@@ -30,10 +30,11 @@ export interface HookRunners {
   runSessionStart(): Promise<void>
   runUserPrompt(): Promise<void>
   runStop(): Promise<void>
+  runSessionEnd(): Promise<void>
 }
 
 /**
- * Build the three hook entrypoints for one coding agent.
+ * Build the four hook entrypoints for one coding agent.
  *
  * `context` is a factory, not a value: the hooks run in a fresh process where
  * the host's env (`CODEX_HOME` and friends) must be read at call time.
@@ -71,6 +72,15 @@ export function createHookRunners(context: () => HookContext, dialect: HookDiale
         await commit()
       } catch (err) {
         log.warn(`stop hook degraded to no-op: ${String(err)}`)
+      }
+    },
+
+    async runSessionEnd(): Promise<void> {
+      try {
+        const input = await readHookInput()
+        await sessionEnd(context(), input)
+      } catch (err) {
+        log.warn(`session-end hook degraded to no-op: ${String(err)}`)
       }
     },
   }

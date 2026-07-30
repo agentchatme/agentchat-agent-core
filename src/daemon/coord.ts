@@ -8,8 +8,8 @@ import { CODING_AGENTS_CLIENT_HEADERS } from '../client-identity.js'
 //
 // Design rule: EVERY call fails OPEN toward replying. A coordination outage
 // (Redis/API blip) must never make the daemon go silent — a missed reply is
-// worse than a rare double. So `claim` fails to TRUE (reply anyway) and
-// `isSessionActive` fails to FALSE (don't yield to a session we can't see).
+// worse than a rare double. Atomic claims normally defer new daemon work while
+// a foreground turn is leased; an outage degrades to replying.
 
 export interface CoordConfig {
   apiKey: string
@@ -18,6 +18,16 @@ export interface CoordConfig {
    *  restart on the same host so the daemon re-claims its own in-flight work. */
   holder: string
   timeoutMs?: number
+}
+
+export interface ClaimOutcome {
+  claimed: boolean
+  deferred: boolean
+}
+
+export interface ClaimBatchOutcome {
+  claimedCount: number
+  deferred: boolean
 }
 
 export class ReplyCoord {
@@ -51,20 +61,23 @@ export class ReplyCoord {
   }
 
   /**
-   * Claim the sole right to reply to a message. Returns true if THIS daemon is
-   * the designated replier, false if a live session already owns it. Fail-open
-   * → TRUE (reply anyway rather than drop).
+   * Claim the sole right to reply to a message, atomically respecting any
+   * foreground turn. Fail-open → claimed (reply anyway rather than drop).
    */
-  async claim(messageId: string): Promise<boolean> {
+  async claim(messageId: string): Promise<ClaimOutcome> {
     try {
       const d = (await this.req('POST', '/v1/reply/claim', {
         message_id: messageId,
         holder: this.cfg.holder,
-      })) as { claimed?: boolean }
-      return d?.claimed !== false
+        defer_if_active: true,
+      })) as { claimed?: boolean; deferred?: boolean }
+      return {
+        claimed: d?.claimed !== false,
+        deferred: d?.deferred === true,
+      }
     } catch (err) {
       log.debug(`coord claim failed (proceeding): ${String(err)}`)
-      return true
+      return { claimed: true, deferred: false }
     }
   }
 
@@ -73,29 +86,37 @@ export class ReplyCoord {
    * Falls back to ordered single-message claims against an older API server;
    * all other coordination failures remain fail-open.
    */
-  async claimBatch(messageIds: string[]): Promise<number> {
-    if (messageIds.length === 0) return 0
+  async claimBatch(messageIds: string[]): Promise<ClaimBatchOutcome> {
+    if (messageIds.length === 0) return { claimedCount: 0, deferred: false }
     try {
       const d = (await this.req('POST', '/v1/reply/claim-batch', {
         message_ids: messageIds,
         holder: this.cfg.holder,
-      })) as { claimed_count?: number }
+        defer_if_active: true,
+      })) as { claimed_count?: number; deferred?: boolean }
       const count = d?.claimed_count
-      return Number.isInteger(count) && (count as number) >= 0 && (count as number) <= messageIds.length
-        ? (count as number)
-        : messageIds.length
+      return {
+        claimedCount:
+          Number.isInteger(count) && (count as number) >= 0 && (count as number) <= messageIds.length
+            ? (count as number)
+            : messageIds.length,
+        deferred: d?.deferred === true,
+      }
     } catch (err) {
       if (!/reply-coord (404|405)\b/.test(String(err))) {
         log.debug(`coord batch claim failed (proceeding with all): ${String(err)}`)
-        return messageIds.length
+        return { claimedCount: messageIds.length, deferred: false }
       }
     }
 
     let claimed = 0
     for (const messageId of messageIds) {
-      if (!(await this.claim(messageId))) break
+      const outcome = await this.claim(messageId)
+      if (!outcome.claimed) {
+        return { claimedCount: claimed, deferred: outcome.deferred }
+      }
       claimed += 1
     }
-    return claimed
+    return { claimedCount: claimed, deferred: false }
   }
 }
