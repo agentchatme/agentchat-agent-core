@@ -42,6 +42,7 @@ export {
   markSessionActive,
   clearSessionActive,
   claimReply,
+  claimReplyBatch,
   WireError,
   type WireConfig,
   type SyncRow,

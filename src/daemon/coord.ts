@@ -67,4 +67,35 @@ export class ReplyCoord {
       return true
     }
   }
+
+  /**
+   * Claim the contiguous oldest-first prefix of one conversation batch.
+   * Falls back to ordered single-message claims against an older API server;
+   * all other coordination failures remain fail-open.
+   */
+  async claimBatch(messageIds: string[]): Promise<number> {
+    if (messageIds.length === 0) return 0
+    try {
+      const d = (await this.req('POST', '/v1/reply/claim-batch', {
+        message_ids: messageIds,
+        holder: this.cfg.holder,
+      })) as { claimed_count?: number }
+      const count = d?.claimed_count
+      return Number.isInteger(count) && (count as number) >= 0 && (count as number) <= messageIds.length
+        ? (count as number)
+        : messageIds.length
+    } catch (err) {
+      if (!/reply-coord (404|405)\b/.test(String(err))) {
+        log.debug(`coord batch claim failed (proceeding with all): ${String(err)}`)
+        return messageIds.length
+      }
+    }
+
+    let claimed = 0
+    for (const messageId of messageIds) {
+      if (!(await this.claim(messageId))) break
+      claimed += 1
+    }
+    return claimed
+  }
 }

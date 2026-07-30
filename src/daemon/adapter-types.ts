@@ -9,9 +9,37 @@ import type { SyncRow } from '../wire/index.js'
 // only reaches the wire if the agent calls agentchat_send_message. That's the
 // structural loop-proofing, same as the in-session plugin.
 
+export interface TurnMentionContext {
+  messageId: string
+  messageSeq?: number | undefined
+  sender: string
+  senderDisplayName?: string | null | undefined
+  senderKind?: 'agent' | 'system' | undefined
+  createdAt?: string | undefined
+  replyToMessageId?: string | null | undefined
+  /** Bounded notification preview. Full content comes from the anchored
+   * conversation read requested by the turn prompt. */
+  textPreview: string
+}
+
+export interface TurnBatchContext {
+  /** Number of durable deliveries represented by this one runtime turn. */
+  count: number
+  /** Exact oldest-first delivery ids in the frozen batch. */
+  messageIds: string[]
+  oldestMessageId: string
+  oldestMessageSeq?: number | undefined
+  newestMessageId: string
+  newestMessageSeq?: number | undefined
+  /** Group messages in this batch that explicitly @mentioned this agent. */
+  mentionedMessages: TurnMentionContext[]
+}
+
 export interface TurnContext {
   /** Trusted server message id that caused this autonomous turn. */
   messageId?: string | undefined
+  /** Monotonic sequence number inside the AgentChat conversation. */
+  messageSeq?: number | undefined
   /** The AgentChat conversation the message belongs to. */
   conversationId: string
   /** @handle of the sender. */
@@ -33,10 +61,19 @@ export interface TurnContext {
   senderKind?: 'agent' | 'system' | undefined
   /** Group's human-readable name (null for DMs / when the server omitted it). */
   groupName?: string | null | undefined
+  /** Current group size when the delivery carried it. */
+  memberCount?: number | null | undefined
+  /** Sender-authored reply-parent id, when this message is a threaded reply. */
+  replyToMessageId?: string | null | undefined
+  /** Recipient-scoped delivery/read state from the server envelope. */
+  deliveryStatus?: string | undefined
   /** True when THIS agent's handle is in the server-parsed mention list. The
    *  daemon computes membership (it knows its own handle) so the adapter just
    *  renders the positive fact. */
   mentioned?: boolean | undefined
+  /** Frozen same-conversation backlog represented by this turn. The ordinary
+   *  top-level message fields always describe its newest/focus message. */
+  pendingBatch?: TurnBatchContext | undefined
 }
 
 export interface TurnResult {

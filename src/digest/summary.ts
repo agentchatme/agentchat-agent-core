@@ -17,6 +17,8 @@ interface ConversationDigest {
   senders: string[]
   count: number
   latestSnippet: string
+  /** Exact newest message id, used to anchor the compact history window. */
+  latestMessageId: string
   /** created_at of the newest message in this conversation, for a relative
    *  "latest N ago" recency cue that lets the agent triage by freshness.
    *  Explicit `| undefined` so a row missing created_at is assignable under
@@ -27,6 +29,9 @@ interface ConversationDigest {
   /** True if any unread message in this conversation @-mentioned this agent —
    *  a strong triage signal to open it first. */
   mentionsYou?: boolean | undefined
+  /** Exact oldest-first mention ids, so an older mention can be surfaced
+   *  alongside the newest-message anchor instead of reduced to a boolean. */
+  mentionedMessageIds: string[]
 }
 
 const SNIPPET_MAX = 140
@@ -54,9 +59,11 @@ export function digestConversations(
       existing.count += 1
       if (!existing.senders.includes(sender)) existing.senders.push(sender)
       existing.latestSnippet = snippetOf(row) // rows arrive oldest-first; last write wins
+      existing.latestMessageId = row.id
       existing.latestCreatedAt = row.created_at ?? existing.latestCreatedAt
       existing.groupName = ctx.groupName ?? existing.groupName
       existing.mentionsYou = existing.mentionsYou || mentionsSelf
+      if (mentionsSelf) existing.mentionedMessageIds.push(row.id)
     } else {
       byConversation.set(row.conversation_id, {
         conversationId: row.conversation_id,
@@ -64,9 +71,11 @@ export function digestConversations(
         senders: [sender],
         count: 1,
         latestSnippet: snippetOf(row),
+        latestMessageId: row.id,
         latestCreatedAt: row.created_at,
         groupName: ctx.groupName,
         mentionsYou: mentionsSelf,
+        mentionedMessageIds: mentionsSelf ? [row.id] : [],
       })
     }
   }
@@ -86,9 +95,18 @@ function digestLines(digests: ConversationDigest[]): string[] {
     const age = relativeWhen(d.latestCreatedAt)
     const recency = age ? `, latest ${age}` : ''
     const mention = d.mentionsYou ? ' — mentions you' : ''
+    const attentionIds = d.mentionedMessageIds.slice(-30)
+    const attention =
+      attentionIds.length > 0
+        ? `, attention_message_ids=${JSON.stringify(attentionIds)}${
+            d.mentionedMessageIds.length > attentionIds.length
+              ? ` (+${d.mentionedMessageIds.length - attentionIds.length} older mentions in history)`
+              : ''
+          }`
+        : ''
     // JSON string encoding prevents quotes/backslashes in a peer-authored
     // preview from escaping its one-line data field.
-    return `${i + 1}. ${who} (${count}, ${kind}${recency}${mention}), preview=${JSON.stringify(d.latestSnippet)}`
+    return `${i + 1}. ${who} (${count}, ${kind}${recency}${mention}), latest_message_id=${d.latestMessageId}${attention}, preview=${JSON.stringify(d.latestSnippet)}`
   })
 }
 
@@ -107,7 +125,7 @@ export function formatSessionStart(handle: string | null, rows: SyncRow[]): stri
     '',
     ...digestLines(digests),
     '',
-    'Triage per your AgentChat skill: read a conversation with agentchat_get_conversation before replying; reply only where an open request is addressed to you; finished conversations get silence, not acknowledgments. Mention anything the user should know about.',
+    'Triage per your AgentChat skill: read a conversation with agentchat_get_conversation before replying, passing its latest_message_id as around_message_id and any listed attention_message_ids exactly; reply only where an open request is addressed to you; finished conversations get silence, not acknowledgments. Mention anything the user should know about.',
   ].join('\n')
 }
 
@@ -122,7 +140,7 @@ export function formatStopPickup(handle: string | null, rows: SyncRow[]): string
     '',
     ...digestLines(digests),
     '',
-    'Handle these per your AgentChat skill, then finish. Reply via agentchat_send_message only where warranted — if nothing is actionable, simply end the turn (silence is a valid outcome).',
+    'Handle these per your AgentChat skill, opening each conversation with agentchat_get_conversation, its latest_message_id as around_message_id, and any listed attention_message_ids exactly. Reply via agentchat_send_message only where warranted — if nothing is actionable, simply end the turn (silence is a valid outcome).',
   ].join('\n')
 }
 

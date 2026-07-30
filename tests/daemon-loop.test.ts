@@ -65,10 +65,20 @@ beforeEach(() => {
   }
   vi.stubGlobal(
     'fetch',
-    vi.fn(async (input: string | URL | Request) => {
+    vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const url = String(input)
+      const body =
+        typeof init?.body === 'string'
+          ? (JSON.parse(init.body) as { message_ids?: string[] })
+          : {}
       return new Response(
-        JSON.stringify(url.endsWith('/active') ? { active: false } : { claimed: true }),
+        JSON.stringify(
+          url.endsWith('/active')
+            ? { active: false }
+            : url.endsWith('/claim-batch')
+              ? { claimed_count: body.message_ids?.length ?? 0 }
+              : { claimed: true },
+        ),
         { status: 200, headers: { 'content-type': 'application/json' } },
       )
     }),
@@ -89,6 +99,7 @@ const row = (
   id,
   conversation_id: conversationId,
   sender,
+  seq: 7,
   type: 'text',
   content: { text },
   created_at: '2026-07-30T00:00:00Z',
@@ -123,8 +134,8 @@ describe('daemon delivery state machine', () => {
     daemon.stop()
   })
 
-  it('processes every message in a same-conversation burst as its own ordered turn', async () => {
-    const adapter = new FakeAdapter([{ ok: true }, { ok: true }, { ok: true }])
+  it('coalesces a same-conversation burst into one turn focused on the newest message', async () => {
+    const adapter = new FakeAdapter([{ ok: true }])
     const daemon = new Daemon(cfg, adapter, ws as unknown as AgentWsClient)
     await daemon.start()
     ws.emit('inbound', row('msg_1', 'from Alice', 'grp_1', 'alice'))
@@ -132,19 +143,192 @@ describe('daemon delivery state machine', () => {
     ws.emit('inbound', row('msg_3', 'from Carol', 'grp_1', 'carol'))
 
     await waitFor(() => ws.acks.length === 3)
-    expect(adapter.calls.map((call) => call.messageId)).toEqual(['msg_1', 'msg_2', 'msg_3'])
-    expect(adapter.calls.map((call) => call.sender)).toEqual(['alice', 'bob', 'carol'])
-    expect(adapter.calls.map((call) => call.text)).toEqual([
-      'from Alice',
-      'from Bob',
-      'from Carol',
-    ])
+    expect(adapter.calls).toHaveLength(1)
+    expect(adapter.calls[0]).toMatchObject({
+      messageId: 'msg_3',
+      sender: 'carol',
+      text: 'from Carol',
+      pendingBatch: {
+        count: 3,
+        messageIds: ['msg_1', 'msg_2', 'msg_3'],
+        oldestMessageId: 'msg_1',
+        newestMessageId: 'msg_3',
+      },
+    })
     expect(ws.acks).toEqual(['msg_1', 'msg_2', 'msg_3'])
     daemon.stop()
   })
 
+  it('bounds one backlog turn at 30 messages and carries the remainder forward', async () => {
+    const adapter = new FakeAdapter([{ ok: true }, { ok: true }])
+    const daemon = new Daemon(cfg, adapter, ws as unknown as AgentWsClient)
+    await daemon.start()
+    for (let index = 1; index <= 31; index++) {
+      ws.emit('inbound', row(`msg_${index}`, `message ${index}`))
+    }
+
+    await waitFor(() => ws.acks.length === 31)
+    expect(adapter.calls).toHaveLength(2)
+    expect(adapter.calls[0]).toMatchObject({
+      messageId: 'msg_30',
+      pendingBatch: { count: 30 },
+    })
+    expect(adapter.calls[1]).toMatchObject({
+      messageId: 'msg_31',
+      pendingBatch: { count: 1 },
+    })
+    daemon.stop()
+  })
+
+  it('acknowledges only the contiguous prefix it owns when a live session has a conflict', async () => {
+    let batchClaim = 0
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+        const url = String(input)
+        if (url.endsWith('/active')) {
+          return new Response(JSON.stringify({ active: false }), { status: 200 })
+        }
+        if (url.endsWith('/claim-batch')) {
+          batchClaim += 1
+          const body = JSON.parse(String(init?.body)) as {
+            message_ids: string[]
+          }
+          return new Response(
+            JSON.stringify({
+              claimed_count: batchClaim === 1 ? 1 : body.message_ids.length,
+            }),
+            { status: 200 },
+          )
+        }
+        return new Response(JSON.stringify({ claimed: true }), { status: 200 })
+      }),
+    )
+    const adapter = new FakeAdapter([{ ok: true }, { ok: true }])
+    const daemon = new Daemon(cfg, adapter, ws as unknown as AgentWsClient)
+    await daemon.start()
+    ws.emit('inbound', row('msg_1'))
+    ws.emit('inbound', row('msg_session_owned'))
+    ws.emit('inbound', row('msg_3'))
+
+    await waitFor(() => ws.acks.length === 2)
+    expect(adapter.calls.map((call) => call.messageId)).toEqual([
+      'msg_1',
+      'msg_3',
+    ])
+    expect(ws.acks).toEqual(['msg_1', 'msg_3'])
+    expect(ws.acks).not.toContain('msg_session_owned')
+    daemon.stop()
+  })
+
+  it('freezes a running batch and leaves later arrivals for the next turn', async () => {
+    let finishFirst: (result: TurnResult) => void = () => {
+      throw new Error('first turn did not start')
+    }
+    const heldFirst = new Promise<TurnResult>((resolve) => {
+      finishFirst = resolve
+    })
+    const adapter = new FakeAdapter([heldFirst, { ok: true }])
+    const daemon = new Daemon(cfg, adapter, ws as unknown as AgentWsClient)
+    await daemon.start()
+    ws.emit('inbound', row('msg_1'))
+    await waitFor(() => adapter.calls.length === 1)
+
+    ws.emit('inbound', row('msg_2'))
+    expect(adapter.calls[0]?.pendingBatch?.messageIds).toEqual(['msg_1'])
+    expect(ws.acks).toEqual([])
+
+    finishFirst({ ok: true })
+    await waitFor(() => ws.acks.length === 2)
+    expect(adapter.calls.map((call) => call.messageId)).toEqual(['msg_1', 'msg_2'])
+    expect(adapter.calls[1]?.pendingBatch?.messageIds).toEqual(['msg_2'])
+    daemon.stop()
+  })
+
+  it('passes message anchoring, reply, group, and delivery metadata to the runtime', async () => {
+    const adapter = new FakeAdapter([{ ok: true }])
+    const daemon = new Daemon(cfg, adapter, ws as unknown as AgentWsClient)
+    await daemon.start()
+    ws.emit('inbound', {
+      ...row('msg_context', 'follow-up', 'grp_ops', 'alice'),
+      metadata: { reply_to: 'msg_parent' },
+      status: 'delivered',
+      context: {
+        sender: {
+          handle: 'alice',
+          display_name: 'Alice',
+          kind: 'agent',
+        },
+        conversation: {
+          type: 'group',
+          group_name: 'Ops',
+          member_count: 5,
+        },
+        mentions: ['local-agent'],
+      },
+    })
+
+    await waitFor(() => ws.acks.includes('msg_context'))
+    expect(adapter.calls[0]).toMatchObject({
+      messageId: 'msg_context',
+      messageSeq: 7,
+      groupName: 'Ops',
+      memberCount: 5,
+      replyToMessageId: 'msg_parent',
+      deliveryStatus: 'delivered',
+      mentioned: true,
+    })
+    daemon.stop()
+  })
+
+  it('surfaces older group mentions explicitly while keeping the newest message as focus', async () => {
+    const adapter = new FakeAdapter([{ ok: true }])
+    const daemon = new Daemon(cfg, adapter, ws as unknown as AgentWsClient)
+    await daemon.start()
+    ws.emit('inbound', {
+      ...row('msg_mention', 'please check this', 'grp_ops', 'alice'),
+      seq: 10,
+      context: {
+        sender: { handle: 'alice', display_name: 'Alice', kind: 'agent' },
+        conversation: { type: 'group', group_name: 'Ops', member_count: 4 },
+        mentions: ['local-agent'],
+      },
+    })
+    ws.emit('inbound', {
+      ...row('msg_latest', 'separate latest update', 'grp_ops', 'bob'),
+      seq: 11,
+      context: {
+        sender: { handle: 'bob', display_name: 'Bob', kind: 'agent' },
+        conversation: { type: 'group', group_name: 'Ops', member_count: 4 },
+        mentions: [],
+      },
+    })
+
+    await waitFor(() => ws.acks.length === 2)
+    expect(adapter.calls).toHaveLength(1)
+    expect(adapter.calls[0]).toMatchObject({
+      messageId: 'msg_latest',
+      mentioned: false,
+      pendingBatch: {
+        count: 2,
+        oldestMessageSeq: 10,
+        newestMessageSeq: 11,
+        mentionedMessages: [
+          {
+            messageId: 'msg_mention',
+            messageSeq: 10,
+            sender: 'alice',
+            senderDisplayName: 'Alice',
+            textPreview: 'please check this',
+          },
+        ],
+      },
+    })
+    daemon.stop()
+  })
+
   it(
-    'keeps a failed message pending past three attempts and blocks later messages until success',
+    'keeps a failed batch pending past three attempts and acknowledges none until success',
     async () => {
       let finishFourthAttempt: (result: TurnResult) => void = () => {
         throw new Error('fourth attempt did not start')
@@ -157,7 +341,6 @@ describe('daemon delivery state machine', () => {
         { ok: false, detail: 'failure two' },
         { ok: false, detail: 'failure three' },
         heldFourthAttempt,
-        { ok: true },
       ])
       const daemon = new Daemon(cfg, adapter, ws as unknown as AgentWsClient)
       await daemon.start()
@@ -167,19 +350,22 @@ describe('daemon delivery state machine', () => {
       await waitFor(() => adapter.calls.length >= 4, 8_500)
       expect(ws.acks).toEqual([])
       expect(adapter.calls.map((call) => call.messageId)).toEqual([
+        'msg_after',
+        'msg_after',
+        'msg_after',
+        'msg_after',
+      ])
+      expect(adapter.calls[0]?.pendingBatch?.messageIds).toEqual([
         'msg_blocking',
-        'msg_blocking',
-        'msg_blocking',
-        'msg_blocking',
+        'msg_after',
       ])
 
       finishFourthAttempt({ ok: true })
       await waitFor(() => ws.acks.length === 2)
       expect(adapter.calls.map((call) => call.messageId)).toEqual([
-        'msg_blocking',
-        'msg_blocking',
-        'msg_blocking',
-        'msg_blocking',
+        'msg_after',
+        'msg_after',
+        'msg_after',
         'msg_after',
       ])
       expect(ws.acks).toEqual(['msg_blocking', 'msg_after'])

@@ -25,8 +25,11 @@ const SyncRowSchema = z
     // fallback against a future server-side rename).
     sender: z.string().optional(),
     sender_handle: z.string().optional(),
+    seq: z.number().optional(),
     type: z.string().optional(),
     content: z.record(z.unknown()).optional(),
+    metadata: z.record(z.unknown()).optional(),
+    status: z.string().optional(),
     created_at: z.string().optional(),
   })
   .passthrough()
@@ -181,7 +184,7 @@ export async function getMeLite(cfg: WireConfig): Promise<{ handle: string } | n
 // ─── Reply coordination (always-on daemon coexistence) ──────────────────────
 //
 // When a user also runs the always-on daemon for this agent, these let a live
-// session and the daemon agree on ONE replier. All three are FAIL-OPEN: if the
+// session and the daemon agree on ONE replier. Coordination is FAIL-OPEN: if the
 // API predates /v1/reply or coordination is briefly down, the session behaves
 // exactly as it does today (announce nothing, surface everything) — never hide
 // mail, never block a turn.
@@ -218,6 +221,44 @@ export async function claimReply(cfg: WireConfig, messageId: string, holder: str
     log.warn(`reply-claim failed (surfacing anyway): ${String(err)}`)
     return true
   }
+}
+
+/**
+ * Claim the contiguous oldest-first prefix of a batch. The batch endpoint
+ * avoids claiming newer rows past a message another replier owns. During a
+ * rolling server upgrade, fall back to ordered single-message claims only
+ * when the endpoint itself is absent. Other coordination failures stay
+ * fail-open and surface the whole batch.
+ */
+export async function claimReplyBatch(
+  cfg: WireConfig,
+  messageIds: string[],
+  holder: string,
+): Promise<number> {
+  if (messageIds.length === 0) return 0
+  try {
+    const data = await request(cfg, 'POST', '/v1/reply/claim-batch', {
+      message_ids: messageIds,
+      holder,
+    })
+    const parsed = z
+      .object({ claimed_count: z.number().int().min(0).max(messageIds.length) })
+      .passthrough()
+      .safeParse(data)
+    return parsed.success ? parsed.data.claimed_count : messageIds.length
+  } catch (err) {
+    if (!/AgentChat API (404|405)\b/.test(String(err))) {
+      log.warn(`reply-batch-claim failed (surfacing all): ${String(err)}`)
+      return messageIds.length
+    }
+  }
+
+  let claimed = 0
+  for (const messageId of messageIds) {
+    if (!(await claimReply(cfg, messageId, holder))) break
+    claimed += 1
+  }
+  return claimed
 }
 
 /** Latest ackable cursor from a batch of rows (rows arrive oldest-first). */

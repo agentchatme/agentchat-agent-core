@@ -28,8 +28,11 @@ const SyncRowSchema = z
     delivery_id: z.string().nullish(),
     sender: z.string().optional(),
     sender_handle: z.string().optional(),
+    seq: z.number().optional(),
     type: z.string().optional(),
     content: z.record(z.unknown()).optional(),
+    metadata: z.record(z.unknown()).optional(),
+    status: z.string().optional(),
     created_at: z.string().optional(),
   })
   .passthrough()

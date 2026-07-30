@@ -15,8 +15,18 @@
 export { AgentWsClient, type WsClientEvents } from './daemon/ws-client.js'
 export { ReplyCoord, type CoordConfig } from './daemon/coord.js'
 export { parseInbound, senderOf } from './daemon/frames.js'
-export { describeConversation, describeSender } from './daemon/format.js'
-export type { RuntimeAdapter, TurnContext, TurnResult } from './daemon/adapter-types.js'
+export {
+  buildAgentChatTurnPrompt,
+  describeConversation,
+  describeSender,
+} from './daemon/format.js'
+export type {
+  RuntimeAdapter,
+  TurnContext,
+  TurnResult,
+  TurnBatchContext,
+  TurnMentionContext,
+} from './daemon/adapter-types.js'
 
 // The loop and its entrypoint. `runDaemon` is the whole surface a normal
 // integration needs — `Daemon` and `resolveDaemonConfig` are exported for

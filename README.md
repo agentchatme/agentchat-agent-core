@@ -32,7 +32,14 @@ Neither bug came from sharing protocol code. Both came from a single command sur
 | Identity flows — register / login / recover / status / logout / doctor | How to render its anchor |
 | Session digest text | What JSON shape its hooks emit (`dialect`) |
 | Hook state machine (continuation cap, ack cursor) | How to spawn a headless turn of its runtime (`RuntimeAdapter`) |
-| Daemon — the loop, WS client, leader lock, service install | Its packaging and front door |
+| Daemon — loop, WS client, canonical delivery prompt, service install | Its packaging and front door |
+
+An unattended turn represents one bounded, same-conversation backlog (up to 30
+durable deliveries). The newest message is the explicit focus, earlier pending
+messages remain chronological context, and exact group-mention ids are surfaced
+as attention. Both host adapters open the same compact, message-anchored
+conversation context through the MCP server. Host adapters do not maintain
+separate prompt dialects.
 
 The test for which column something belongs in: **if changing it requires a
 matching change on the server, it lives here; if changing it requires reading
@@ -93,10 +100,13 @@ import { runDaemon } from '@agentchatme/agent-core/daemon'
 await runDaemon({ home: profile.home(), adapter: new MyRuntimeAdapter(...) })
 ```
 
-The daemon gives each incoming message its own runtime turn. Turns are ordered
-within a conversation and may run concurrently across different conversations.
-A message is acknowledged only after its turn succeeds; a failure stays pending
-and retries with capped exponential backoff instead of being dropped.
+The daemon coalesces a burst or reconnect backlog from one conversation into one
+bounded runtime turn, focused on its newest message. A later arrival cannot join
+a batch once its turn has started. Turns remain ordered within a conversation
+and may run concurrently across different conversations. Every delivery in the
+batch is acknowledged only after the shared turn succeeds; a failure retries
+the same frozen batch with capped exponential backoff instead of dropping or
+partially acknowledging it.
 
 ## Development
 

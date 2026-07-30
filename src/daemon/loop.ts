@@ -8,15 +8,16 @@ import { AgentWsClient } from './ws-client.js'
 import { ReplyCoord } from './coord.js'
 import { beat } from './health.js'
 import { contextOf, senderOf, type SyncRow } from './frames.js'
-import type { RuntimeAdapter } from './adapter-types.js'
+import type { RuntimeAdapter, TurnContext, TurnMentionContext } from './adapter-types.js'
 
 // ─── The core loop ──────────────────────────────────────────────────────────
 //
 // WS pushes message.new → dedup → coexistence check (yield to a live session,
 // then claim the sole right to reply) → (per-conversation serialized, globally
-// capped) run one runtime turn per message → ack that message on success.
-// Failures retry with bounded exponential backoff and remain unacknowledged
-// until they genuinely succeed.
+// capped) run one runtime turn per bounded conversation backlog → ack every
+// represented delivery only after that turn succeeds. Failures retry the same
+// frozen batch with bounded exponential backoff and remain unacknowledged until
+// they genuinely succeed.
 //
 // Host-agnostic by construction: everything it knows about the agent arrives in
 // `DaemonConfig`, and everything it knows about the coding agent arrives as a
@@ -31,7 +32,21 @@ function positiveBoundedEnv(name: string, fallback: number): number {
     : fallback
 }
 
+function nonNegativeBoundedEnv(name: string, fallback: number): number {
+  const parsed = Number(process.env[name])
+  return Number.isFinite(parsed) && parsed >= 0
+    ? Math.min(parsed, MAX_TIMER_MS)
+    : fallback
+}
+
 const MAX_CONCURRENT_TURNS = 3
+// Matches agentchat_get_conversation's compact default window. Larger backlogs
+// become consecutive bounded turns instead of one unbounded prompt.
+const MAX_BATCH_MESSAGES = 30
+// Gives reconnect/socket bursts a brief chance to land before the conversation
+// snapshot is frozen. Zero remains available for deterministic host tuning.
+const BATCH_SETTLE_MS = nonNegativeBoundedEnv('AGENTCHATD_BATCH_SETTLE_MS', 100)
+const MENTION_PREVIEW_MAX = 280
 const HEARTBEAT_MS = 30_000
 const SEEN_TTL_MS = 24 * 60 * 60_000
 const MAX_COMPLETED_SEEN = 10_000
@@ -57,6 +72,26 @@ function retryDelay(attempt: number): number {
   // Clamp the exponent before multiplication so a long-lived outage never
   // overflows setTimeout or turns into a tight retry loop.
   return Math.min(RETRY_BASE_MS * 2 ** Math.min(20, Math.max(0, attempt - 1)), RETRY_MAX_MS)
+}
+
+function textOf(row: SyncRow): string {
+  return typeof row.content?.['text'] === 'string'
+    ? (row.content['text'] as string)
+    : ''
+}
+
+function replyToOf(row: SyncRow): string | null {
+  return typeof row.metadata?.['reply_to'] === 'string'
+    ? (row.metadata['reply_to'] as string)
+    : null
+}
+
+function previewOf(row: SyncRow): string {
+  const oneLine = textOf(row).replace(/\s+/g, ' ').trim()
+  if (oneLine.length === 0) return `[${row.type ?? 'message'}]`
+  return oneLine.length > MENTION_PREVIEW_MAX
+    ? `${oneLine.slice(0, MENTION_PREVIEW_MAX - 1)}…`
+    : oneLine
 }
 
 type DeliveryStatus = 'queued' | 'running' | 'retry-wait' | 'handled'
@@ -186,15 +221,13 @@ export class Daemon {
     void this.drainConversation(row.conversation_id)
   }
 
-  /** Process each message independently, in arrival order within a conversation. */
+  /** Process bounded backlog snapshots, in arrival order within a conversation. */
   private async drainConversation(conversationId: string): Promise<void> {
     try {
       while (!this.stopping) {
         const queue = this.convQueues.get(conversationId)
         if (!queue || queue.length === 0) break
-        const row = queue.shift()
-        if (!row) break
-        await this.handle(row)
+        await this.handleNextBatch(conversationId)
       }
     } catch (err) {
       log.warn(`unhandled in conv ${conversationId}: ${String(err)}`)
@@ -211,91 +244,185 @@ export class Daemon {
     }
   }
 
-  private async handle(row: SyncRow): Promise<void> {
+  private async handleNextBatch(conversationId: string): Promise<void> {
     if (this.stopping) return
-    const initial = this.seen.get(row.id)
-    if (!initial || initial.status !== 'queued') return
+    const first = this.convQueues.get(conversationId)?.[0]
+    if (!first) return
+    const initial = this.seen.get(first.id)
+    if (!initial || initial.status !== 'queued') {
+      // Defensive invariant repair: leaving an unprocessable head in place
+      // would make the conversation worker spin forever.
+      this.convQueues.get(conversationId)?.shift()
+      return
+    }
 
     // ── Coexistence: agree on exactly one replier ──
     // If the agent's live coding session is actively working, yield briefly so
     // its hook can claim + handle this first (the human-driven session has
     // priority). Then claim the sole right to reply; whoever wins is it.
     if (await this.coord.isSessionActive()) {
-      log.info(`msg ${row.id}: live session active — yielding for ${YIELD_MS}ms`)
+      log.info(`msg ${first.id}: live session active — yielding for ${YIELD_MS}ms`)
       await delay(YIELD_MS)
       if (this.stopping) return
     }
 
-    if (!(await this.coord.claim(row.id))) {
-      // A live session owns this one. Forget our dedup state and do NOT ack:
-      // the session's sync path still needs to see and commit it.
-      log.info(`msg ${row.id}: claimed by the live session — standing down`)
-      this.seen.delete(row.id)
-      this.markNoLongerPending()
-      return
-    }
-
-    // A failed message stays at the head of its conversation. This preserves
-    // ordering: a later message in the same thread cannot be acknowledged
-    // before the earlier one has actually been handled.
-    while (!this.stopping) {
-      const state = this.seen.get(row.id)
-      if (!state || state.status === 'handled') return
-      state.status = 'running'
-      state.attempts += 1
-      state.updatedAt = Date.now()
-      const attempt = state.attempts
-
-      await this.acquireSlot()
+    // Wait for an actual runtime slot before freezing the backlog. Messages
+    // that arrive while another conversation is using all slots can therefore
+    // join this batch instead of causing avoidable follow-up turns.
+    await this.acquireSlot()
+    let slotHeld = true
+    try {
       if (this.stopping) {
-        this.releaseSlot()
         return
       }
-      let result
-      try {
-        log.info(
-          `turn for msg ${row.id} in ${row.conversation_id} from @${senderOf(row)} (attempt ${attempt})`,
-        )
-        const ctx = contextOf(row)
-        result = await this.adapter.runTurn({
-          messageId: row.id,
-          conversationId: row.conversation_id,
-          sender: senderOf(row),
-          text:
-            typeof row.content?.['text'] === 'string'
-              ? (row.content['text'] as string)
-              : '',
-          createdAt: typeof row.created_at === 'string' ? row.created_at : undefined,
-          type: typeof row.type === 'string' ? row.type : undefined,
-          senderDisplayName: ctx.senderDisplayName,
-          senderKind: ctx.senderKind,
-          groupName: ctx.groupName,
-          mentioned: ctx.mentions.includes(this.cfg.handle.toLowerCase()),
-        })
-      } catch (err) {
-        result = { ok: false, detail: `adapter threw: ${String(err)}` }
-      } finally {
-        this.releaseSlot()
-      }
+      if (BATCH_SETTLE_MS > 0) await delay(BATCH_SETTLE_MS)
+      if (this.stopping) return
 
-      if (result.ok) {
-        this.markHandled(row.id)
-        return
-      }
-      if (result.fatal) {
-        log.error(`fatal turn error: ${result.detail} — stopping runtime so preflight can recover`)
-        this.stop()
-        this.onTerminal?.({ kind: 'runtime', reason: result.detail ?? 'runtime failed' })
-        return
-      }
-
-      const retryMs = retryDelay(attempt)
-      state.status = 'retry-wait'
-      state.updatedAt = Date.now()
-      log.warn(
-        `turn failed for msg ${row.id}: ${result.detail}; retrying in ${retryMs}ms without acknowledging it`,
+      const queue = this.convQueues.get(conversationId)
+      if (!queue || queue.length === 0) return
+      const candidates = queue.splice(0, MAX_BATCH_MESSAGES)
+      const claimedCount = await this.coord.claimBatch(
+        candidates.map((row) => row.id),
       )
-      await delay(retryMs)
+      const batch = candidates.slice(0, claimedCount)
+
+      if (claimedCount < candidates.length) {
+        const conflict = candidates[claimedCount] as SyncRow
+        // A live session owns this delivery. Forget our dedup state and do NOT
+        // ack: the session's sync path still needs to see and commit it.
+        log.info(`msg ${conflict.id}: claimed by the live session — standing down`)
+        this.seen.delete(conflict.id)
+        this.markNoLongerPending()
+
+        const unclaimedTail = candidates.slice(claimedCount + 1)
+        if (unclaimedTail.length > 0) {
+          const current = this.convQueues.get(conversationId) ?? []
+          this.convQueues.set(conversationId, [...unclaimedTail, ...current])
+        }
+      }
+
+      if (batch.length === 0) return
+
+      // A failed batch stays ahead of later messages in its conversation. The
+      // same frozen delivery set retries; new arrivals wait for the next batch.
+      while (!this.stopping) {
+        const states = batch.map((row) => this.seen.get(row.id))
+        if (
+          states.some(
+            (state) =>
+              state === undefined ||
+              state.status === 'handled',
+          )
+        ) {
+          return
+        }
+        const attempt = Math.max(...states.map((state) => state?.attempts ?? 0)) + 1
+        const now = Date.now()
+        for (const state of states) {
+          if (!state) continue
+          state.status = 'running'
+          state.attempts = attempt
+          state.updatedAt = now
+        }
+
+        const focus = batch[batch.length - 1] as SyncRow
+        let result
+        try {
+          log.info(
+            `turn for ${batch.length} message(s), newest ${focus.id}, in ${conversationId} (attempt ${attempt})`,
+          )
+          result = await this.adapter.runTurn(this.turnContext(batch))
+        } catch (err) {
+          result = { ok: false, detail: `adapter threw: ${String(err)}` }
+        }
+
+        if (result.ok) {
+          for (const row of batch) this.markHandled(row.id)
+          return
+        }
+        if (result.fatal) {
+          log.error(`fatal turn error: ${result.detail} — stopping runtime so preflight can recover`)
+          this.stop()
+          this.onTerminal?.({ kind: 'runtime', reason: result.detail ?? 'runtime failed' })
+          return
+        }
+
+        const retryMs = retryDelay(attempt)
+        const retryAt = Date.now()
+        for (const state of states) {
+          if (!state) continue
+          state.status = 'retry-wait'
+          state.updatedAt = retryAt
+        }
+        log.warn(
+          `turn failed for batch ending ${focus.id}: ${result.detail}; retrying in ${retryMs}ms without acknowledging ${batch.length} message(s)`,
+        )
+        this.releaseSlot()
+        slotHeld = false
+        await delay(retryMs)
+        if (this.stopping) return
+        await this.acquireSlot()
+        slotHeld = true
+      }
+    } finally {
+      if (slotHeld) this.releaseSlot()
+    }
+  }
+
+  private turnContext(batch: SyncRow[]): TurnContext {
+    const focus = batch[batch.length - 1] as SyncRow
+    const oldest = batch[0] as SyncRow
+    const focusContext = contextOf(focus)
+    const self = this.cfg.handle.replace(/^@/, '').toLowerCase()
+    const isGroup = focus.conversation_id.startsWith('grp_')
+    const mentionedMessages: TurnMentionContext[] = isGroup
+      ? batch.flatMap((row) => {
+          const ctx = contextOf(row)
+          if (!ctx.mentions.includes(self)) return []
+          return [
+            {
+              messageId: row.id,
+              messageSeq: typeof row.seq === 'number' ? row.seq : undefined,
+              sender: senderOf(row),
+              senderDisplayName: ctx.senderDisplayName,
+              senderKind: ctx.senderKind,
+              createdAt:
+                typeof row.created_at === 'string' ? row.created_at : undefined,
+              replyToMessageId: replyToOf(row),
+              textPreview: previewOf(row),
+            },
+          ]
+        })
+      : []
+
+    return {
+      messageId: focus.id,
+      messageSeq: typeof focus.seq === 'number' ? focus.seq : undefined,
+      conversationId: focus.conversation_id,
+      sender: senderOf(focus),
+      text: textOf(focus),
+      createdAt:
+        typeof focus.created_at === 'string' ? focus.created_at : undefined,
+      type: typeof focus.type === 'string' ? focus.type : undefined,
+      senderDisplayName: focusContext.senderDisplayName,
+      senderKind: focusContext.senderKind,
+      groupName: focusContext.groupName,
+      memberCount: focusContext.memberCount,
+      replyToMessageId: replyToOf(focus),
+      deliveryStatus:
+        typeof focus.status === 'string' ? focus.status : undefined,
+      mentioned: focusContext.mentions.includes(self),
+      pendingBatch: {
+        count: batch.length,
+        messageIds: batch.map((row) => row.id),
+        oldestMessageId: oldest.id,
+        oldestMessageSeq:
+          typeof oldest.seq === 'number' ? oldest.seq : undefined,
+        newestMessageId: focus.id,
+        newestMessageSeq:
+          typeof focus.seq === 'number' ? focus.seq : undefined,
+        mentionedMessages,
+      },
     }
   }
 

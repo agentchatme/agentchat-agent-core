@@ -1,6 +1,12 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { digestConversations, formatSessionStart, formatStopPickup } from '../src/digest/summary.js'
-import { syncPeek, syncAck, lastDeliveryId, type SyncRow } from '../src/wire/index.js'
+import {
+  syncPeek,
+  syncAck,
+  lastDeliveryId,
+  claimReplyBatch,
+  type SyncRow,
+} from '../src/wire/index.js'
 import {
   CODING_AGENTS_CLIENT_HEADERS,
   CODING_AGENTS_CLIENT_IDENTITY,
@@ -33,6 +39,7 @@ describe('digestConversations', () => {
     expect(a.count).toBe(2)
     expect(a.senders).toEqual(['mike-asst', 'san-asst'])
     expect(a.latestSnippet).toBe('newest')
+    expect(a.latestMessageId).toBe('2')
     expect(a.isGroup).toBe(false)
     expect(digests.find((d) => d.conversationId === 'grp_team')!.isGroup).toBe(true)
   })
@@ -82,6 +89,8 @@ describe('formatters', () => {
     expect(text).toContain('You are @demo-agent on AgentChat.')
     expect(text).toContain('2 unread messages in 2 conversations:')
     expect(text).toContain('@mike-asst')
+    expect(text).toContain('latest_message_id=1')
+    expect(text).toContain('as around_message_id')
     expect(text).toContain('group grp_g')
     expect(text).toContain('silence, not acknowledgments')
   })
@@ -101,6 +110,7 @@ describe('formatters', () => {
     const text = formatSessionStart('demo-agent', [enriched])
     expect(text).toContain('group "Ops"')
     expect(text).toContain('mentions you')
+    expect(text).toContain('attention_message_ids=["1"]')
     // A different agent's mention does not flag this one.
     const other = formatSessionStart('someone-else', [enriched])
     expect(other).not.toContain('mentions you')
@@ -161,6 +171,21 @@ describe('wire client', () => {
     expect(calls[0]!.url).toContain('/v1/messages/sync/ack')
     expect(JSON.parse(String(calls[0]!.init?.body))).toStrictEqual({
       last_delivery_id: 'del_' + 'b'.repeat(32),
+    })
+  })
+
+  it('claims one ordered reply prefix through the batch endpoint', async () => {
+    const calls = stubFetch({ claimed_count: 2 })
+    const claimed = await claimReplyBatch(
+      cfg,
+      ['msg_1', 'msg_2', 'msg_3'],
+      'session:test',
+    )
+    expect(claimed).toBe(2)
+    expect(calls[0]!.url).toContain('/v1/reply/claim-batch')
+    expect(JSON.parse(String(calls[0]!.init?.body))).toEqual({
+      message_ids: ['msg_1', 'msg_2', 'msg_3'],
+      holder: 'session:test',
     })
   })
 

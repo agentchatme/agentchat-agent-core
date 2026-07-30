@@ -15,7 +15,7 @@ import {
   syncAck,
   lastDeliveryId,
   markSessionActive,
-  claimReply,
+  claimReplyBatch,
   getMeLite,
   type WireConfig,
   type SyncRow,
@@ -129,21 +129,20 @@ export function ackableRows<T extends { delivery_id: string | null }>(rows: T[])
  * takes. Returns the CONTIGUOUS oldest-first prefix this session won — stopping
  * at the first row the daemon already owns keeps the ack cursor (which commits
  * everything at-or-before it) from acking a message the daemon is mid-turn on.
- * Claims run in parallel; each is fail-open (a coord outage yields the row to
- * this session, i.e. the no-daemon behavior). Rows past a daemon-owned one stay
- * queued and re-surface next turn — duplicate beats loss, per invariant 2.
+ * Rows past a daemon-owned one stay queued and re-surface next turn —
+ * duplicate beats loss, per invariant 2.
  */
 async function claimContiguousPrefix(
   cfg: WireConfig,
   rows: SyncRow[],
   holder: string,
 ): Promise<SyncRow[]> {
-  const won = await Promise.all(rows.map((r) => claimReply(cfg, r.id, holder)))
-  const prefix: SyncRow[] = []
-  for (let i = 0; i < rows.length; i++) {
-    if (!won[i]) break // daemon owns this one — stop so the ack cursor stays clean
-    prefix.push(rows[i] as SyncRow)
-  }
+  const claimed = await claimReplyBatch(
+    cfg,
+    rows.map((row) => row.id),
+    holder,
+  )
+  const prefix = rows.slice(0, claimed)
   if (prefix.length < rows.length) {
     log.info(
       `coexistence: daemon owns ${rows.length - prefix.length} row(s); surfacing ${prefix.length}`,
