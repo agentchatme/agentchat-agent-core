@@ -307,7 +307,14 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
         created_at: new Date().toISOString(),
       })
       clearOfferDeclined(home)
-      console.log([`Signed in as @${me.handle} for ${LABEL}.`, ...writeOurAnchor(me.handle), RESTART_HINT].join('\n'))
+      console.log(
+        [
+          `Signed in as @${me.handle} for ${LABEL}.`,
+          `API key stored at ${credentialsPath(home)} (never commit this file).`,
+          ...writeOurAnchor(me.handle),
+          RESTART_HINT,
+        ].join('\n'),
+      )
       return 0
     } catch (err) {
       console.error(`Login failed. ${apiErr(err)}`)
@@ -345,7 +352,8 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
         clearOfferDeclined(home)
         console.log(
           [
-            `Recovered: @${result.handle} for ${LABEL} — a fresh API key is stored (the old key is now revoked).`,
+            `Recovered: @${result.handle} for ${LABEL}.`,
+            `New API key stored at ${credentialsPath(home)} (the old key is now revoked; never commit this file).`,
             ...writeOurAnchor(result.handle),
             RESTART_HINT,
           ].join('\n'),
