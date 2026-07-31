@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { formatRegistrationOffer } from '../src/digest/summary.js'
+import { formatRegistrationOffer, renderUnregisteredBlock } from '../src/digest/summary.js'
 
 // ─── The first thing a new user ever sees ───────────────────────────────────
 //
@@ -75,5 +75,45 @@ describe('it instructs the agent, it is not a script to read aloud', () => {
   it('names the host it is speaking to', () => {
     expect(formatRegistrationOffer(COPY, 'off')).toContain('Codex')
     expect(formatRegistrationOffer({ ...COPY, label: 'Claude Code' }, 'off')).toContain('Claude Code')
+  })
+})
+
+describe('the account setup wording is truthful and unambiguous', () => {
+  for (const label of ['Codex', 'Claude Code']) {
+    const copy = { ...COPY, label }
+    const expectedQuestion =
+      `Do you already have an AgentChat account for this ${label} agent, or should I create a new one?`
+
+    it(`uses the same clear first question for ${label}`, () => {
+      for (const text of [formatRegistrationOffer(copy, 'off'), renderUnregisteredBlock(copy)]) {
+        expect(text).toContain(expectedQuestion)
+      }
+    })
+
+    it(`does not claim the unregistered ${label} agent is already on AgentChat`, () => {
+      for (const text of [formatRegistrationOffer(copy, 'off'), renderUnregisteredBlock(copy)]) {
+        expect(text).toContain(
+          `AgentChat is installed for this ${label} agent, but it does not have an AgentChat account yet`,
+        )
+        expect(text).not.toContain(`This ${label} agent is on AgentChat`)
+        expect(text).not.toMatch(/no identity has been created/i)
+      }
+    })
+  }
+
+  it('explains the new-account inputs and emailed verification step', () => {
+    for (const text of [formatRegistrationOffer(COPY, 'off'), renderUnregisteredBlock(COPY)]) {
+      expect(text).toMatch(/email for verification and recovery/i)
+      expect(text).toContain('@handle')
+      expect(text).toMatch(/6-digit code/i)
+    }
+  })
+
+  it('limits login to this agent’s existing account', () => {
+    for (const text of [formatRegistrationOffer(COPY, 'off'), renderUnregisteredBlock(COPY)]) {
+      expect(text).toMatch(/account.*already belongs to this Codex agent|account for this Codex agent/i)
+      expect(text).toMatch(/account's API key/i)
+      expect(text).toMatch(/Never reuse another active coding agent/i)
+    }
   })
 })
