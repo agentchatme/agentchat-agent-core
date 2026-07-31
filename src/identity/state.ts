@@ -23,13 +23,14 @@ const SESSION_TTL_MS = 48 * 60 * 60 * 1000
 const SessionStateSchema = z.object({
   continuations: z.number().int().min(0),
   updated_at: z.string(),
-  // Ack cursor for the batch the session-start hook injected but has NOT
-  // yet committed. Committed by the user-prompt hook — proof the session
-  // actually ran a turn. A session that dies before its first prompt
-  // (arg-error invocations, crashed startups) leaves this uncommitted and
-  // the batch re-digests next session instead of being consumed by a
-  // ghost. Live-fire lesson, 2026-07-12.
+  // Ack cursor for hook context already handed to the host but not yet proven
+  // through a completed model boundary. UserPromptSubmit and Stop stage it;
+  // the following Stop commits it. A session that dies in between leaves the
+  // server delivery unacked, preferring a later duplicate over silent loss.
   pending_ack: z.string().optional(),
+  // Stop context needs the specific host-created continuation, not merely an
+  // unrelated later turn that happens to reach Stop.
+  pending_ack_requires_continuation: z.boolean().optional(),
 })
 
 const StateSchema = z.object({
@@ -77,9 +78,19 @@ export function getContinuations(home: string, sessionKey: string): number {
 export function recordContinuation(home: string, sessionKey: string, now: Date = new Date()): number {
   const state = readState(home)
   prune(state, now)
-  const current = state.sessions[sessionKey]?.continuations ?? 0
+  const existing = state.sessions[sessionKey]
+  const current = existing?.continuations ?? 0
   const next = current + 1
-  state.sessions[sessionKey] = { continuations: next, updated_at: now.toISOString() }
+  state.sessions[sessionKey] = {
+    continuations: next,
+    updated_at: now.toISOString(),
+    ...(existing?.pending_ack !== undefined
+      ? { pending_ack: existing.pending_ack }
+      : {}),
+    ...(existing?.pending_ack_requires_continuation === true
+      ? { pending_ack_requires_continuation: true }
+      : {}),
+  }
   writeState(home, state)
   return next
 }
@@ -92,11 +103,22 @@ export function recordContinuation(home: string, sessionKey: string, now: Date =
 export function resetSession(home: string, sessionKey: string): void {
   const state = readState(home)
   if (state.sessions[sessionKey] === undefined) return
+  // A new/resumed host session is not proof that context staged before the
+  // prior process ended was processed. Drop the LOCAL cursor while leaving the
+  // server delivery unacknowledged, so UserPromptSubmit can claim and inject
+  // it again. Preserving the cursor would let an unrelated later Stop ACK
+  // context that the model may never have seen.
   delete state.sessions[sessionKey]
   writeState(home, state)
 }
 
-export function setPendingAck(home: string, sessionKey: string, cursor: string, now: Date = new Date()): void {
+export function setPendingAck(
+  home: string,
+  sessionKey: string,
+  cursor: string,
+  now: Date = new Date(),
+  requiresContinuation = false,
+): void {
   const state = readState(home)
   prune(state, now)
   const existing = state.sessions[sessionKey]
@@ -104,17 +126,37 @@ export function setPendingAck(home: string, sessionKey: string, cursor: string, 
     continuations: existing?.continuations ?? 0,
     updated_at: now.toISOString(),
     pending_ack: cursor,
+    ...(requiresContinuation
+      ? { pending_ack_requires_continuation: true }
+      : {}),
   }
   writeState(home, state)
 }
 
-/** Read-and-clear the pending cursor for a session (user-prompt hook). */
+/** Read the pending cursor without changing it. */
+export function getPendingAck(home: string, sessionKey: string): string | null {
+  return readState(home).sessions[sessionKey]?.pending_ack ?? null
+}
+
+/** Whether this cursor came from Stop and needs its specific continuation. */
+export function pendingAckRequiresContinuation(
+  home: string,
+  sessionKey: string,
+): boolean {
+  return (
+    readState(home).sessions[sessionKey]
+      ?.pending_ack_requires_continuation === true
+  )
+}
+
+/** Read-and-clear the pending cursor for a session (completed-turn boundary). */
 export function takePendingAck(home: string, sessionKey: string, now: Date = new Date()): string | null {
   const state = readState(home)
   const entry = state.sessions[sessionKey]
   if (entry?.pending_ack === undefined) return null
   const cursor = entry.pending_ack
   delete entry.pending_ack
+  delete entry.pending_ack_requires_continuation
   entry.updated_at = now.toISOString()
   writeState(home, state)
   return cursor

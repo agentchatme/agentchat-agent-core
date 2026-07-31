@@ -12,6 +12,11 @@ export interface HookInput {
   /** Claude Code SessionStart source: startup | resume | clear | compact | fork.
    *  Undefined on other hosts/events. */
   source: string | undefined
+  /**
+   * Whether this Stop belongs to the continuation created by a prior Stop
+   * decision. Both harnesses expose this as `stop_hook_active`.
+   */
+  stopHookActive?: boolean
 }
 
 export async function readHookInput(stream: NodeJS.ReadStream = process.stdin): Promise<HookInput> {
@@ -44,8 +49,16 @@ export async function readHookInput(stream: NodeJS.ReadStream = process.stdin): 
   const sessionId =
     firstString(parsed, ['session_id', 'sessionId', 'thread_id', 'conversation_id']) ?? 'unknown'
   const source = firstString(parsed, ['source']) ?? undefined
+  const stopHookActive = firstBoolean(parsed, [
+    'stop_hook_active',
+    'stopHookActive',
+  ])
 
-  return { sessionId, source }
+  return {
+    sessionId,
+    source,
+    ...(stopHookActive !== undefined ? { stopHookActive } : {}),
+  }
 }
 
 function firstString(obj: Record<string, unknown>, keys: string[]): string | null {
@@ -54,4 +67,14 @@ function firstString(obj: Record<string, unknown>, keys: string[]): string | nul
     if (typeof value === 'string' && value.trim().length > 0) return value.trim()
   }
   return null
+}
+
+function firstBoolean(
+  obj: Record<string, unknown>,
+  keys: string[],
+): boolean | undefined {
+  for (const key of keys) {
+    if (typeof obj[key] === 'boolean') return obj[key]
+  }
+  return undefined
 }

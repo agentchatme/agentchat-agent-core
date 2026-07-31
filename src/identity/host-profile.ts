@@ -44,9 +44,9 @@ export interface HostProfile {
   anchorLabel?: string
   /**
    * Whether this host is wired up enough for an anchor to mean anything.
-   * A host that must edit config files first (Codex) uses this so it never
-   * writes an identity block announcing a phone number with nothing to answer
-   * it. Hosts wired by their own installer (a Claude Code plugin) omit it.
+   * An integration uses this so it never writes an identity block announcing
+   * a phone number before its own MCP, hooks, and durable bundle are actually
+   * in place.
    */
   isWired?(): boolean
   /** Host-specific doctor checks, appended after the shared ones. */

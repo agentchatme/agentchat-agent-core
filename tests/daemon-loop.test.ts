@@ -120,6 +120,38 @@ describe('daemon delivery state machine', () => {
     daemon.stop()
   })
 
+  it('renews the frozen reply claim before every host attempt', async () => {
+    let claims = 0
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+        const url = String(input)
+        if (url.endsWith('/claim-batch')) {
+          claims += 1
+          const body = JSON.parse(String(init?.body)) as { message_ids: string[] }
+          return new Response(
+            JSON.stringify({ claimed_count: body.message_ids.length }),
+            { status: 200 },
+          )
+        }
+        return new Response(JSON.stringify({ active: false }), { status: 200 })
+      }),
+    )
+    const adapter = new FakeAdapter([
+      { ok: false, detail: 'temporary runtime failure' },
+      { ok: true },
+    ])
+    const daemon = new Daemon(cfg, adapter, ws as unknown as AgentWsClient)
+    await daemon.start()
+    ws.emit('inbound', row('msg_renew'))
+
+    await waitFor(() => ws.acks.includes('msg_renew'))
+    // One initial claim freezes the batch, then one renewal per attempt.
+    expect(claims).toBe(3)
+    expect(adapter.calls).toHaveLength(2)
+    daemon.stop()
+  })
+
   it('re-acks a replayed handled message without running a second model turn', async () => {
     const adapter = new FakeAdapter([{ ok: true }])
     const daemon = new Daemon(cfg, adapter, ws as unknown as AgentWsClient)

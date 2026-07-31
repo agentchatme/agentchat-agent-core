@@ -3,6 +3,8 @@ import { resolveIdentity } from '../identity/credentials.js'
 import type { HookInput } from './hook-input.js'
 import {
   getContinuations,
+  getPendingAck,
+  pendingAckRequiresContinuation,
   recordContinuation,
   resetSession,
   setPendingAck,
@@ -40,18 +42,13 @@ import { alwaysOnHealth, alwaysOnState } from '../daemon/health.js'
 // Invariants that hold no matter what goes wrong:
 //   1. These functions never throw. A failing hook must degrade to "no
 //      AgentChat context this turn", never to a broken session.
-//   2. Ack only when a session PROVES it is real. Session-start injects the
-//      digest and records the cursor as pending; the user-prompt hook commits
-//      it — a prompt actually running is the proof. A session that dies before
-//      its first prompt (arg-error invocation, crashed startup — live-fired
-//      2026-07-12) leaves the batch unacked and it re-digests next session:
-//      duplicate beats loss, always. Cap-exceeded never acks. Rows without an
-//      ackable delivery_id are never injected — they could only re-inject
-//      forever.
-//   3. The stop path acks AFTER the host has been handed the text. That
-//      ordering is expressed in the return type: `stop()` gives back a
-//      `commit()` the integration calls once it has printed. An engine that
-//      acked eagerly would lose a message whenever printing failed.
+//   2. Ack only after a completed host turn proves that injected context was
+//      actually processed. UserPromptSubmit and Stop return a local `stage()`
+//      callback that runs only after the integration prints successfully. The
+//      following Stop commits that cursor. A crash anywhere in between leaves
+//      the server delivery unacked: duplicate beats loss, always.
+//   3. Rows without an ackable delivery_id are never injected — they could
+//      only re-inject forever. Cap-exceeded never acknowledges queued rows.
 //
 // Session state is keyed by session id ALONE. It used to be
 // `${platform}:${sessionId}` because one state file served every host; now the
@@ -60,7 +57,7 @@ import { alwaysOnHealth, alwaysOnState } from '../daemon/health.js'
 // prefixed keys and simply age out under the 48h TTL — worst case one session
 // gets a fresh continuation budget.)
 
-const SESSION_START_PEEK_LIMIT = 100
+const USER_PROMPT_PEEK_LIMIT = 100
 const STOP_PEEK_LIMIT = 50
 const DEFAULT_MAX_CONTINUATIONS = 5
 // Normal handoff is explicit at Stop/SessionEnd. This lease is only the crash
@@ -80,15 +77,24 @@ export interface SessionStartResult {
   context: string | null
 }
 
+export interface UserPromptResult {
+  /** Text to add to this prompt, or null when the inbox has nothing new. */
+  context: string | null
+  /**
+   * Persist the surfaced cursor locally. Call only after the host has accepted
+   * `context`; the following Stop is the first boundary allowed to ACK it.
+   */
+  stage: () => void
+}
+
 export interface StopResult {
   /** Text to continue the session with, or null to let it stop. */
   reason: string | null
   /**
-   * Commit the surfaced batch as delivered. Call this ONLY after the host has
-   * actually been given `reason` (invariant 3). Safe to call when `reason` is
-   * null — it is a no-op.
+   * Persist the surfaced cursor locally. Call this ONLY after the host has
+   * actually been given `reason`. The following Stop commits it remotely.
    */
-  commit: () => Promise<void>
+  stage: () => void
 }
 
 export function hooksDisabled(): boolean {
@@ -187,31 +193,11 @@ export async function sessionStart(
       return none
     }
 
-    const cfg: WireConfig = { apiKey: identity.apiKey, apiBase: identity.apiBase }
-
     // If the user set up always-on but its daemon isn't beating, surface that —
     // independent of the inbox, since being silently unreachable is the point.
     const h = alwaysOnHealth(ctx.home)
     const alert = h.wanted && !h.healthy ? formatAlwaysOnDown(ctx.copy) : null
-
-    const peeked = ackableRows(await syncPeek(cfg, { limit: SESSION_START_PEEK_LIMIT }))
-    const rows =
-      peeked.length > 0
-        ? await claimContiguousPrefix(cfg, peeked, `session:${input.sessionId}`)
-        : []
-
-    if (rows.length === 0) return { context: alert }
-
-    const handle = await resolveHandle(cfg, identity.handle)
-    const digest = formatSessionStart(handle, rows)
-    const context = alert !== null ? `${alert}\n\n${digest}` : digest
-
-    // Record the cursor as pending — committed by the user-prompt hook once a
-    // turn actually runs (invariant 2).
-    const cursor = lastDeliveryId(rows)
-    if (cursor !== null) setPendingAck(ctx.home, input.sessionId, cursor)
-
-    return { context }
+    return { context: alert }
   } catch (err) {
     log.warn(`session-start hook degraded to no-op: ${String(err)}`)
     return none
@@ -219,38 +205,52 @@ export async function sessionStart(
 }
 
 /**
- * A prompt is running, so the session is real — commit the digest batch that
- * session-start injected. Silent in every outcome.
+ * A prompt is about to run. Claim and inject the inbox at this real turn
+ * boundary, then stage its cursor only after the host accepts our output.
  */
-export async function userPrompt(ctx: HookContext, input: HookInput): Promise<void> {
+export async function userPrompt(
+  ctx: HookContext,
+  input: HookInput,
+): Promise<UserPromptResult> {
+  const none: UserPromptResult = { context: null, stage: () => {} }
   try {
-    if (hooksDisabled()) return
+    if (hooksDisabled()) return none
     const identity = resolveIdentity(ctx.home)
-    if (identity === null) return
+    if (identity === null) return none
 
     const cfg: WireConfig = { apiKey: identity.apiKey, apiBase: identity.apiBase }
     // This is the exact boundary at which a foreground model turn begins.
-    // Announce it even when there was no startup digest to ack.
+    // Announce it even when there is no inbox digest to inject.
     await markForegroundTurn(cfg, input.sessionId, FOREGROUND_TURN_TTL_SECONDS)
 
-    const cursor = takePendingAck(ctx.home, input.sessionId)
-    if (cursor === null) return
+    // The prior injected batch has not crossed a completed-turn boundary yet.
+    // Do not overwrite its cursor or inject later rows ahead of it.
+    if (getPendingAck(ctx.home, input.sessionId) !== null) return none
 
-    try {
-      await syncAck(cfg, cursor)
-    } catch (err) {
-      // Put it back — the next prompt retries. Rows stay stored server-side
-      // either way, so the worst case is a duplicate digest next session.
-      setPendingAck(ctx.home, input.sessionId, cursor)
-      log.warn(`user-prompt ack failed (will retry next prompt): ${String(err)}`)
+    const peeked = ackableRows(await syncPeek(cfg, { limit: USER_PROMPT_PEEK_LIMIT }))
+    if (peeked.length === 0) return none
+    const rows = await claimContiguousPrefix(
+      cfg,
+      peeked,
+      `session:${input.sessionId}`,
+    )
+    if (rows.length === 0) return none
+
+    const cursor = lastDeliveryId(rows)
+    if (cursor === null) return none
+    const handle = await resolveHandle(cfg, identity.handle)
+    return {
+      context: formatSessionStart(handle, rows),
+      stage: () => setPendingAck(ctx.home, input.sessionId, cursor),
     }
   } catch (err) {
     log.warn(`user-prompt hook degraded to no-op: ${String(err)}`)
+    return none
   }
 }
 
 export async function stop(ctx: HookContext, input: HookInput): Promise<StopResult> {
-  const none: StopResult = { reason: null, commit: async () => {} }
+  const none: StopResult = { reason: null, stage: () => {} }
   let cfg: WireConfig | null = null
   try {
     if (hooksDisabled()) return none
@@ -259,6 +259,33 @@ export async function stop(ctx: HookContext, input: HookInput): Promise<StopResu
     if (identity === null) return none
 
     cfg = { apiKey: identity.apiKey, apiBase: identity.apiBase }
+
+    // UserPromptSubmit context is proven by its next Stop. Stop-injected
+    // context needs the specific continuation the host marks with
+    // stop_hook_active=true. If another Stop hook prevented that continuation,
+    // discard only the local cursor and re-offer the still-unacked row below.
+    const needsContinuation = pendingAckRequiresContinuation(
+      ctx.home,
+      input.sessionId,
+    )
+    if (needsContinuation && input.stopHookActive !== true) {
+      takePendingAck(ctx.home, input.sessionId)
+    }
+    const pending =
+      needsContinuation && input.stopHookActive !== true
+        ? null
+        : takePendingAck(ctx.home, input.sessionId)
+    if (pending !== null) {
+      try {
+        await syncAck(cfg, pending)
+      } catch (err) {
+        setPendingAck(ctx.home, input.sessionId, pending)
+        await clearForegroundTurn(cfg, input.sessionId)
+        log.warn(`completed-turn ack failed (messages stay queued): ${String(err)}`)
+        return none
+      }
+    }
+
     // Renew before the sync/claim work. If this hook continues the model with
     // an inbound digest, the lease protects that continuation until its next
     // Stop. Every path that actually becomes idle clears below.
@@ -289,16 +316,18 @@ export async function stop(ctx: HookContext, input: HookInput): Promise<StopResu
     const handle = await resolveHandle(cfg, identity.handle)
     const reason = formatStopPickup(handle, rows)
     const cursor = lastDeliveryId(rows)
-    const claimedCfg = cfg
 
     return {
       reason,
-      commit: async () => {
-        if (cursor === null) return
-        try {
-          await syncAck(claimedCfg, cursor)
-        } catch (err) {
-          log.warn(`stop ack failed (messages stay queued): ${String(err)}`)
+      stage: () => {
+        if (cursor !== null) {
+          setPendingAck(
+            ctx.home,
+            input.sessionId,
+            cursor,
+            new Date(),
+            true,
+          )
         }
       },
     }

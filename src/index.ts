@@ -121,6 +121,7 @@ export {
   hooksDisabled,
   type HookContext,
   type SessionStartResult,
+  type UserPromptResult,
   type StopResult,
 } from './hooks/engine.js'
 

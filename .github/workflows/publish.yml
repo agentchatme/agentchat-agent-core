@@ -29,7 +29,7 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
-      - run: pnpm install --no-frozen-lockfile
+      - run: pnpm install --frozen-lockfile
       - run: pnpm type-check
       - run: pnpm build
       - run: pnpm test
@@ -56,6 +56,14 @@ jobs:
           cache: pnpm
           registry-url: https://registry.npmjs.org
       - run: npm install -g npm@latest
-      - run: pnpm install --no-frozen-lockfile
+      - run: pnpm install --frozen-lockfile
       - run: pnpm build
-      - run: npm publish --provenance --access public
+      - name: Pack the artifact that will be published
+        id: pack
+        shell: bash
+        run: |
+          mkdir -p /tmp/verify
+          tgz="$(npm pack --ignore-scripts --pack-destination /tmp/verify | tail -1)"
+          tar tzf "/tmp/verify/$tgz" | grep -q '^package/dist/index.js$'
+          echo "tgz=/tmp/verify/$tgz" >> "$GITHUB_OUTPUT"
+      - run: npm publish "${{ steps.pack.outputs.tgz }}" --ignore-scripts --provenance --access public

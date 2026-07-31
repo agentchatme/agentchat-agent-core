@@ -148,13 +148,14 @@ export function formatStopPickup(handle: string | null, rows: SyncRow[]): string
  * Injected at session start when always-on was set up but the daemon isn't
  * beating (its heartbeat is stale — see alwaysOnHealth). Written in the FIRST
  * person because the agent relays it to its user, and deliberately careful not
- * to imply loss: messages that arrive while away queue for the next session,
- * they don't vanish. The one-line fix is inline so the agent can act on it.
+ * to imply that stored messages disappear: they remain in conversation
+ * history and their delivery envelopes queue within the normal retention
+ * window. The one-line fix is inline so the agent can act on it.
  */
 export function formatAlwaysOnDown(copy: HostCopy): string {
   return (
     '⚠ Always-on is down — while you are away I won’t be able to answer messages ' +
-    '(they queue for your next session, nothing is lost). ' +
+    '(they remain stored and queue for your next session). ' +
     `Turn it back on: \`${copy.invoke} daemon install\``
   )
 }
@@ -240,7 +241,7 @@ function alwaysOnNote(state: AlwaysOnState, invoke: string): string {
 //
 // Discovery cannot depend on a session hook everywhere. Codex requires every
 // hook to be reviewed and trusted before it runs, and marks new or CHANGED
-// hooks as untrusted — so on a fresh install all three of ours are skipped, and
+// hooks as untrusted — so on a fresh install all four of ours are skipped, and
 // the agent is never told AgentChat exists. A user who does not already know to
 // ask sees an install that did nothing.
 //

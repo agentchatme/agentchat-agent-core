@@ -22,6 +22,7 @@ import { log } from '../util/log.js'
  */
 export interface HookDialect {
   sessionStartOutput(context: string): Record<string, unknown>
+  userPromptOutput(context: string): Record<string, unknown>
   stopOutput(reason: string): Record<string, unknown>
   printJson(payload: Record<string, unknown>): void
 }
@@ -54,7 +55,10 @@ export function createHookRunners(context: () => HookContext, dialect: HookDiale
     async runUserPrompt(): Promise<void> {
       try {
         const input = await readHookInput()
-        await userPrompt(context(), input)
+        const { context: text, stage } = await userPrompt(context(), input)
+        if (text === null) return
+        dialect.printJson(dialect.userPromptOutput(text))
+        stage()
       } catch (err) {
         log.warn(`user-prompt hook degraded to no-op: ${String(err)}`)
       }
@@ -63,13 +67,12 @@ export function createHookRunners(context: () => HookContext, dialect: HookDiale
     async runStop(): Promise<void> {
       try {
         const input = await readHookInput()
-        const { reason, commit } = await stop(context(), input)
+        const { reason, stage } = await stop(context(), input)
         if (reason === null) return
-        // Print FIRST, commit second: the ack means "the agent has this", so a
-        // failed print must not leave the message marked delivered. The engine
-        // hands back `commit` precisely so this ordering lives at the call site.
+        // Print FIRST, stage second. The network ACK happens only at the next
+        // completed-turn boundary, never merely because stdout accepted bytes.
         dialect.printJson(dialect.stopOutput(reason))
-        await commit()
+        stage()
       } catch (err) {
         log.warn(`stop hook degraded to no-op: ${String(err)}`)
       }

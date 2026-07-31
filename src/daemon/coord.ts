@@ -3,8 +3,10 @@ import { CODING_AGENTS_CLIENT_HEADERS } from '../client-identity.js'
 
 // ─── Reply-coordination client (/v1/reply) ───────────────────────────────────
 //
-// Lets this daemon agree with the agent's live coding session on ONE replier
-// per message, so a message is never answered twice when both are present.
+// Lets this daemon normally agree with the agent's live coding session on ONE
+// replier per message, suppressing duplicate answers when both are present.
+// During a coordination outage it deliberately fails open, so this is not an
+// exactly-once guarantee.
 //
 // Design rule: EVERY call fails OPEN toward replying. A coordination outage
 // (Redis/API blip) must never make the daemon go silent — a missed reply is

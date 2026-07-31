@@ -55,19 +55,31 @@ The wire protocol is the thing worth sharing: two hand-maintained copies of the 
 
 ## Ack semantics (the part worth reading twice)
 
-Injection **is** delivery, and nothing is acked until a session proves it is real:
+Host acceptance is not the same as completed delivery, so hook context crosses
+two boundaries:
 
-1. `sessionStart()` builds the digest and records the ack cursor as *pending*.
-2. `userPrompt()` commits it — a prompt actually running is the proof. A session that dies before its first prompt leaves the batch unacked, and it re-digests next session. **Duplicate beats loss, always.**
-3. `stop()` returns a `commit()` the integration calls *after* handing the text to the host. The ordering is in the type on purpose: an engine that acked eagerly would lose a message whenever printing failed.
+1. `userPrompt()` claims queued rows at a real prompt boundary and returns a
+   `stage()` callback. The integration stages the cursor only after it has
+   successfully printed the host's `UserPromptSubmit` envelope.
+2. The following `stop()` proves that model turn completed and commits the
+   staged cursor before looking for newer rows.
+3. When `stop()` continues the host with mid-turn arrivals, it also returns a
+   `stage()` callback. Those rows are committed by the *next* Stop, after that
+   continuation completes.
+
+A host crash before the completed-turn boundary, or a failed ACK, leaves the
+rows unacknowledged for replay. **Duplicate beats loss, always.**
 
 Rows without an ackable `delivery_id` are never surfaced — they could only re-inject forever.
 
-Foreground/daemon ownership is atomic at the server. `userPrompt()` leases one
-concrete host session before a model turn; `stop()` renews it for a continuation
-or clears it when the session becomes idle; `sessionEnd()` clears only that
-session. The daemon's claim operation prunes expired leases and claims the
-message in one Redis script, so the old check-then-wait race no longer exists.
+Foreground/daemon ownership is atomic while the coordination store is
+available. `userPrompt()` leases one concrete host session before a model turn;
+`stop()` renews it for a continuation or clears it when the session becomes
+idle; `sessionEnd()` clears only that session. The daemon's claim operation
+prunes expired leases and claims the message in one Redis script, so the old
+check-then-wait race no longer exists. Coordination deliberately fails open
+during a Redis/API outage: delivery continues, but two owners can then produce
+duplicate replies. That is at-least-once behavior, not an exactly-once claim.
 
 ## Usage
 
@@ -111,8 +123,9 @@ bounded runtime turn, focused on its newest message. A later arrival cannot join
 a batch once its turn has started. Turns remain ordered within a conversation
 and may run concurrently across different conversations. Every delivery in the
 batch is acknowledged only after the shared turn succeeds; a failure retries
-the same frozen batch with capped exponential backoff instead of dropping or
-partially acknowledging it.
+the same frozen batch with capped exponential backoff. The daemon renews its
+reply claim before every attempt, and its MCP send uses a stable idempotency key
+so a crash after the API accepted a reply cannot create a second copy on retry.
 
 ## Development
 

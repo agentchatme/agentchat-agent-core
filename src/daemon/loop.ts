@@ -283,7 +283,7 @@ export class Daemon {
         candidates.map((row) => row.id),
       )
       const claimedCount = claim.claimedCount
-      const batch = candidates.slice(0, claimedCount)
+      let batch = candidates.slice(0, claimedCount)
 
       if (claimedCount < candidates.length) {
         if (claim.deferred) {
@@ -323,6 +323,57 @@ export class Daemon {
       // A failed batch stays ahead of later messages in its conversation. The
       // same frozen delivery set retries; new arrivals wait for the next batch.
       while (!this.stopping) {
+        // A host turn can run for almost the full coordination TTL. Renew the
+        // exact frozen delivery set before every attempt so a retry never runs
+        // on an expired claim. Re-claiming with this daemon's stable holder is
+        // a TTL renewal, not a second owner.
+        const renewed = await this.coord.claimBatch(batch.map((row) => row.id))
+        if (renewed.claimedCount < batch.length) {
+          const lost = batch.slice(renewed.claimedCount)
+          batch = batch.slice(0, renewed.claimedCount)
+
+          if (renewed.deferred) {
+            this.foregroundClaimsBlockedUntil = Math.max(
+              this.foregroundClaimsBlockedUntil,
+              Date.now() + FOREGROUND_RECHECK_MS,
+            )
+            // A foreground turn gained priority between daemon attempts. Put
+            // every unrenewed row back at the head and let the normal claim
+            // path retry after handoff.
+            for (const row of lost) {
+              const state = this.seen.get(row.id)
+              if (state) {
+                state.status = 'queued'
+                state.updatedAt = Date.now()
+              }
+            }
+            const current = this.convQueues.get(conversationId) ?? []
+            this.convQueues.set(conversationId, [...lost, ...current])
+          } else {
+            // Another live holder owns the first unrenewed row. Stand down for
+            // that one and preserve the later suffix for a fresh ordered claim.
+            const conflict = lost[0] as SyncRow
+            log.info(`msg ${conflict.id}: renewal lost to a live session — standing down`)
+            this.seen.delete(conflict.id)
+            this.markNoLongerPending()
+
+            const tail = lost.slice(1)
+            for (const row of tail) {
+              const state = this.seen.get(row.id)
+              if (state) {
+                state.status = 'queued'
+                state.updatedAt = Date.now()
+              }
+            }
+            if (tail.length > 0) {
+              const current = this.convQueues.get(conversationId) ?? []
+              this.convQueues.set(conversationId, [...tail, ...current])
+            }
+          }
+        }
+
+        if (batch.length === 0) return
+
         const states = batch.map((row) => this.seen.get(row.id))
         if (
           states.some(

@@ -50,11 +50,12 @@ describe('foreground turn ownership', () => {
   it('leases every user turn even when there is no startup digest to ack', async () => {
     await userPrompt(ctx(), input)
 
-    expect(calls).toHaveLength(1)
+    expect(calls).toHaveLength(2)
     expect(calls[0]).toMatchObject({
       method: 'PUT',
       body: { session_id: 'session-a', ttl_seconds: 600 },
     })
+    expect(calls[1]?.method).toBe('GET')
   })
 
   it('releases the turn immediately when Stop has nothing to continue', async () => {
