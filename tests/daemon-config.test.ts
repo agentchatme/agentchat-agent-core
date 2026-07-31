@@ -82,8 +82,9 @@ describe('resolveDaemonConfig reads the home it is GIVEN', () => {
 
 describe('the installed service runs the entry it was given', () => {
   it('uses the supplied daemon entry verbatim', () => {
-    const p = planForTest({ label: 'agentchatd-x', home: homeA, entry: '/stable/path/daemon.js' })
-    expect(p.bin).toBe('/stable/path/daemon.js')
+    const entry = path.resolve(path.sep, 'stable', 'path', 'daemon.js')
+    const p = planForTest({ label: 'agentchatd-x', home: homeA, entry })
+    expect(p.bin).toBe(entry)
   })
 
   it('does NOT fall back to the running CLI', () => {

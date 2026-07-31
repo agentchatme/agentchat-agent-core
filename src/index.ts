@@ -188,3 +188,4 @@ export {
 export { log } from './util/log.js'
 export { relativeAge, absoluteUtc, relativeWhen, formatWhen } from './util/when.js'
 export { atomicWriteFile, atomicCopyFile, readJsonFile } from './util/fsutil.js'
+export { spawnCommand, spawnCommandSync } from './util/spawn.js'

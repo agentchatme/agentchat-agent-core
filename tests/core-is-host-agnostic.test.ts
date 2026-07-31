@@ -23,7 +23,7 @@ const SRC = path.join(__dirname, '..', 'src')
 function stripComments(source: string): string {
   return source
     .replace(/\/\*[\s\S]*?\*\//g, '')
-    .split('\n')
+    .split(/\r?\n/)
     .map((line) => line.replace(/\/\/.*$/, ''))
     .join('\n')
 }
@@ -57,7 +57,7 @@ describe('agent-core names no coding agent', () => {
       const offenders: string[] = []
       for (const file of files) {
         stripComments(fs.readFileSync(file, 'utf-8'))
-          .split('\n')
+          .split(/\r?\n/)
           .forEach((line, i) => {
             if (pattern.test(line)) {
               offenders.push(`${path.relative(SRC, file)}:${i + 1}: ${line.trim()}`)
@@ -77,7 +77,7 @@ describe('agent-core names no coding agent', () => {
     const offenders: string[] = []
     for (const file of files) {
       stripComments(fs.readFileSync(file, 'utf-8'))
-        .split('\n')
+        .split(/\r?\n/)
         .forEach((line, i) => {
           if (/--platform|\bplatform\s*[:?]|\bruntime\s*[:?]\s*['"]/.test(line)) {
             offenders.push(`${path.relative(SRC, file)}:${i + 1}: ${line.trim()}`)

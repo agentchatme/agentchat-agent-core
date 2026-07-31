@@ -1,9 +1,9 @@
 import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
-import { spawnSync, spawn } from 'node:child_process'
 import { log } from '../util/log.js'
 import { atomicWriteFile } from '../util/fsutil.js'
+import { spawnCommand, spawnCommandSync } from '../util/spawn.js'
 
 // ─── Service lifecycle (systemd / launchd / Windows Startup) ─────────────────
 //
@@ -109,7 +109,7 @@ function plan(opts: ServiceOpts): Plan {
 }
 
 function run(cmd: string, args: string[]): { ok: boolean; out: string } {
-  const r = spawnSync(cmd, args, { encoding: 'utf-8' })
+  const r = spawnCommandSync(cmd, args, { encoding: 'utf-8' })
   const out = [
     typeof r.stdout === 'string' ? r.stdout : '',
     typeof r.stderr === 'string' ? r.stderr : '',
@@ -415,7 +415,7 @@ function startDetached(cmd: string, args: string[]): void {
   // actually launch the loop now (it still starts at next login).
   if (process.env['AGENTCHATD_SERVICE_NO_START'] === '1') return
   try {
-    spawn(cmd, args, { detached: true, stdio: 'ignore', windowsHide: true }).unref()
+    spawnCommand(cmd, args, { detached: true, stdio: 'ignore', windowsHide: true }).unref()
   } catch (err) {
     log.warn(`could not start the launcher now (it starts at next login): ${String(err)}`)
   }
