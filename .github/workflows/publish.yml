@@ -64,6 +64,7 @@ jobs:
         run: |
           mkdir -p /tmp/verify
           tgz="$(npm pack --ignore-scripts --pack-destination /tmp/verify | tail -1)"
-          tar tzf "/tmp/verify/$tgz" | grep -q '^package/dist/index.js$'
+          tar tzf "/tmp/verify/$tgz" > /tmp/verify/contents.txt
+          grep -q '^package/dist/index.js$' /tmp/verify/contents.txt
           echo "tgz=/tmp/verify/$tgz" >> "$GITHUB_OUTPUT"
       - run: npm publish "${{ steps.pack.outputs.tgz }}" --ignore-scripts --provenance --access public
