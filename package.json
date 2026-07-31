@@ -1,6 +1,6 @@
 {
   "name": "@agentchatme/agent-core",
-  "version": "0.0.13131111111",
+  "version": "0.0.131311111111",
   "description": "Shared host-agnostic engine for AgentChat coding-agent integrations \u2014 wire protocol, identity storage, session digest, hook state machine, always-on daemon internals. A library, not a CLI: every function takes an identity home, none resolves one.",
   "type": "module",
   "main": "./dist/index.js",

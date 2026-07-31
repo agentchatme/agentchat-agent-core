@@ -68,6 +68,14 @@ const FOREGROUND_RECHECK_MS = positiveBoundedEnv(
   'AGENTCHATD_FOREGROUND_RECHECK_MS',
   2_000,
 )
+// A foreground turn can legitimately stay busy for minutes. Poll quickly once
+// for a normal Stop handoff, then back off so one queued delivery does not
+// produce hundreds of coordination requests and identical log lines. The cap
+// keeps crash failover prompt once the foreground lease expires.
+const FOREGROUND_RECHECK_MAX_MS = Math.max(
+  FOREGROUND_RECHECK_MS,
+  positiveBoundedEnv('AGENTCHATD_FOREGROUND_RECHECK_MAX_MS', 15_000),
+)
 
 const delay = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
 
@@ -104,6 +112,11 @@ interface DeliveryState {
   status: DeliveryStatus
   attempts: number
   updatedAt: number
+}
+
+interface ForegroundDeferral {
+  messageId: string
+  claims: number
 }
 
 export interface DaemonFailure {
@@ -144,6 +157,11 @@ export class Daemon {
   // conversation shares this window so a large multi-conversation backlog
   // cannot turn into one polling loop per conversation.
   private foregroundClaimsBlockedUntil = 0
+  private foregroundDeferralRounds = 0
+  // Log one start and one resolution per deferred conversation. Repeated
+  // rechecks remain visible through the resolution count without flooding the
+  // resident daemon log every few seconds.
+  private readonly foregroundDeferrals = new Map<string, ForegroundDeferral>()
   private stopping = false
   private heartbeatTimer: NodeJS.Timeout | null = null
 
@@ -285,12 +303,12 @@ export class Daemon {
       const claimedCount = claim.claimedCount
       let batch = candidates.slice(0, claimedCount)
 
+      if (!claim.deferred && claimedCount > 0) {
+        this.finishForegroundDeferral(conversationId, 'daemon-resumed')
+      }
+
       if (claimedCount < candidates.length) {
         if (claim.deferred) {
-          this.foregroundClaimsBlockedUntil = Math.max(
-            this.foregroundClaimsBlockedUntil,
-            Date.now() + FOREGROUND_RECHECK_MS,
-          )
           // Nobody owns this suffix yet. A foreground turn's lease atomically
           // prevented the daemon claim, so keep every row queued. If that turn
           // crashes, retrying here is the delivery's failover schedule.
@@ -299,14 +317,21 @@ export class Daemon {
             const current = this.convQueues.get(conversationId) ?? []
             this.convQueues.set(conversationId, [...deferred, ...current])
           }
-          log.info(
-            `msg ${deferred[0]?.id}: foreground turn owns priority — deferring daemon claim`,
-          )
+          const deferredHead = deferred[0]
+          if (deferredHead) {
+            this.noteForegroundDeferral(conversationId, deferredHead.id)
+          }
         } else {
           const conflict = candidates[claimedCount] as SyncRow
           // A live session already owns this delivery. Forget our dedup state
           // and do NOT ack: the session's sync path still needs to commit it.
-          log.info(`msg ${conflict.id}: claimed by the live session — standing down`)
+          const summarized = this.finishForegroundDeferral(
+            conversationId,
+            'foreground-owned',
+          )
+          if (!summarized) {
+            log.info(`msg ${conflict.id}: claimed by the live session — standing down`)
+          }
           this.seen.delete(conflict.id)
           this.markNoLongerPending()
 
@@ -333,10 +358,6 @@ export class Daemon {
           batch = batch.slice(0, renewed.claimedCount)
 
           if (renewed.deferred) {
-            this.foregroundClaimsBlockedUntil = Math.max(
-              this.foregroundClaimsBlockedUntil,
-              Date.now() + FOREGROUND_RECHECK_MS,
-            )
             // A foreground turn gained priority between daemon attempts. Put
             // every unrenewed row back at the head and let the normal claim
             // path retry after handoff.
@@ -349,11 +370,19 @@ export class Daemon {
             }
             const current = this.convQueues.get(conversationId) ?? []
             this.convQueues.set(conversationId, [...lost, ...current])
+            const lostHead = lost[0]
+            if (lostHead) this.noteForegroundDeferral(conversationId, lostHead.id)
           } else {
             // Another live holder owns the first unrenewed row. Stand down for
             // that one and preserve the later suffix for a fresh ordered claim.
             const conflict = lost[0] as SyncRow
-            log.info(`msg ${conflict.id}: renewal lost to a live session — standing down`)
+            const summarized = this.finishForegroundDeferral(
+              conversationId,
+              'foreground-owned',
+            )
+            if (!summarized) {
+              log.info(`msg ${conflict.id}: renewal lost to a live session — standing down`)
+            }
             this.seen.delete(conflict.id)
             this.markNoLongerPending()
 
@@ -443,6 +472,53 @@ export class Daemon {
       if (remaining <= 0) return
       await delay(remaining)
     }
+  }
+
+  private noteForegroundDeferral(conversationId: string, messageId: string): void {
+    const now = Date.now()
+    // Concurrent conversation workers can wake together. Only the first one
+    // advances the identity-wide backoff round; the others share its window.
+    if (now >= this.foregroundClaimsBlockedUntil) {
+      this.foregroundDeferralRounds += 1
+    }
+    const retryMs = Math.min(
+      FOREGROUND_RECHECK_MS *
+        2 ** Math.min(20, Math.max(0, this.foregroundDeferralRounds - 1)),
+      FOREGROUND_RECHECK_MAX_MS,
+    )
+    this.foregroundClaimsBlockedUntil = Math.max(
+      this.foregroundClaimsBlockedUntil,
+      now + retryMs,
+    )
+
+    const prior = this.foregroundDeferrals.get(conversationId)
+    if (prior) {
+      prior.claims += 1
+      return
+    }
+    this.foregroundDeferrals.set(conversationId, { messageId, claims: 1 })
+    log.info(`msg ${messageId}: foreground turn owns priority — daemon waiting`)
+  }
+
+  private finishForegroundDeferral(
+    conversationId: string,
+    outcome: 'daemon-resumed' | 'foreground-owned',
+  ): boolean {
+    const deferred = this.foregroundDeferrals.get(conversationId)
+    if (!deferred) return false
+    this.foregroundDeferrals.delete(conversationId)
+    if (this.foregroundDeferrals.size === 0) {
+      this.foregroundDeferralRounds = 0
+      this.foregroundClaimsBlockedUntil = 0
+    }
+    const resolution =
+      outcome === 'daemon-resumed'
+        ? 'foreground priority ended — daemon resumed'
+        : 'foreground session claimed delivery — daemon stood down'
+    log.info(
+      `msg ${deferred.messageId}: ${resolution} after ${deferred.claims} deferred claim(s)`,
+    )
+    return true
   }
 
   private turnContext(batch: SyncRow[]): TurnContext {

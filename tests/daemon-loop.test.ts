@@ -7,6 +7,7 @@ import { Daemon } from '../src/daemon/loop.js'
 import type { RuntimeAdapter, TurnContext, TurnResult } from '../src/daemon/adapter-types.js'
 import type { AgentWsClient } from '../src/daemon/ws-client.js'
 import type { DaemonConfig } from '../src/daemon/config.js'
+import { log } from '../src/util/log.js'
 
 class FakeWs extends EventEmitter {
   connected = true
@@ -86,6 +87,8 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  vi.useRealTimers()
+  vi.restoreAllMocks()
   vi.unstubAllGlobals()
   fs.rmSync(home, { recursive: true, force: true })
 })
@@ -330,6 +333,46 @@ describe('daemon delivery state machine', () => {
     foregroundActive = false
     await waitFor(() => ws.acks.length === 20)
     expect(adapter.calls).toHaveLength(20)
+    daemon.stop()
+  })
+
+  it('backs off and coalesces repeated foreground deferrals', async () => {
+    vi.useFakeTimers()
+    let batchClaims = 0
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string | URL | Request) => {
+        const url = String(input)
+        if (url.endsWith('/claim-batch')) {
+          batchClaims += 1
+          return new Response(
+            JSON.stringify({ claimed_count: 0, deferred: true }),
+            { status: 200 },
+          )
+        }
+        return new Response(JSON.stringify({ active: false }), { status: 200 })
+      }),
+    )
+    const info = vi.spyOn(log, 'info').mockImplementation(() => {})
+    const daemon = new Daemon(cfg, new FakeAdapter([]), ws as unknown as AgentWsClient)
+    await daemon.start()
+    ws.emit('inbound', row('msg_long_foreground'))
+
+    // Initial settle + claim, then the first 2s recheck. The next window backs
+    // off to 4s instead of continuing to poll every 2s.
+    await vi.advanceTimersByTimeAsync(2_400)
+    expect(batchClaims).toBe(2)
+    await vi.advanceTimersByTimeAsync(2_500)
+    expect(batchClaims).toBe(2)
+    await vi.advanceTimersByTimeAsync(2_000)
+    expect(batchClaims).toBe(3)
+
+    const foregroundLogs = info.mock.calls
+      .map(([message]) => message)
+      .filter((message) => message.includes('foreground turn owns priority'))
+    expect(foregroundLogs).toEqual([
+      'msg msg_long_foreground: foreground turn owns priority — daemon waiting',
+    ])
     daemon.stop()
   })
 
