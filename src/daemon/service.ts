@@ -86,6 +86,43 @@ function serviceLabel(value: string): string {
   return value
 }
 
+function transientPathEntry(value: string): boolean {
+  const normalized = value.replace(/\\/g, '/')
+  return (
+    /\/node_modules\/\.bin\/?$/i.test(normalized) ||
+    /\/node_modules\/npm\/node_modules\/@npmcli\/run-script\/lib\/node-gyp-bin\/?$/i.test(normalized) ||
+    /\/\.[^/]+\/tmp\//i.test(normalized)
+  )
+}
+
+/** npm/NPX and agent shells prepend disposable directories to PATH. Capturing
+ * those verbatim makes every later doctor run call a healthy service stale.
+ * Keep real user paths, canonicalize version-manager symlinks, and anchor the
+ * service to the Node installation that actually built its command plan. */
+export function stableServicePath(
+  value: string,
+  nodePath: string = process.execPath,
+): string {
+  const entries = [path.dirname(nodePath), ...value.split(path.delimiter)]
+  const seen = new Set<string>()
+  const stable: string[] = []
+  for (const raw of entries) {
+    const trimmed = raw.trim()
+    if (!trimmed || transientPathEntry(trimmed)) continue
+    let resolved = trimmed
+    try {
+      resolved = fs.realpathSync(trimmed)
+    } catch {
+      // A currently absent user path can become valid later; preserve it.
+    }
+    const key = process.platform === 'win32' ? resolved.toLowerCase() : resolved
+    if (seen.has(key)) continue
+    seen.add(key)
+    stable.push(resolved)
+  }
+  return stable.join(path.delimiter)
+}
+
 function plan(opts: ServiceOpts): Plan {
   const env: Record<string, string> = {}
   // CRITICAL: a systemd/launchd service does NOT inherit the login shell's
@@ -93,11 +130,21 @@ function plan(opts: ServiceOpts): Plan {
   // or a version-manager dir). Capture the installer's PATH so the service
   // resolves the same binaries the user does. (Without this the daemon exits
   // "claude CLI not found on PATH" and restart-loops.)
-  if (process.env['PATH']) env['PATH'] = serviceValue('environment value', process.env['PATH'])
+  if (process.env['PATH']) {
+    env['PATH'] = serviceValue(
+      'environment value',
+      stableServicePath(process.env['PATH']),
+    )
+  }
   // Whatever host env the integration says its adapter needs.
   for (const [k, v] of Object.entries(opts.env ?? {})) {
     if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) throw new Error(`invalid service environment key: ${k}`)
-    if (typeof v === 'string' && v.length > 0) env[k] = serviceValue('environment value', v)
+    if (typeof v === 'string' && v.length > 0) {
+      env[k] = serviceValue(
+        'environment value',
+        k === 'PATH' ? stableServicePath(v) : v,
+      )
+    }
   }
   return {
     label: serviceLabel(opts.label),
@@ -317,8 +364,11 @@ function uninstallLaunchd(label: string): void {
 }
 
 function statusLaunchd(label: string): string {
-  const r = run('launchctl', ['list', launchdLabel(label)])
-  return `launchd ${launchdLabel(label)}: ${r.ok ? 'loaded' : 'not loaded'}`
+  const fullLabel = launchdLabel(label)
+  const uid = typeof process.getuid === 'function' ? process.getuid() : os.userInfo().uid
+  const modern = run('launchctl', ['print', `gui/${uid}/${fullLabel}`])
+  const loaded = modern.ok || run('launchctl', ['list', fullLabel]).ok
+  return `launchd ${fullLabel}: ${loaded ? 'loaded' : 'not loaded'}`
 }
 
 // ─── Windows + WSL (Startup-folder launcher, no admin) ───────────────────────

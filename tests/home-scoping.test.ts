@@ -267,4 +267,25 @@ describe('service units are named exactly as the integration asks', () => {
     // login shell, so without it the adapter cannot find its runtime binary.
     expect(p.env['PATH']).toBeDefined()
   })
+
+  it('removes disposable npm and agent-shell entries from the service PATH', async () => {
+    const { stableServicePath } = await import('../src/daemon/service.js')
+    const transientNpx = path.join(homeA, '.npm', '_npx', 'hash', 'node_modules', '.bin')
+    const transientProject = path.join(homeA, 'project', 'node_modules', '.bin')
+    const transientAgent = path.join(homeA, '.codex', 'tmp', 'arg0', 'codex-arg123')
+    const stableBin = path.join(homeA, 'bin')
+    fs.mkdirSync(stableBin, { recursive: true })
+
+    const normalized = stableServicePath(
+      [transientNpx, transientProject, transientAgent, stableBin, stableBin].join(path.delimiter),
+      path.join(stableBin, 'node'),
+    ).split(path.delimiter)
+    const resolvedStableBin = fs.realpathSync(stableBin)
+
+    expect(normalized).toContain(resolvedStableBin)
+    expect(normalized.filter((entry) => entry === resolvedStableBin)).toHaveLength(1)
+    expect(normalized).not.toContain(transientNpx)
+    expect(normalized).not.toContain(transientProject)
+    expect(normalized).not.toContain(transientAgent)
+  })
 })
