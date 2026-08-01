@@ -1,17 +1,18 @@
-import * as crypto from 'node:crypto'
-import * as fs from 'node:fs'
-import * as path from 'node:path'
 import { log } from '../util/log.js'
-import { atomicWriteFile } from '../util/fsutil.js'
 import type { DaemonConfig } from './config.js'
 import { AgentWsClient } from './ws-client.js'
 import { ReplyCoord } from './coord.js'
 import { beat } from './health.js'
 import { recordDaemonActivity } from './activity.js'
 import {
-  recordPendingRequest,
+  listPendingRequests,
+  pendingRequestsFingerprint,
+  recordPendingRequestWithStatus,
   type RecordPendingRequestInput,
 } from './pending.js'
+import { notifyPendingRequest } from './desktop-notification.js'
+import { installationId } from './installation.js'
+import { syncPendingReviewMirror } from '../wire/index.js'
 import {
   fullAutonomyAllows,
   readFullAutonomyPolicy,
@@ -63,6 +64,7 @@ const MAX_BATCH_MESSAGES = 30
 const BATCH_SETTLE_MS = nonNegativeBoundedEnv('AGENTCHATD_BATCH_SETTLE_MS', 100)
 const MENTION_PREVIEW_MAX = 280
 const HEARTBEAT_MS = 30_000
+const PENDING_MIRROR_REFRESH_MS = 12 * 60 * 60_000
 const SEEN_TTL_MS = 24 * 60 * 60_000
 const MAX_COMPLETED_SEEN = 10_000
 const PAUSE_AT_PENDING = Math.max(
@@ -146,26 +148,6 @@ export interface DaemonFailure {
   reason: string
 }
 
-function installationId(home: string): string {
-  const file = path.join(home, 'daemon.installation-id')
-  try {
-    const existing = fs.readFileSync(file, 'utf-8').trim()
-    if (/^[0-9a-f-]{36}$/i.test(existing)) return existing
-  } catch {
-    /* create below */
-  }
-  const id = crypto.randomUUID()
-  try {
-    atomicWriteFile(file, `${id}\n`, 0o600)
-  } catch (err) {
-    // A read-only home must not make delivery disappear. The random fallback
-    // is process-unique, so it still avoids cross-machine hostname collisions;
-    // it simply cannot reclaim its prior claim after a restart.
-    log.warn(`could not persist daemon installation id: ${String(err)}`)
-  }
-  return id
-}
-
 export class Daemon {
   private readonly ws: AgentWsClient
   private readonly coord: ReplyCoord
@@ -186,6 +168,9 @@ export class Daemon {
   private readonly foregroundDeferrals = new Map<string, ForegroundDeferral>()
   private stopping = false
   private heartbeatTimer: NodeJS.Timeout | null = null
+  private readonly installation: string
+  private mirroredPendingFingerprint: string | null = null
+  private pendingMirrorSyncedAt = 0
 
   constructor(
     private readonly cfg: DaemonConfig,
@@ -195,6 +180,7 @@ export class Daemon {
      *  above decides what happens next — this class does not end the process. */
     private readonly onTerminal?: (failure: DaemonFailure) => void,
   ) {
+    this.installation = installationId(cfg.home)
     // Stable holder token: the same across a restart of THIS installation, so a
     // restarted daemon re-claims its own in-flight messages instead of being
     // locked out by its own prior claim. A hostname is not unique: two laptops
@@ -226,13 +212,43 @@ export class Daemon {
       throw new Error(`runtime (${this.adapter.name}) not ready: ${pre.detail}`)
     }
     log.info(`agentchat daemon up as @${this.cfg.handle} via ${this.adapter.name}; holding the wire`)
+    // Reconcile the complete local snapshot on every start. This backfills
+    // requests created by older clients and clears stale dashboard mirrors
+    // after an offline resolve. It is advisory and never gates the socket.
+    void this.syncPendingMirror(true)
     this.ws.start()
     // Keep the beacon fresh while connected. unref so it never by itself keeps
     // the process alive.
     this.heartbeatTimer = setInterval(() => {
-      if (this.ws.connected) beat(this.cfg.home)
+      if (this.ws.connected) {
+        beat(this.cfg.home)
+        // Detect a foreground CLI resolving an item while this resident
+        // process stays alive, and retry any prior mirror outage.
+        void this.syncPendingMirror()
+      }
     }, HEARTBEAT_MS)
     this.heartbeatTimer.unref()
+  }
+
+  private async syncPendingMirror(force = false): Promise<void> {
+    const records = listPendingRequests(this.cfg.home, this.cfg.handle)
+    const fingerprint = pendingRequestsFingerprint(records)
+    if (
+      !force &&
+      fingerprint === this.mirroredPendingFingerprint &&
+      Date.now() - this.pendingMirrorSyncedAt < PENDING_MIRROR_REFRESH_MS
+    ) return
+    try {
+      await syncPendingReviewMirror(
+        { apiKey: this.cfg.apiKey, apiBase: this.cfg.apiBase },
+        this.installation,
+        records,
+      )
+      this.mirroredPendingFingerprint = fingerprint
+      this.pendingMirrorSyncedAt = Date.now()
+    } catch (err) {
+      log.warn(`pending-review dashboard mirror unavailable: ${String(err)}`)
+    }
   }
 
   stop(): void {
@@ -480,7 +496,15 @@ export class Daemon {
                 summary: disposition.pending.summary,
               }
             try {
-              recordPendingRequest(this.cfg.home, pendingInput)
+              const persisted = recordPendingRequestWithStatus(
+                this.cfg.home,
+                pendingInput,
+              )
+              if (persisted.changed) notifyPendingRequest(persisted.record)
+              // Await one bounded attempt so a connected dashboard normally
+              // receives its event before the delivery is ACKed. Local state
+              // remains authoritative if this advisory mirror is unavailable.
+              await this.syncPendingMirror()
               pendingPersistence = null
             } catch (err) {
               // Pending state is the foreground notification contract. Never

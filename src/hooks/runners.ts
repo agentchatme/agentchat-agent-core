@@ -21,8 +21,8 @@ import { log } from '../util/log.js'
  * between them would be one more place to pick the wrong one.
  */
 export interface HookDialect {
-  sessionStartOutput(context: string): Record<string, unknown>
-  userPromptOutput(context: string): Record<string, unknown>
+  sessionStartOutput(context: string, notification: string | null): Record<string, unknown>
+  userPromptOutput(context: string, notification: string | null): Record<string, unknown>
   stopOutput(reason: string): Record<string, unknown>
   printJson(payload: Record<string, unknown>): void
 }
@@ -45,8 +45,13 @@ export function createHookRunners(context: () => HookContext, dialect: HookDiale
     async runSessionStart(): Promise<void> {
       try {
         const input = await readHookInput()
-        const { context: text } = await sessionStart(context(), input)
-        if (text !== null) dialect.printJson(dialect.sessionStartOutput(text))
+        const result = await sessionStart(context(), input)
+        if (result.context !== null) {
+          dialect.printJson(
+            dialect.sessionStartOutput(result.context, result.notification),
+          )
+          result.stage()
+        }
       } catch (err) {
         log.warn(`session-start hook degraded to no-op: ${String(err)}`)
       }
@@ -55,9 +60,9 @@ export function createHookRunners(context: () => HookContext, dialect: HookDiale
     async runUserPrompt(): Promise<void> {
       try {
         const input = await readHookInput()
-        const { context: text, stage } = await userPrompt(context(), input)
+        const { context: text, notification, stage } = await userPrompt(context(), input)
         if (text === null) return
-        dialect.printJson(dialect.userPromptOutput(text))
+        dialect.printJson(dialect.userPromptOutput(text, notification))
         stage()
       } catch (err) {
         log.warn(`user-prompt hook degraded to no-op: ${String(err)}`)

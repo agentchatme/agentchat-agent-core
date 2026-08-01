@@ -40,6 +40,7 @@ import {
 } from '../daemon/activity.js'
 import {
   formatPendingRequestsNotice,
+  formatPendingRequestsSystemMessage,
   listPendingRequests,
   pendingRequestsFingerprint,
 } from '../daemon/pending.js'
@@ -87,11 +88,17 @@ export interface HookContext {
 export interface SessionStartResult {
   /** Text to inject into the session, or null for "say nothing". */
   context: string | null
+  /** Deterministic text for the host's user-visible hook surface. */
+  notification: string | null
+  /** Record the notice only after the integration printed it successfully. */
+  stage: () => void
 }
 
 export interface UserPromptResult {
   /** Text to add to this prompt, or null when the inbox has nothing new. */
   context: string | null
+  /** Deterministic text for the host's user-visible hook surface. */
+  notification: string | null
   /**
    * Persist the surfaced cursor locally. Call only after the host has accepted
    * `context`; the following Stop is the first boundary allowed to ACK it.
@@ -178,7 +185,11 @@ export async function sessionStart(
   ctx: HookContext,
   input: HookInput,
 ): Promise<SessionStartResult> {
-  const none: SessionStartResult = { context: null }
+  const none: SessionStartResult = {
+    context: null,
+    notification: null,
+    stage: () => {},
+  }
   try {
     if (hooksDisabled()) return none
 
@@ -200,7 +211,11 @@ export async function sessionStart(
       // be quiet, not a nag.
       if (shouldOfferRegistration(ctx.home)) {
         recordRegistrationOffer(ctx.home)
-        return { context: formatRegistrationOffer(ctx.copy, alwaysOnState(ctx.home)) }
+        return {
+          context: formatRegistrationOffer(ctx.copy, alwaysOnState(ctx.home)),
+          notification: null,
+          stage: () => {},
+        }
       }
       return none
     }
@@ -226,13 +241,21 @@ export async function sessionStart(
     )
       ? formatPendingRequestsNotice(requests, ctx.copy)
       : null
-    if (pendingNotice !== null) {
-      recordPendingNotice(ctx.home, input.sessionId, fingerprint)
-    }
     const context = [alert, pendingNotice]
       .filter((value): value is string => value !== null)
       .join('\n\n')
-    return { context: context || null }
+    return {
+      context: context || null,
+      notification:
+        pendingNotice === null
+          ? null
+          : formatPendingRequestsSystemMessage(requests),
+      stage: () => {
+        if (pendingNotice !== null) {
+          recordPendingNotice(ctx.home, input.sessionId, fingerprint)
+        }
+      },
+    }
   } catch (err) {
     log.warn(`session-start hook degraded to no-op: ${String(err)}`)
     return none
@@ -247,7 +270,11 @@ export async function userPrompt(
   ctx: HookContext,
   input: HookInput,
 ): Promise<UserPromptResult> {
-  const none: UserPromptResult = { context: null, stage: () => {} }
+  const none: UserPromptResult = {
+    context: null,
+    notification: null,
+    stage: () => {},
+  }
   try {
     if (hooksDisabled()) return none
     const identity = resolveIdentity(ctx.home)
@@ -300,6 +327,10 @@ export async function userPrompt(
       if (!localContext) return none
       return {
         context: localContext,
+        notification:
+          pendingContext === null
+            ? null
+            : formatPendingRequestsSystemMessage(pendingRequests),
         stage: stageLocalContext,
       }
     }
@@ -312,6 +343,10 @@ export async function userPrompt(
       if (!localContext) return none
       return {
         context: localContext,
+        notification:
+          pendingContext === null
+            ? null
+            : formatPendingRequestsSystemMessage(pendingRequests),
         stage: stageLocalContext,
       }
     }
@@ -319,13 +354,24 @@ export async function userPrompt(
     const cursor = lastDeliveryId(rows)
     if (cursor === null) {
       return localContext
-        ? { context: localContext, stage: stageLocalContext }
+        ? {
+            context: localContext,
+            notification:
+              pendingContext === null
+                ? null
+                : formatPendingRequestsSystemMessage(pendingRequests),
+            stage: stageLocalContext,
+          }
         : none
     }
     return {
       context: [pendingContext, activityContext, formatSessionStart(handle, rows)]
         .filter((value): value is string => value !== null)
         .join('\n\n'),
+      notification:
+        pendingContext === null
+          ? null
+          : formatPendingRequestsSystemMessage(pendingRequests),
       stage: () => {
         stageLocalContext()
         setPendingAck(ctx.home, input.sessionId, cursor)
