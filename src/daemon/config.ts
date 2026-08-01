@@ -52,7 +52,11 @@ export async function resolveDaemonConfig(opts: ResolveDaemonOpts): Promise<Daem
     throw new Error(`no AgentChat identity in ${home} — register this agent first`)
   }
 
-  let handle = id.handle
+  // An environment key is the authenticated identity even when this home also
+  // contains an older credentials file. That file's handle is not evidence
+  // about the env key, so resolve it from the server before applying any
+  // identity-scoped autonomy or pending state.
+  let handle = id.source === 'file' ? id.handle : null
   if (handle === null) {
     const me = await getMeLite({ apiKey: id.apiKey, apiBase: id.apiBase })
     if (me === null) {

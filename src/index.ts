@@ -78,6 +78,8 @@ export {
   resetSession,
   setPendingAck,
   takePendingAck,
+  pendingNoticeNeeded,
+  recordPendingNotice,
   shouldOfferRegistration,
   recordRegistrationOffer,
   recordOfferDeclined,
@@ -85,6 +87,21 @@ export {
   clearOfferDeclined,
   type HookState,
 } from './identity/state.js'
+
+// Local unattended-execution policy. Identity scoped and intentionally kept
+// outside the server/account contract.
+export {
+  autonomyPath,
+  normalizeAgentHandle,
+  readFullAutonomyPolicy,
+  writeFullAutonomyPolicy,
+  setFullAutonomyMode,
+  allowFullAutonomyAgent,
+  removeFullAutonomyAgent,
+  fullAutonomyAllows,
+  type AutonomyMode,
+  type FullAutonomyPolicy,
+} from './autonomy/policy.js'
 
 // Digest rendering — what the agent is actually told.
 export {
@@ -136,6 +153,8 @@ export {
   type IdentityCommands,
   type RegisterOpts,
   type DoctorOpts,
+  type AutonomyCommandOpts,
+  type PendingCommandOpts,
 } from './identity/commands.js'
 export { anchorLabelOf, type HostProfile, type DoctorCheck, type Verdict } from './identity/host-profile.js'
 
@@ -164,6 +183,26 @@ export {
 } from './daemon/health.js'
 
 export { acquireLeaderLock, type LockHandle } from './daemon/leader-lock.js'
+export {
+  recordDaemonActivity,
+  peekDaemonActivities,
+  ackDaemonActivities,
+  formatDaemonActivities,
+  type DaemonActivity,
+  type RecordDaemonActivityInput,
+} from './daemon/activity.js'
+export {
+  pendingRequestId,
+  recordPendingRequest,
+  getPendingRequest,
+  listPendingRequests,
+  resolvePendingRequest,
+  pendingRequestsFingerprint,
+  formatPendingRequestsNotice,
+  type PendingReason,
+  type PendingRequest,
+  type RecordPendingRequestInput,
+} from './daemon/pending.js'
 export {
   installService,
   uninstallService,

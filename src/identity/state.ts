@@ -31,6 +31,10 @@ const SessionStateSchema = z.object({
   // Stop context needs the specific host-created continuation, not merely an
   // unrelated later turn that happens to reach Stop.
   pending_ack_requires_continuation: z.boolean().optional(),
+  // Fingerprint of the durable local pending-request set already surfaced in
+  // this sitting. A changed request updates its fingerprint and is announced
+  // again; unchanged requests wait quietly until the next session.
+  pending_notice_fingerprint: z.string().optional(),
 })
 
 const StateSchema = z.object({
@@ -90,6 +94,9 @@ export function recordContinuation(home: string, sessionKey: string, now: Date =
     ...(existing?.pending_ack_requires_continuation === true
       ? { pending_ack_requires_continuation: true }
       : {}),
+    ...(existing?.pending_notice_fingerprint !== undefined
+      ? { pending_notice_fingerprint: existing.pending_notice_fingerprint }
+      : {}),
   }
   writeState(home, state)
   return next
@@ -129,6 +136,9 @@ export function setPendingAck(
     ...(requiresContinuation
       ? { pending_ack_requires_continuation: true }
       : {}),
+    ...(existing?.pending_notice_fingerprint !== undefined
+      ? { pending_notice_fingerprint: existing.pending_notice_fingerprint }
+      : {}),
   }
   writeState(home, state)
 }
@@ -160,6 +170,42 @@ export function takePendingAck(home: string, sessionKey: string, now: Date = new
   entry.updated_at = now.toISOString()
   writeState(home, state)
   return cursor
+}
+
+export function pendingNoticeNeeded(
+  home: string,
+  sessionKey: string,
+  fingerprint: string,
+): boolean {
+  if (fingerprint.length === 0) return false
+  return (
+    readState(home).sessions[sessionKey]?.pending_notice_fingerprint !==
+    fingerprint
+  )
+}
+
+export function recordPendingNotice(
+  home: string,
+  sessionKey: string,
+  fingerprint: string,
+  now: Date = new Date(),
+): void {
+  if (fingerprint.length === 0) return
+  const state = readState(home)
+  prune(state, now)
+  const existing = state.sessions[sessionKey]
+  state.sessions[sessionKey] = {
+    continuations: existing?.continuations ?? 0,
+    updated_at: now.toISOString(),
+    pending_notice_fingerprint: fingerprint,
+    ...(existing?.pending_ack !== undefined
+      ? { pending_ack: existing.pending_ack }
+      : {}),
+    ...(existing?.pending_ack_requires_continuation === true
+      ? { pending_ack_requires_continuation: true }
+      : {}),
+  }
+  writeState(home, state)
 }
 
 const OFFER_COOLDOWN_MS = 24 * 60 * 60 * 1000

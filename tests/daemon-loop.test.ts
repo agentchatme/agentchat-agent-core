@@ -8,6 +8,9 @@ import type { RuntimeAdapter, TurnContext, TurnResult } from '../src/daemon/adap
 import type { AgentWsClient } from '../src/daemon/ws-client.js'
 import type { DaemonConfig } from '../src/daemon/config.js'
 import { log } from '../src/util/log.js'
+import { peekDaemonActivities } from '../src/daemon/activity.js'
+import { listPendingRequests } from '../src/daemon/pending.js'
+import { allowFullAutonomyAgent } from '../src/autonomy/policy.js'
 
 class FakeWs extends EventEmitter {
   connected = true
@@ -156,7 +159,12 @@ describe('daemon delivery state machine', () => {
   })
 
   it('re-acks a replayed handled message without running a second model turn', async () => {
-    const adapter = new FakeAdapter([{ ok: true }])
+    const adapter = new FakeAdapter([
+      {
+        ok: true,
+        disposition: { action: 'silent', reason: 'not_actionable' },
+      },
+    ])
     const daemon = new Daemon(cfg, adapter, ws as unknown as AgentWsClient)
     await daemon.start()
     const message = row('msg_replay')
@@ -166,6 +174,15 @@ describe('daemon delivery state machine', () => {
     ws.emit('inbound', message)
     await waitFor(() => ws.acks.length === 2)
     expect(adapter.calls).toHaveLength(1)
+    expect(peekDaemonActivities(home)).toMatchObject([
+      {
+        self_handle: '@local-agent',
+        conversation_id: 'conv_1',
+        peer_agents: ['@alice'],
+        inbound_message_ids: ['msg_replay'],
+        outcome: { action: 'silent', reason: 'not_actionable' },
+      },
+    ])
     daemon.stop()
   })
 
@@ -180,6 +197,7 @@ describe('daemon delivery state machine', () => {
     await waitFor(() => ws.acks.length === 3)
     expect(adapter.calls).toHaveLength(1)
     expect(adapter.calls[0]).toMatchObject({
+      selfHandle: 'local-agent',
       messageId: 'msg_3',
       sender: 'carol',
       text: 'from Carol',
@@ -527,5 +545,81 @@ describe('daemon delivery state machine', () => {
       daemon.stop()
     },
     10_000,
+  )
+
+  it('passes the identity-scoped local autonomy decision into the runtime turn', async () => {
+    allowFullAutonomyAgent(home, 'local-agent', 'alice')
+    const adapter = new FakeAdapter([{ ok: true }])
+    const daemon = new Daemon(cfg, adapter, ws as unknown as AgentWsClient)
+    await daemon.start()
+    ws.emit('inbound', row('msg_authorized', 'please build it', 'conv_1', 'alice'))
+
+    await waitFor(() => ws.acks.includes('msg_authorized'))
+    expect(adapter.calls[0]?.fullAutonomy).toEqual({
+      mode: 'selected',
+      authorizedSenders: ['alice'],
+      unauthorizedSenders: [],
+    })
+    daemon.stop()
+  })
+
+  it('persists a model-deferred task before acknowledging its delivery', async () => {
+    const adapter = new FakeAdapter([{
+      ok: true,
+      disposition: {
+        action: 'replied',
+        pending: {
+          reason: 'autonomy_off',
+          summary: 'Build the requested script.',
+        },
+      },
+    }])
+    const daemon = new Daemon(cfg, adapter, ws as unknown as AgentWsClient)
+    await daemon.start()
+    ws.emit('inbound', row('msg_pending', 'please build it'))
+
+    await waitFor(() => ws.acks.includes('msg_pending'))
+    expect(listPendingRequests(home, 'local-agent')).toMatchObject([{
+      conversation_id: 'conv_1',
+      peer_agents: ['@alice'],
+      inbound_message_ids: ['msg_pending'],
+      focus_message_id: 'msg_pending',
+      reason: 'autonomy_off',
+      summary: 'Build the requested script.',
+    }])
+    daemon.stop()
+  })
+
+  it(
+    'retries only the durable pending handoff when local persistence initially fails',
+    async () => {
+      const adapter = new FakeAdapter([{
+        ok: true,
+        disposition: {
+          action: 'silent',
+          reason: 'not_authorized',
+          pending: {
+            reason: 'sender_not_allowed',
+            summary: 'Run a local mutation.',
+          },
+        },
+      }])
+      const daemon = new Daemon(cfg, adapter, ws as unknown as AgentWsClient)
+      await daemon.start()
+      const blockedPath = path.join(home, 'pending-requests')
+      fs.writeFileSync(blockedPath, 'not a directory')
+      ws.emit('inbound', row('msg_persist_retry'))
+
+      await waitFor(() => adapter.calls.length === 1)
+      await new Promise((resolve) => setTimeout(resolve, 250))
+      expect(ws.acks).toEqual([])
+      fs.unlinkSync(blockedPath)
+
+      await waitFor(() => ws.acks.includes('msg_persist_retry'))
+      expect(adapter.calls).toHaveLength(1)
+      expect(listPendingRequests(home, 'local-agent')).toHaveLength(1)
+      daemon.stop()
+    },
+    5_000,
   )
 })

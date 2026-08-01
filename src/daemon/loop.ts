@@ -7,8 +7,23 @@ import type { DaemonConfig } from './config.js'
 import { AgentWsClient } from './ws-client.js'
 import { ReplyCoord } from './coord.js'
 import { beat } from './health.js'
+import { recordDaemonActivity } from './activity.js'
+import {
+  recordPendingRequest,
+  type RecordPendingRequestInput,
+} from './pending.js'
+import {
+  fullAutonomyAllows,
+  readFullAutonomyPolicy,
+} from '../autonomy/policy.js'
 import { contextOf, senderOf, type SyncRow } from './frames.js'
-import type { RuntimeAdapter, TurnContext, TurnMentionContext } from './adapter-types.js'
+import type {
+  RuntimeAdapter,
+  TurnContext,
+  TurnDisposition,
+  TurnMentionContext,
+  TurnResult,
+} from './adapter-types.js'
 
 // ─── The core loop ──────────────────────────────────────────────────────────
 //
@@ -103,6 +118,13 @@ function previewOf(row: SyncRow): string {
   return oneLine.length > MENTION_PREVIEW_MAX
     ? `${oneLine.slice(0, MENTION_PREVIEW_MAX - 1)}…`
     : oneLine
+}
+
+function dispositionOf(result: TurnResult): TurnDisposition {
+  if (result.disposition) return result.disposition
+  return result.detail === 'replied'
+    ? { action: 'replied' }
+    : { action: 'silent', reason: 'other' }
 }
 
 type DeliveryStatus = 'queued' | 'running' | 'retry-wait' | 'handled'
@@ -347,6 +369,10 @@ export class Daemon {
 
       // A failed batch stays ahead of later messages in its conversation. The
       // same frozen delivery set retries; new arrivals wait for the next batch.
+      let pendingPersistence: {
+        result: TurnResult
+        input: RecordPendingRequestInput
+      } | null = null
       while (!this.stopping) {
         // A host turn can run for almost the full coordination TTL. Renew the
         // exact frozen delivery set before every attempt so a retry never runs
@@ -423,17 +449,65 @@ export class Daemon {
         }
 
         const focus = batch[batch.length - 1] as SyncRow
-        let result
-        try {
-          log.info(
-            `turn for ${batch.length} message(s), newest ${focus.id}, in ${conversationId} (attempt ${attempt})`,
-          )
-          result = await this.adapter.runTurn(this.turnContext(batch))
-        } catch (err) {
-          result = { ok: false, detail: `adapter threw: ${String(err)}` }
+        let result: TurnResult
+        if (pendingPersistence !== null) {
+          // The runtime already handled this delivery. Only the durable local
+          // handoff failed, so retry that write without asking the model to
+          // repeat work or depend on it emitting the same marker again.
+          result = pendingPersistence.result
+        } else {
+          try {
+            log.info(
+              `turn for ${batch.length} message(s), newest ${focus.id}, in ${conversationId} (attempt ${attempt})`,
+            )
+            result = await this.adapter.runTurn(this.turnContext(batch))
+          } catch (err) {
+            result = { ok: false, detail: `adapter threw: ${String(err)}` }
+          }
         }
 
         if (result.ok) {
+          const disposition = dispositionOf(result)
+          if (disposition.pending) {
+            const pendingInput: RecordPendingRequestInput =
+              pendingPersistence?.input ?? {
+                selfHandle: this.cfg.handle,
+                conversationId,
+                peerAgents: [...new Set(batch.map(senderOf))],
+                inboundMessageIds: batch.map((row) => row.id),
+                focusMessageId: focus.id,
+                reason: disposition.pending.reason,
+                summary: disposition.pending.summary,
+              }
+            try {
+              recordPendingRequest(this.cfg.home, pendingInput)
+              pendingPersistence = null
+            } catch (err) {
+              // Pending state is the foreground notification contract. Never
+              // ACK the server delivery if that durable local handoff failed.
+              pendingPersistence = { result, input: pendingInput }
+              result = {
+                ok: false,
+                detail: `could not persist pending request: ${String(err)}`,
+              }
+            }
+          }
+        }
+
+        if (result.ok) {
+          const disposition = dispositionOf(result)
+          recordDaemonActivity(this.cfg.home, {
+            selfHandle: this.cfg.handle,
+            conversationId,
+            peerAgents: [...new Set(batch.map(senderOf))],
+            inboundMessageIds: batch.map((row) => row.id),
+            outcome: disposition,
+          })
+          log.info(
+            disposition.action === 'replied'
+              ? `turn outcome for ${conversationId}: replied`
+              : `turn outcome for ${conversationId}: silent (${disposition.reason})`,
+          )
           for (const row of batch) this.markHandled(row.id)
           return
         }
@@ -527,6 +601,14 @@ export class Daemon {
     const focusContext = contextOf(focus)
     const self = this.cfg.handle.replace(/^@/, '').toLowerCase()
     const isGroup = focus.conversation_id.startsWith('grp_')
+    const policy = readFullAutonomyPolicy(this.cfg.home, this.cfg.handle)
+    const batchSenders = [...new Set(batch.map(senderOf))]
+    const authorizedSenders = batchSenders.filter((sender) =>
+      fullAutonomyAllows(policy, sender),
+    )
+    const unauthorizedSenders = batchSenders.filter(
+      (sender) => !fullAutonomyAllows(policy, sender),
+    )
     const mentionedMessages: TurnMentionContext[] = isGroup
       ? batch.flatMap((row) => {
           const ctx = contextOf(row)
@@ -548,6 +630,7 @@ export class Daemon {
       : []
 
     return {
+      selfHandle: this.cfg.handle,
       messageId: focus.id,
       messageSeq: typeof focus.seq === 'number' ? focus.seq : undefined,
       conversationId: focus.conversation_id,
@@ -574,6 +657,11 @@ export class Daemon {
         newestMessageSeq:
           typeof focus.seq === 'number' ? focus.seq : undefined,
         mentionedMessages,
+      },
+      fullAutonomy: {
+        mode: policy.mode,
+        authorizedSenders,
+        unauthorizedSenders,
       },
     }
   }

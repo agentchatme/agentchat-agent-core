@@ -16,6 +16,19 @@ import { writeAnchor, removeAnchorAt, readAnchorHandleAt, hasAnchorAt } from '..
 import { syncPeek } from '../wire/index.js'
 import { anchorLabelOf, type DoctorCheck, type HostProfile, type Verdict } from './host-profile.js'
 import { CODING_AGENTS_CLIENT_IDENTITY } from '../client-identity.js'
+import {
+  allowFullAutonomyAgent,
+  normalizeAgentHandle,
+  readFullAutonomyPolicy,
+  removeFullAutonomyAgent,
+  setFullAutonomyMode,
+  type FullAutonomyPolicy,
+} from '../autonomy/policy.js'
+import {
+  getPendingRequest,
+  listPendingRequests,
+  resolvePendingRequest,
+} from '../daemon/pending.js'
 
 // ─── Identity commands, for exactly one agent ───────────────────────────────
 //
@@ -106,11 +119,26 @@ export interface DoctorOpts {
   fix?: boolean
 }
 
+export interface AutonomyCommandOpts {
+  action?: string
+  handle?: string
+  yes?: boolean
+  json?: boolean
+}
+
+export interface PendingCommandOpts {
+  action?: string
+  id?: string
+  json?: boolean
+}
+
 export interface IdentityCommands {
   runRegister(opts: RegisterOpts): Promise<number>
   runLogin(opts: { apiKey?: string; apiBase?: string }): Promise<number>
   runRecover(opts: { email?: string; code?: string; apiBase?: string }): Promise<number>
   runStatus(opts: { json?: boolean }): Promise<number>
+  runAutonomy(opts: AutonomyCommandOpts): Promise<number>
+  runPendingRequests(opts: PendingCommandOpts): Promise<number>
   runLogout(): number
   runDoctor(opts?: DoctorOpts): Promise<number>
 }
@@ -120,6 +148,53 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
   const invocation = (): string => profile.invocation()
   const apiErr = (err: unknown): string => describeApiError(err, invocation())
   const LABEL = profile.label
+
+  function localControlMutationAllowed(): boolean {
+    if (process.env['AGENTCHAT_EXECUTION'] !== 'always_on') return true
+    console.error(
+      'This setting can only be changed from a local foreground session or terminal, never from an unattended AgentChat request.',
+    )
+    return false
+  }
+
+  async function currentIdentity(): Promise<{
+    home: string
+    handle: string
+    client: AgentChatClient
+  } | null> {
+    const home = profile.home()
+    const identity = resolveIdentity(home)
+    if (identity === null) {
+      console.error(`No AgentChat account is connected for this ${LABEL} agent.`)
+      return null
+    }
+    const client = new AgentChatClient({
+      apiKey: identity.apiKey,
+      baseUrl: identity.apiBase,
+      clientIdentity: CODING_AGENTS_CLIENT_IDENTITY,
+    })
+    if (identity.source === 'file' && identity.handle) {
+      return { home, handle: identity.handle, client }
+    }
+    try {
+      const me = await client.getMe()
+      return { home, handle: me.handle, client }
+    } catch (err) {
+      console.error(`Could not identify this AgentChat account: ${apiErr(err)}`)
+      return null
+    }
+  }
+
+  function autonomyDescription(policy: FullAutonomyPolicy): string {
+    switch (policy.mode) {
+      case 'off':
+        return 'off — unattended side-effecting work waits for local review'
+      case 'everyone':
+        return 'everyone who can reach this agent — existing inbox, block, pause, permission, and safety rules still apply'
+      case 'selected':
+        return `selected agents — ${policy.selected_agents.map((handle) => `@${handle}`).join(', ') || 'none'}`
+    }
+  }
 
   /** Write THIS agent's anchor. Only ever touches `profile.anchorFile()`. */
   function writeOurAnchor(handle: string): string[] {
@@ -442,6 +517,8 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
       const me = await client.getMe()
       const rows = await syncPeek({ apiKey: identity.apiKey, apiBase: identity.apiBase }, { limit: 100 })
       const unread = rows.length === 100 ? '100+' : String(rows.length)
+      const autonomy = readFullAutonomyPolicy(home, me.handle)
+      const pendingRequests = listPendingRequests(home, me.handle)
 
       if (opts.json) {
         console.log(
@@ -457,6 +534,11 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
             api_base: identity.apiBase,
             home,
             anchor: hasAnchorAt(anchorFile),
+            full_autonomy: {
+              mode: autonomy.mode,
+              selected_agents: autonomy.selected_agents.map((handle) => `@${handle}`),
+            },
+            pending_requests: pendingRequests.length,
           }),
         )
       } else {
@@ -467,6 +549,8 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
             `Key source: ${identity.source} (${identity.source === 'file' ? credentialsPath(home) : 'AGENTCHAT_API_KEY'})`,
             `API: ${identity.apiBase}`,
             `Anchor: ${hasAnchorAt(anchorFile) ? 'yes' : 'no'} (${anchorFile})`,
+            `Full autonomy: ${autonomyDescription(autonomy)}`,
+            `Pending requests: ${pendingRequests.length}`,
           ].join('\n'),
         )
       }
@@ -475,6 +559,172 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
       console.error(`Could not reach AgentChat: ${apiErr(err)}`)
       return 1
     }
+  }
+
+  async function runAutonomy(opts: AutonomyCommandOpts): Promise<number> {
+    const current = await currentIdentity()
+    if (current === null) return 1
+    const action = opts.action ?? 'status'
+    const existing = readFullAutonomyPolicy(current.home, current.handle)
+
+    if (action === 'status') {
+      const pendingCount = listPendingRequests(current.home, current.handle).length
+      if (opts.json) {
+        console.log(JSON.stringify({
+          identity: `@${current.handle.replace(/^@/, '')}`,
+          mode: existing.mode,
+          selected_agents: existing.selected_agents.map((handle) => `@${handle}`),
+          pending_requests: pendingCount,
+        }))
+      } else {
+        console.log([
+          `Full autonomy: ${autonomyDescription(existing)}`,
+          `Pending requests: ${pendingCount}`,
+        ].join('\n'))
+      }
+      return 0
+    }
+
+    if (!localControlMutationAllowed()) return 1
+
+    if (action === 'off') {
+      const policy = setFullAutonomyMode(current.home, current.handle, 'off')
+      console.log(`Full autonomy is off for @${policy.identity_handle}. New unattended tasks that need side effects will wait for local review.`)
+      return 0
+    }
+
+    if (action === 'everyone') {
+      let confirmed = opts.yes === true
+      if (!confirmed && process.stdin.isTTY === true && process.stdout.isTTY === true) {
+        confirmed = (await prompt(
+          'Enable full autonomy for every agent allowed to reach this account? Type "enable" to confirm: ',
+        )).toLowerCase() === 'enable'
+      }
+      if (!confirmed) {
+        console.error(`Confirmation required. Re-run with: ${invocation()} autonomy everyone --yes`)
+        return 1
+      }
+      const policy = setFullAutonomyMode(current.home, current.handle, 'everyone')
+      console.log(`Full autonomy now accepts tasks from everyone who can reach @${policy.identity_handle}. Existing inbox, block, pause, permission, and safety rules still apply.`)
+      return 0
+    }
+
+    if (action === 'selected') {
+      if (existing.selected_agents.length === 0) {
+        console.error(`No agents are selected yet. Add one with: ${invocation()} autonomy allow @handle`)
+        return 1
+      }
+      const policy = setFullAutonomyMode(current.home, current.handle, 'selected')
+      console.log(`Full autonomy is limited to: ${policy.selected_agents.map((handle) => `@${handle}`).join(', ')}`)
+      return 0
+    }
+
+    if (action === 'allow') {
+      const peer = normalizeAgentHandle(opts.handle ?? '')
+      if (peer === null) {
+        console.error(`Provide a valid AgentChat handle. Usage: ${invocation()} autonomy allow @handle`)
+        return 1
+      }
+      if (peer === normalizeAgentHandle(current.handle)) {
+        console.error('This agent cannot add itself to its own autonomy list.')
+        return 1
+      }
+      try {
+        await current.client.getAgent(peer)
+      } catch (err) {
+        console.error(`Could not select @${peer}: ${apiErr(err)}`)
+        return 1
+      }
+      const policy = allowFullAutonomyAgent(current.home, current.handle, peer)
+      console.log(`Full autonomy is enabled for @${peer}. Selected agents: ${policy.selected_agents.map((handle) => `@${handle}`).join(', ')}`)
+      return 0
+    }
+
+    if (action === 'remove') {
+      if (existing.mode === 'everyone') {
+        console.error(`Everyone is currently allowed. Switch to selected mode or turn full autonomy off before removing one agent.`)
+        return 1
+      }
+      const peer = normalizeAgentHandle(opts.handle ?? '')
+      if (peer === null) {
+        console.error(`Provide a valid AgentChat handle. Usage: ${invocation()} autonomy remove @handle`)
+        return 1
+      }
+      const policy = removeFullAutonomyAgent(current.home, current.handle, peer)
+      console.log(
+        policy.mode === 'off'
+          ? `Removed @${peer}. No selected agents remain, so full autonomy is off.`
+          : `Removed @${peer}. Selected agents: ${policy.selected_agents.map((handle) => `@${handle}`).join(', ')}`,
+      )
+      return 0
+    }
+
+    console.error(`Usage: ${invocation()} autonomy <status|allow @handle|remove @handle|selected|everyone|off>`)
+    return 1
+  }
+
+  async function runPendingRequests(opts: PendingCommandOpts): Promise<number> {
+    const current = await currentIdentity()
+    if (current === null) return 1
+    const action = opts.action ?? 'list'
+
+    if (action === 'list' || action === 'status') {
+      const records = listPendingRequests(current.home, current.handle)
+      if (opts.json) {
+        console.log(JSON.stringify({ pending_requests: records }))
+      } else if (records.length === 0) {
+        console.log('No pending AgentChat requests need local review.')
+      } else {
+        console.log([
+          `${records.length} pending AgentChat request${records.length === 1 ? '' : 's'}:`,
+          ...records.map((record) =>
+            `  ${record.id}  ${record.peer_agents.join(', ') || 'unknown peer'}  ${record.summary}`,
+          ),
+          '',
+          `Inspect one with: ${invocation()} pending show <id>`,
+        ].join('\n'))
+      }
+      return 0
+    }
+
+    if (action === 'show') {
+      const record = getPendingRequest(current.home, current.handle, opts.id ?? '')
+      if (record === null) {
+        console.error('That pending request was not found for this AgentChat account.')
+        return 1
+      }
+      if (opts.json) console.log(JSON.stringify(record))
+      else {
+        console.log([
+          `Pending request: ${record.id}`,
+          `From: ${record.peer_agents.join(', ') || 'unknown peer'}`,
+          `Reason: ${record.reason}`,
+          `Summary: ${record.summary}`,
+          `Conversation: ${record.conversation_id}`,
+          `Focus message: ${record.focus_message_id}`,
+          `Waiting since: ${record.first_requested_at}`,
+          `Last updated: ${record.updated_at}`,
+          '',
+          'The summary is only a local triage note. Read the full AgentChat conversation before deciding.',
+          `After the request is completed or declined: ${invocation()} pending resolve ${record.id}`,
+        ].join('\n'))
+      }
+      return 0
+    }
+
+    if (action === 'resolve') {
+      if (!localControlMutationAllowed()) return 1
+      const id = opts.id ?? ''
+      if (!resolvePendingRequest(current.home, current.handle, id)) {
+        console.error('That pending request was not found for this AgentChat account.')
+        return 1
+      }
+      console.log(`Resolved local pending request ${id}. Its AgentChat conversation remains stored on the server.`)
+      return 0
+    }
+
+    console.error(`Usage: ${invocation()} pending <list|show <id>|resolve <id>>`)
+    return 1
   }
 
   /**
@@ -595,5 +845,14 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
     return checks.some((c) => c.verdict === 'FAIL') ? 1 : 0
   }
 
-  return { runRegister, runLogin, runRecover, runStatus, runLogout, runDoctor }
+  return {
+    runRegister,
+    runLogin,
+    runRecover,
+    runStatus,
+    runAutonomy,
+    runPendingRequests,
+    runLogout,
+    runDoctor,
+  }
 }

@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
@@ -31,6 +31,7 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  vi.unstubAllGlobals()
   fs.rmSync(root, { recursive: true, force: true })
 })
 
@@ -73,6 +74,20 @@ describe('resolveDaemonConfig reads the home it is GIVEN', () => {
     fs.writeFileSync(path.join(homeA, 'credentials'), creds('agent-a', 'http://localhost:3000'))
     const a = await resolveDaemonConfig({ home: homeA })
     expect(a.wsUrl).toBe('ws://localhost:3000/v1/ws')
+  })
+
+  it('resolves an environment key handle authoritatively instead of borrowing the file handle', async () => {
+    fs.writeFileSync(path.join(homeA, 'credentials'), creds('file-agent'))
+    process.env['AGENTCHAT_API_KEY'] = 'ac_live_' + 'z'.repeat(40)
+    vi.stubGlobal('fetch', vi.fn(async () =>
+      new Response(JSON.stringify({ handle: 'environment-agent' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    ))
+
+    const config = await resolveDaemonConfig({ home: homeA })
+    expect(config.handle).toBe('environment-agent')
   })
 
   it('refuses to start against a home with no identity', async () => {

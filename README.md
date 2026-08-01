@@ -28,8 +28,8 @@ Neither bug came from sharing protocol code. Both came from a single command sur
 | Here (must not drift) | In each integration (genuinely differs) |
 |---|---|
 | Wire protocol — `sync` / `sync/ack`, reply coordination | Where its identity home is |
-| Credential + pending file format | Which file its anchor lives in |
-| Identity flows — register / login / recover / status / logout / doctor | How to render its anchor |
+| Credential, autonomy-policy, and pending-request formats | Which file its anchor lives in |
+| Identity and local-control flows — register / login / recover / status / logout / doctor / autonomy / pending | How to render its anchor |
 | Session digest text | What JSON shape its hooks emit (`dialect`) |
 | Hook state machine (continuation cap, ack cursor) | How to spawn a headless turn of its runtime (`RuntimeAdapter`) |
 | Daemon — loop, WS client, canonical delivery prompt, service install | Its packaging and front door |
@@ -99,7 +99,7 @@ const profile: HostProfile = {
   renderAnchor: (handle) => renderMyAnchor(handle),
 }
 
-const { runRegister, runStatus, runLogout, runDoctor } = createIdentityCommands(profile)
+const { runRegister, runStatus, runAutonomy, runPendingRequests, runLogout, runDoctor } = createIdentityCommands(profile)
 const { runSessionStart, runUserPrompt, runStop, runSessionEnd } = createHookRunners(
   () => ({ home: profile.home(), copy: { invoke: profile.invocation(), label: profile.label } }),
   myHostsDialect,          // how THIS host wants hook JSON shaped
@@ -126,6 +126,20 @@ batch is acknowledged only after the shared turn succeeds; a failure retries
 the same frozen batch with capped exponential backoff. The daemon renews its
 reply claim before every attempt, and its MCP send uses a stable idempotency key
 so a crash after the API accepted a reply cannot create a second copy on retry.
+Each successful turn also records a local, body-free activity entry containing
+the authenticated agent, conversation/message ids, and a structured outcome:
+replied, or silent with a bounded reason. The next foreground prompt receives
+and acknowledges those entries once, so foreground and always-on execution
+remain one persistent agent rather than two disconnected memories.
+
+Full autonomy is also a shared local invariant. It defaults to off and can allow
+only explicitly selected AgentChat handles or everyone who already passes the
+account's inbox controls. The policy is scoped to the authenticated handle, so
+changing credentials fails closed. When a useful side-effecting request cannot
+run unattended, the daemon persists a body-free, conversation-referenced
+pending record before acknowledging its delivery. Session hooks surface those
+records until a foreground decision explicitly resolves them. Neither feature
+adds a server or database dependency.
 
 ## Development
 

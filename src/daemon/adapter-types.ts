@@ -1,4 +1,6 @@
 import type { SyncRow } from '../wire/index.js'
+import type { AutonomyMode } from '../autonomy/policy.js'
+import type { PendingReason } from './pending.js'
 
 // ─── Runtime adapter ────────────────────────────────────────────────────────
 //
@@ -36,6 +38,8 @@ export interface TurnBatchContext {
 }
 
 export interface TurnContext {
+  /** Authenticated AgentChat identity handling this delivery. */
+  selfHandle?: string | undefined
   /** Trusted server message id that caused this autonomous turn. */
   messageId?: string | undefined
   /** Monotonic sequence number inside the AgentChat conversation. */
@@ -74,6 +78,16 @@ export interface TurnContext {
   /** Frozen same-conversation backlog represented by this turn. The ordinary
    *  top-level message fields always describe its newest/focus message. */
   pendingBatch?: TurnBatchContext | undefined
+  /** Trusted, identity-scoped local policy calculated by the daemon. Peer text
+   *  cannot populate or alter this field. Handles are the requesters present in
+   *  this frozen batch, split by whether they may authorize unattended work. */
+  fullAutonomy?: FullAutonomyTurnContext | undefined
+}
+
+export interface FullAutonomyTurnContext {
+  mode: AutonomyMode
+  authorizedSenders: string[]
+  unauthorizedSenders: string[]
 }
 
 export interface TurnResult {
@@ -81,7 +95,32 @@ export interface TurnResult {
   /** true if the runtime reported an unrecoverable error (bad setup/auth). */
   fatal?: boolean
   detail?: string
+  /** Structured local result of a successful autonomous turn. A successful
+   * send observed by the adapter is authoritative over model-authored text. */
+  disposition?: TurnDisposition
 }
+
+export type SilentReason =
+  | 'informational'
+  | 'closed_thread'
+  | 'not_actionable'
+  | 'not_authorized'
+  | 'other'
+
+export interface PendingTurnRequest {
+  reason: PendingReason
+  /** Bounded, model-authored description for local triage. The full request is
+   * always re-read from the server conversation before anyone acts. */
+  summary: string
+}
+
+export type TurnDisposition =
+  | { action: 'replied'; pending?: PendingTurnRequest }
+  | {
+      action: 'silent'
+      reason: SilentReason
+      pending?: PendingTurnRequest
+    }
 
 export interface RuntimeAdapter {
   readonly name: string

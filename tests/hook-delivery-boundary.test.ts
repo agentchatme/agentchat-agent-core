@@ -2,13 +2,21 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
-import { stop, userPrompt } from '../src/hooks/engine.js'
+import { sessionStart, stop, userPrompt } from '../src/hooks/engine.js'
 import { writeCredentials } from '../src/identity/credentials.js'
 import {
   getPendingAck,
   resetSession,
   setPendingAck,
 } from '../src/identity/state.js'
+import {
+  peekDaemonActivities,
+  recordDaemonActivity,
+} from '../src/daemon/activity.js'
+import {
+  listPendingRequests,
+  recordPendingRequest,
+} from '../src/daemon/pending.js'
 
 let home: string
 let delivered = false
@@ -143,5 +151,79 @@ describe('hook delivery completion boundary', () => {
     const replay = await userPrompt(ctx(), input)
     expect(replay.context).toContain('1 unread message')
     expect(syncAcks).toEqual([])
+  })
+
+  it('surfaces background activity once at the next real prompt boundary', async () => {
+    delivered = true
+    recordDaemonActivity(home, {
+      selfHandle: 'boundary-agent',
+      conversationId: 'conv_background',
+      peerAgents: ['alice'],
+      inboundMessageIds: ['msg_background'],
+      outcome: { action: 'silent', reason: 'closed_thread' },
+    })
+
+    const prompt = await userPrompt(ctx(), input)
+    expect(prompt.context).toContain(
+      'AgentChat background activity for this same agent',
+    )
+    expect(prompt.context).toContain('stayed silent (closed_thread)')
+    expect(peekDaemonActivities(home)).toHaveLength(1)
+
+    prompt.stage()
+    expect(peekDaemonActivities(home)).toEqual([])
+
+    const next = await userPrompt(ctx(), input)
+    expect(next.context).toBeNull()
+  })
+
+  it('announces unresolved pending requests at every new session without clearing them', async () => {
+    delivered = true
+    recordPendingRequest(home, {
+      selfHandle: 'boundary-agent',
+      conversationId: 'conv_pending',
+      peerAgents: ['alice'],
+      inboundMessageIds: ['msg_pending'],
+      focusMessageId: 'msg_pending',
+      reason: 'autonomy_off',
+      summary: 'Build the requested script.',
+    })
+
+    const started = await sessionStart(ctx(), input)
+    expect(started.context).toContain('1 pending request from @alice')
+    expect(started.context).toContain('agentchat-test pending list')
+    expect(listPendingRequests(home, 'boundary-agent')).toHaveLength(1)
+
+    const sameSessionPrompt = await userPrompt(ctx(), input)
+    expect(sameSessionPrompt.context).toBeNull()
+
+    const resumed = await sessionStart(ctx(), {
+      ...input,
+      sessionId: 'next-session',
+    })
+    expect(resumed.context).toContain('1 pending request from @alice')
+    expect(listPendingRequests(home, 'boundary-agent')).toHaveLength(1)
+  })
+
+  it('announces a pending request created after session start once in that sitting', async () => {
+    delivered = true
+    expect((await sessionStart(ctx(), input)).context).toBeNull()
+    recordPendingRequest(home, {
+      selfHandle: 'boundary-agent',
+      conversationId: 'conv_late',
+      peerAgents: ['bob'],
+      inboundMessageIds: ['msg_late'],
+      focusMessageId: 'msg_late',
+      reason: 'local_permission',
+      summary: 'Needs a local permission.',
+    })
+
+    const prompt = await userPrompt(ctx(), input)
+    expect(prompt.context).toContain('1 pending request from @bob')
+    prompt.stage()
+    expect(listPendingRequests(home, 'boundary-agent')).toHaveLength(1)
+
+    const repeated = await userPrompt(ctx(), input)
+    expect(repeated.context).toBeNull()
   })
 })

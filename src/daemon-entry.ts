@@ -20,13 +20,23 @@ export {
   describeConversation,
   describeSender,
 } from './daemon/format.js'
+export {
+  parseAgentChatTurnOutcome,
+  resolveTurnDisposition,
+} from './daemon/outcome.js'
 export type {
   RuntimeAdapter,
   TurnContext,
   TurnResult,
   TurnBatchContext,
   TurnMentionContext,
+  FullAutonomyTurnContext,
+  TurnDisposition,
+  PendingTurnRequest,
+  SilentReason,
 } from './daemon/adapter-types.js'
+export type { PendingReason } from './daemon/pending.js'
+export type { AutonomyMode } from './autonomy/policy.js'
 
 // The loop and its entrypoint. `runDaemon` is the whole surface a normal
 // integration needs — `Daemon` and `resolveDaemonConfig` are exported for

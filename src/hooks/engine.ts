@@ -11,6 +11,8 @@ import {
   takePendingAck,
   shouldOfferRegistration,
   recordRegistrationOffer,
+  pendingNoticeNeeded,
+  recordPendingNotice,
 } from '../identity/state.js'
 import {
   syncPeek,
@@ -31,6 +33,16 @@ import {
   type HostCopy,
 } from '../digest/summary.js'
 import { alwaysOnHealth, alwaysOnState } from '../daemon/health.js'
+import {
+  ackDaemonActivities,
+  formatDaemonActivities,
+  peekDaemonActivities,
+} from '../daemon/activity.js'
+import {
+  formatPendingRequestsNotice,
+  listPendingRequests,
+  pendingRequestsFingerprint,
+} from '../daemon/pending.js'
 
 // ─── Session hook engine (host-agnostic) ────────────────────────────────────
 //
@@ -197,7 +209,30 @@ export async function sessionStart(
     // independent of the inbox, since being silently unreachable is the point.
     const h = alwaysOnHealth(ctx.home)
     const alert = h.wanted && !h.healthy ? formatAlwaysOnDown(ctx.copy) : null
-    return { context: alert }
+    const cfg: WireConfig = {
+      apiKey: identity.apiKey,
+      apiBase: identity.apiBase,
+    }
+    const handle = await resolveHandle(
+      cfg,
+      identity.source === 'file' ? identity.handle : null,
+    )
+    const requests = handle ? listPendingRequests(ctx.home, handle) : []
+    const fingerprint = pendingRequestsFingerprint(requests)
+    const pendingNotice = pendingNoticeNeeded(
+      ctx.home,
+      input.sessionId,
+      fingerprint,
+    )
+      ? formatPendingRequestsNotice(requests, ctx.copy)
+      : null
+    if (pendingNotice !== null) {
+      recordPendingNotice(ctx.home, input.sessionId, fingerprint)
+    }
+    const context = [alert, pendingNotice]
+      .filter((value): value is string => value !== null)
+      .join('\n\n')
+    return { context: context || null }
   } catch (err) {
     log.warn(`session-start hook degraded to no-op: ${String(err)}`)
     return none
@@ -227,21 +262,74 @@ export async function userPrompt(
     // Do not overwrite its cursor or inject later rows ahead of it.
     if (getPendingAck(ctx.home, input.sessionId) !== null) return none
 
+    const handle = await resolveHandle(
+      cfg,
+      identity.source === 'file' ? identity.handle : null,
+    )
+    const pendingRequests = handle
+      ? listPendingRequests(ctx.home, handle)
+      : []
+    const pendingFingerprint = pendingRequestsFingerprint(pendingRequests)
+    const pendingContext = pendingNoticeNeeded(
+      ctx.home,
+      input.sessionId,
+      pendingFingerprint,
+    )
+      ? formatPendingRequestsNotice(pendingRequests, ctx.copy)
+      : null
+    const activities = peekDaemonActivities(ctx.home)
+    const activityContext = formatDaemonActivities(activities)
+    const localContext = [pendingContext, activityContext]
+      .filter((value): value is string => value !== null)
+      .join('\n\n')
+    const stageLocalContext = (): void => {
+      if (pendingContext !== null) {
+        recordPendingNotice(
+          ctx.home,
+          input.sessionId,
+          pendingFingerprint,
+        )
+      }
+      ackDaemonActivities(
+        ctx.home,
+        activities.map((activity) => activity.id),
+      )
+    }
     const peeked = ackableRows(await syncPeek(cfg, { limit: USER_PROMPT_PEEK_LIMIT }))
-    if (peeked.length === 0) return none
+    if (peeked.length === 0) {
+      if (!localContext) return none
+      return {
+        context: localContext,
+        stage: stageLocalContext,
+      }
+    }
     const rows = await claimContiguousPrefix(
       cfg,
       peeked,
       `session:${input.sessionId}`,
     )
-    if (rows.length === 0) return none
+    if (rows.length === 0) {
+      if (!localContext) return none
+      return {
+        context: localContext,
+        stage: stageLocalContext,
+      }
+    }
 
     const cursor = lastDeliveryId(rows)
-    if (cursor === null) return none
-    const handle = await resolveHandle(cfg, identity.handle)
+    if (cursor === null) {
+      return localContext
+        ? { context: localContext, stage: stageLocalContext }
+        : none
+    }
     return {
-      context: formatSessionStart(handle, rows),
-      stage: () => setPendingAck(ctx.home, input.sessionId, cursor),
+      context: [pendingContext, activityContext, formatSessionStart(handle, rows)]
+        .filter((value): value is string => value !== null)
+        .join('\n\n'),
+      stage: () => {
+        stageLocalContext()
+        setPendingAck(ctx.home, input.sessionId, cursor)
+      },
     }
   } catch (err) {
     log.warn(`user-prompt hook degraded to no-op: ${String(err)}`)
@@ -313,7 +401,10 @@ export async function stop(ctx: HookContext, input: HookInput): Promise<StopResu
 
     recordContinuation(ctx.home, input.sessionId)
 
-    const handle = await resolveHandle(cfg, identity.handle)
+    const handle = await resolveHandle(
+      cfg,
+      identity.source === 'file' ? identity.handle : null,
+    )
     const reason = formatStopPickup(handle, rows)
     const cursor = lastDeliveryId(rows)
 
