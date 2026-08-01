@@ -10,7 +10,6 @@ import {
   pendingRequestId,
   pendingRequestsFingerprint,
   recordPendingRequest,
-  recordPendingRequestWithStatus,
   resolvePendingRequest,
 } from '../src/daemon/pending.js'
 
@@ -58,25 +57,6 @@ describe('local pending AgentChat requests', () => {
     expect(listPendingRequests(home, 'local-agent')).toHaveLength(1)
   })
 
-  it('reports whether a write deserves a fresh user notification', () => {
-    const input = {
-      selfHandle: 'local-agent',
-      conversationId: 'conv_notify',
-      peerAgents: ['alice'],
-      inboundMessageIds: ['msg_1'],
-      focusMessageId: 'msg_1',
-      reason: 'autonomy_off' as const,
-      summary: 'Create a script.',
-    }
-    expect(recordPendingRequestWithStatus(home, input).changed).toBe(true)
-    expect(recordPendingRequestWithStatus(home, input).changed).toBe(false)
-    expect(recordPendingRequestWithStatus(home, {
-      ...input,
-      inboundMessageIds: ['msg_2'],
-      focusMessageId: 'msg_2',
-    }).changed).toBe(true)
-  })
-
   it('never exposes one identity pending state to another identity', () => {
     const record = recordPendingRequest(home, {
       selfHandle: 'local-agent',
@@ -111,7 +91,7 @@ describe('local pending AgentChat requests', () => {
       invoke: 'agentchat-test',
     })).toContain('agentchat-test pending list')
     expect(formatPendingRequestsSystemMessage([record])).toBe(
-      "AgentChat: 1 request from @alice is waiting for this agent's review.",
+      'AgentChat: 1 request from @alice needs your decision. Ask this agent to review it, decline it, or leave it for later.',
     )
 
     expect(resolvePendingRequest(home, 'local-agent', record.id)).toBe(true)

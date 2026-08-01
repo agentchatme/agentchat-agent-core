@@ -29,8 +29,6 @@ import {
   listPendingRequests,
   resolvePendingRequest,
 } from '../daemon/pending.js'
-import { installationId } from '../daemon/installation.js'
-import { syncPendingReviewMirror } from '../wire/index.js'
 
 // ─── Identity commands, for exactly one agent ───────────────────────────────
 //
@@ -163,8 +161,6 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
     home: string
     handle: string
     client: AgentChatClient
-    apiKey: string
-    apiBase: string
   } | null> {
     const home = profile.home()
     const identity = resolveIdentity(home)
@@ -178,23 +174,11 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
       clientIdentity: CODING_AGENTS_CLIENT_IDENTITY,
     })
     if (identity.source === 'file' && identity.handle) {
-      return {
-        home,
-        handle: identity.handle,
-        client,
-        apiKey: identity.apiKey,
-        apiBase: identity.apiBase,
-      }
+      return { home, handle: identity.handle, client }
     }
     try {
       const me = await client.getMe()
-      return {
-        home,
-        handle: me.handle,
-        client,
-        apiKey: identity.apiKey,
-        apiBase: identity.apiBase,
-      }
+      return { home, handle: me.handle, client }
     } catch (err) {
       console.error(`Could not identify this AgentChat account: ${apiErr(err)}`)
       return null
@@ -734,16 +718,6 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
       if (!resolvePendingRequest(current.home, current.handle, id)) {
         console.error('That pending request was not found for this AgentChat account.')
         return 1
-      }
-      try {
-        await syncPendingReviewMirror(
-          { apiKey: current.apiKey, apiBase: current.apiBase },
-          installationId(current.home),
-          listPendingRequests(current.home, current.handle),
-        )
-      } catch {
-        // Resolution is local control-plane state and remains successful while
-        // offline. The resident daemon reconciles the snapshot on restart.
       }
       console.log(`Resolved local pending request ${id}. Its AgentChat conversation remains stored on the server.`)
       return 0

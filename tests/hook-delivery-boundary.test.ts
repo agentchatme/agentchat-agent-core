@@ -192,7 +192,8 @@ describe('hook delivery completion boundary', () => {
     const started = await sessionStart(ctx(), input)
     expect(started.context).toContain('1 pending request from @alice')
     expect(started.notification).toContain('1 request from @alice')
-    expect(started.context).toContain('agentchat-test pending list')
+    expect(started.context).toContain('run `agentchat-test pending list` yourself')
+    expect(started.context).toContain('review the request now, decline it, or leave it pending')
     expect(listPendingRequests(home, 'boundary-agent')).toHaveLength(1)
     started.stage()
 
@@ -223,6 +224,7 @@ describe('hook delivery completion boundary', () => {
 
     const prompt = await userPrompt(ctx(), input)
     expect(prompt.context).toContain('1 pending request from @bob')
+    expect(prompt.notification).toContain('needs your decision')
     prompt.stage()
     expect(listPendingRequests(home, 'boundary-agent')).toHaveLength(1)
 

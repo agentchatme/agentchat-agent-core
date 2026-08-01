@@ -49,8 +49,6 @@ export {
   type WireConfig,
   type SyncRow,
   type MessageContext,
-  syncPendingReviewMirror,
-  type PendingReviewMirrorRecord,
 } from './wire/index.js'
 
 // Identity — credential + pending storage, always scoped to a given home.
@@ -196,7 +194,6 @@ export {
 export {
   pendingRequestId,
   recordPendingRequest,
-  recordPendingRequestWithStatus,
   getPendingRequest,
   listPendingRequests,
   resolvePendingRequest,
@@ -206,14 +203,7 @@ export {
   type PendingReason,
   type PendingRequest,
   type RecordPendingRequestInput,
-  type RecordedPendingRequest,
 } from './daemon/pending.js'
-export {
-  pendingNotificationPlan,
-  notifyPendingRequest,
-  type NotificationPlan,
-} from './daemon/desktop-notification.js'
-export { installationId } from './daemon/installation.js'
 export {
   installService,
   uninstallService,

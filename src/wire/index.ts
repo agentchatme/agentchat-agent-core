@@ -75,16 +75,6 @@ export interface WireConfig {
   timeoutMs?: number
 }
 
-export interface PendingReviewMirrorRecord {
-  id: string
-  conversation_id: string
-  peer_agents: string[]
-  focus_message_id: string
-  reason: 'autonomy_off' | 'sender_not_allowed' | 'local_permission'
-  first_requested_at: string
-  updated_at: string
-}
-
 const DEFAULT_TIMEOUT_MS = 4_000
 
 async function request(
@@ -114,30 +104,6 @@ async function request(
     throw new WireError(res.status, text.slice(0, 300))
   }
   return res.json()
-}
-
-/**
- * Replace this installation's ephemeral dashboard mirror with its complete
- * local pending snapshot. The server unions snapshots across installations;
- * no database row or peer-authored message content is created.
- */
-export async function syncPendingReviewMirror(
-  cfg: WireConfig,
-  installationId: string,
-  records: PendingReviewMirrorRecord[],
-): Promise<void> {
-  await request(cfg, 'PUT', '/v1/pending-reviews', {
-    installation_id: installationId,
-    pending_reviews: records.slice(0, 100).map((record) => ({
-      id: record.id,
-      conversation_id: record.conversation_id,
-      peer_agents: record.peer_agents.slice(0, 20),
-      focus_message_id: record.focus_message_id,
-      reason: record.reason,
-      first_requested_at: record.first_requested_at,
-      updated_at: record.updated_at,
-    })),
-  })
 }
 
 export class WireError extends Error {
