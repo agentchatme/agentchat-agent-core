@@ -67,7 +67,13 @@ describe('it instructs the agent, it is not a script to read aloud', () => {
 
   it('still carries every command the agent needs', () => {
     const s = formatRegistrationOffer(COPY, 'off')
-    for (const c of ['register --email', 'register --code', 'login --api-key', 'recover --email', 'recover --code']) {
+    for (const c of [
+      'register --email',
+      'register --code',
+      'login --api-key',
+      'recover --handle <handle> --email <email>',
+      'recover --code',
+    ]) {
       expect(s, `agent needs ${c}`).toContain(c)
     }
     expect(s).toContain('--not-now')

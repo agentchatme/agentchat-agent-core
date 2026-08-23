@@ -152,6 +152,7 @@ export {
   createIdentityCommands,
   type IdentityCommands,
   type RegisterOpts,
+  type RecoverOpts,
   type DoctorOpts,
   type AutonomyCommandOpts,
   type PendingCommandOpts,

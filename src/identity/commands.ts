@@ -12,6 +12,7 @@ import {
   clearPending,
 } from './credentials.js'
 import { clearOfferDeclined } from './state.js'
+import { startRecovery } from './recover-request.js'
 import { writeAnchor, removeAnchorAt, readAnchorHandleAt, hasAnchorAt } from '../anchor/block.js'
 import { syncPeek } from '../wire/index.js'
 import { anchorLabelOf, type DoctorCheck, type HostProfile, type Verdict } from './host-profile.js'
@@ -79,6 +80,23 @@ async function prompt(question: string): Promise<string> {
 interface ApiErrorLike {
   code?: string
   message?: string
+  details?: Record<string, unknown>
+}
+
+/** The server's `details.limit` on an email-policy rejection, when it sent one. */
+function limitOf(e: ApiErrorLike): number | null {
+  const limit = e.details?.['limit']
+  return typeof limit === 'number' && Number.isFinite(limit) ? limit : null
+}
+
+/** The server's `details.handles` on HANDLE_REQUIRED, when it sent them. */
+function handlesOf(e: ApiErrorLike): string[] {
+  const handles = e.details?.['handles']
+  return Array.isArray(handles) ? handles.filter((h): h is string => typeof h === 'string') : []
+}
+
+function recoverUsage(invocation: string): string {
+  return `${invocation} recover --handle <handle> --email <email>`
 }
 
 function describeApiError(err: unknown, invocation: string): string {
@@ -88,10 +106,37 @@ function describeApiError(err: unknown, invocation: string): string {
   switch (code) {
     case 'HANDLE_TAKEN':
       return 'That handle is already taken — pick another and re-run.'
-    case 'EMAIL_TAKEN':
-      return `This email already has an active agent. Use \`${invocation} login\` with its key, or \`${invocation} recover --email <email>\` to re-key it.`
-    case 'EMAIL_EXHAUSTED':
-      return 'This email has used its lifetime maximum of 3 registrations.'
+    // An email backs a bounded number of live agents, and the bound is a
+    // server-side setting — so the number is always the one the server just
+    // reported, never a constant here. `EMAIL_TAKEN` is what a not-yet-upgraded
+    // server says in the same situation (its bound was one); it means the same
+    // thing and gets the same advice.
+    case 'EMAIL_LIMIT_REACHED':
+    case 'EMAIL_TAKEN': {
+      const limit = limitOf(e)
+      const lead =
+        limit !== null
+          ? `This email already backs ${limit} active agent${limit === 1 ? '' : 's'} — its maximum.`
+          : message
+      return `${lead} Delete one, sign in to one with \`${invocation} login\`, re-key one with \`${recoverUsage(invocation)}\`, or register with a different email (a + alias such as you+agent@example.com counts as a different email).`
+    }
+    case 'EMAIL_EXHAUSTED': {
+      const limit = limitOf(e)
+      const lead =
+        limit !== null
+          ? `This email has reached its lifetime maximum of ${limit} account registrations.`
+          : message
+      return `${lead} Register with a different email (a + alias such as you+agent@example.com counts as a different email).`
+    }
+    // Only /recover/verify says this, and only when recovery was started
+    // without a handle for an email that backs several agents. This client
+    // always sends the handle, so reaching here means an older client or a
+    // hand-made request started the flow — still, say exactly what to do.
+    case 'HANDLE_REQUIRED': {
+      const handles = handlesOf(e)
+      const listed = handles.length > 0 ? ` Agents on this email: ${handles.map((h) => `@${h}`).join(', ')}.` : ''
+      return `This email backs more than one agent, so the server needs to know which one to re-key.${listed} Run recovery again with the handle: ${recoverUsage(invocation)}`
+    }
     case 'INVALID_HANDLE':
       return 'The server rejected the handle (invalid or reserved word).'
     case 'INVALID_CODE':
@@ -111,6 +156,20 @@ export interface RegisterOpts {
   handle?: string
   displayName?: string
   description?: string
+  code?: string
+  apiBase?: string
+}
+
+export interface RecoverOpts {
+  /** The email the agent registered with. */
+  email?: string
+  /**
+   * Which agent on that email to re-key. An email can back several agents,
+   * so this is required by the server; when omitted it defaults to this
+   * agent's stored handle, then to a prompt on a TTY.
+   */
+  handle?: string
+  /** The 6-digit code from the recovery email — the completion leg. */
   code?: string
   apiBase?: string
 }
@@ -135,7 +194,7 @@ export interface PendingCommandOpts {
 export interface IdentityCommands {
   runRegister(opts: RegisterOpts): Promise<number>
   runLogin(opts: { apiKey?: string; apiBase?: string }): Promise<number>
-  runRecover(opts: { email?: string; code?: string; apiBase?: string }): Promise<number>
+  runRecover(opts: RecoverOpts): Promise<number>
   runStatus(opts: { json?: boolean }): Promise<number>
   runAutonomy(opts: AutonomyCommandOpts): Promise<number>
   runPendingRequests(opts: PendingCommandOpts): Promise<number>
@@ -397,9 +456,19 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
     }
   }
 
-  async function runRecover(opts: { email?: string; code?: string; apiBase?: string }): Promise<number> {
+  // Recovery re-keys ONE agent, named by handle + email. One email can back
+  // several agents, so the email alone no longer identifies an account; the
+  // server treats an email-only request as "the only agent on this email, if
+  // there is exactly one" and otherwise fails at verify time with
+  // HANDLE_REQUIRED — after the code has been spent. Always sending the handle
+  // keeps this a single round-trip. The handle is resolved in the same order a
+  // person would expect: the flag, then this agent's own stored handle (the
+  // overwhelmingly common case — re-keying the agent that lives here), then a
+  // prompt, and in non-interactive use a message naming the flag.
+  async function runRecover(opts: RecoverOpts): Promise<number> {
     const home = profile.home()
     const apiBase = opts.apiBase ?? process.env['AGENTCHAT_API_BASE'] ?? DEFAULT_API_BASE
+    const usage = recoverUsage(invocation())
 
     if (opts.code !== undefined) {
       const code = opts.code.trim()
@@ -409,7 +478,7 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
       }
       const pending = readPending(home)
       if (pending === null || pending.kind !== 'recover') {
-        console.error(`No recovery in progress. Start with: ${invocation()} recover --email <email>`)
+        console.error(`No recovery in progress. Start with: ${usage}`)
         return 1
       }
       try {
@@ -435,18 +504,47 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
         )
         return 0
       } catch (err) {
+        // The code was accepted but the server could not pick an agent. That
+        // code is spent and the server has dropped the pending record, so the
+        // local one is dead too — clear it rather than let `--code` be retried
+        // against nothing.
+        if ((err as ApiErrorLike | null)?.code === 'HANDLE_REQUIRED') clearPending(home)
         console.error(`Recovery failed. ${apiErr(err)}`)
         return 1
       }
     }
 
-    let email = opts.email?.trim().toLowerCase()
-    if (!email) {
-      if (process.stdin.isTTY !== true) {
-        console.error(`Missing --email. Usage: ${invocation()} recover --email <email>`)
+    const interactive = process.stdin.isTTY === true && process.stdout.isTTY === true
+
+    let handle = opts.handle?.trim().replace(/^@/, '').toLowerCase()
+    if (!handle) {
+      const stored = readCredentials(home)?.handle
+      if (stored !== undefined) {
+        handle = stored
+        console.log(`Recovering @${stored} — this agent's stored handle (pass --handle to recover a different agent).`)
+      } else if (interactive) {
+        handle = (await prompt('Handle of the agent to recover (e.g. sanim-dev): ')).replace(/^@/, '').toLowerCase()
+      } else {
+        console.error(
+          `Missing --handle. An email can back more than one agent, so recovery needs the handle too. Usage: ${usage}`,
+        )
         return 1
       }
-      email = (await prompt('Email the agent was registered with: ')).toLowerCase()
+    }
+    if (!validHandle(handle)) {
+      console.error(
+        `Handle "@${handle}" is invalid. Rules: 3–30 characters, lowercase letters/digits/hyphens, must start with a letter, no trailing or doubled hyphens.`,
+      )
+      return 1
+    }
+
+    let email = opts.email?.trim().toLowerCase()
+    if (!email) {
+      if (!interactive) {
+        console.error(`Missing --email. Usage: ${usage}`)
+        return 1
+      }
+      email = (await prompt(`Email @${handle} was registered with: `)).toLowerCase()
     }
     if (!email.includes('@')) {
       console.error(`"${email}" does not look like an email address.`)
@@ -454,24 +552,26 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
     }
 
     try {
-      const result = await AgentChatClient.recover(email, {
-        baseUrl: apiBase,
-        clientIdentity: CODING_AGENTS_CLIENT_IDENTITY,
-      })
+      const result = await startRecovery({ email, handle, apiBase })
+      // A current server always returns a pending id, whether or not anything
+      // matched, so that a miss is indistinguishable from a hit. A server that
+      // predates that returns only the message when nothing matched; relay it
+      // and stop, exactly as that server intends.
       if (!result.pending_id) {
-        console.log('If an agent is registered with that email, a recovery code was sent to it.')
+        console.log(result.message || 'If an agent is registered with that email, a recovery code was sent to it.')
         return 0
       }
       writePending(home, {
         kind: 'recover',
         pending_id: result.pending_id,
         email,
+        handle,
         ...(apiBase !== DEFAULT_API_BASE ? { api_base: apiBase } : {}),
         created_at: new Date().toISOString(),
       })
       console.log(
         [
-          'Recovery code sent (valid ~10 minutes).',
+          `If @${handle} is registered with ${email}, a recovery code was sent there (valid ~10 minutes).`,
           `Complete with: ${invocation()} recover --code <6-digit-code>`,
           'Note: completing recovery rotates the API key — anything using the old key stops working.',
         ].join('\n'),
@@ -495,8 +595,9 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
           JSON.stringify({ configured: false, pending: pending !== null, pending_kind: pending?.kind ?? null }),
         )
       } else if (pending?.kind === 'recover') {
+        const who = pending.handle !== undefined ? ` for @${pending.handle}` : ''
         console.log(
-          `No identity yet, but an account recovery is waiting on its emailed code — finish with: ${invocation()} recover --code <code>`,
+          `No identity yet, but an account recovery${who} is waiting on its emailed code — finish with: ${invocation()} recover --code <code>`,
         )
       } else if (pending !== null) {
         console.log(
