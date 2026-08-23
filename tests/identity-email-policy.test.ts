@@ -166,13 +166,20 @@ describe('the agent-facing copy states the policy', () => {
     }
   })
 
-  it('tells the agent what to do when an email is at its cap, without hard-coding the cap', () => {
-    for (const [name, text] of Object.entries({ offer: texts.offer, block: texts.block })) {
-      expect(text, name).toMatch(/One email can back several agents/)
-      expect(text, name).toMatch(/relay that message and ask only for a different email/)
-      expect(text, name).toMatch(/\+ alias/)
-      expect(text, name).not.toMatch(/\b10\b/)
-    }
+  it('the session-start offer says what to do when an email is at its cap, without hard-coding the cap', () => {
+    expect(texts.offer).toMatch(/One email can back several agents/)
+    expect(texts.offer).toMatch(/relay that message and ask only for a different email/)
+    expect(texts.offer).toMatch(/\+ alias/)
+    expect(texts.offer).not.toMatch(/\b10\b/)
+  })
+
+  it('the always-loaded anchor block stays lean: the recovery form and the one-line reason, nothing more', () => {
+    // The block is re-read every session, so the cap guidance lives in the
+    // offer, the manual, and the CLI's own error — not here. Integrations
+    // assert an upper bound on this block's size.
+    expect(texts.block).toMatch(/One email can back several agents, so recovery needs both/)
+    expect(texts.block).not.toMatch(/\+ alias/)
+    expect(renderUnregisteredBlock(COPY).length).toBeLessThan(4000)
   })
 
   it('the manual documents the policy, the error codes, and the recovery form', () => {
