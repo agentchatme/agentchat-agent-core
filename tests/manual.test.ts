@@ -11,7 +11,9 @@ const SOURCE = path.join(__dirname, '..', 'src', 'skill', 'agentchat.skill.md')
 
 describe('the bundled manual', () => {
   it('is byte-identical to src/skill/agentchat.skill.md (regenerate with scripts/embed-manual.mjs)', () => {
-    expect(MANUAL).toBe(fs.readFileSync(SOURCE, 'utf-8'))
+    // `.gitattributes` pins LF; the normalization below only guards a checkout
+    // that ignored it, so the comparison is about content, not line endings.
+    expect(MANUAL).toBe(fs.readFileSync(SOURCE, 'utf-8').replace(/\r\n/g, '\n'))
   })
 
   it('is the published skill: front matter names it and versions it', () => {
