@@ -15,7 +15,9 @@
 // When a delayed knock is already pending the SOONER deadline wins — a later
 // retry never pushes an earlier one back. (Learned on the Hermes doorbell: two
 // failed cycles inside one outage once climbed the ladder to 300 s and
-// replaced the pending 60 s retry.)
+// replaced the pending 60 s retry.) `cancelDelayed` drops a pending retry once
+// nothing is owed: a stale re-knock once fired 4.5 min after a successful run
+// and started a run on an empty tray (Codex live-fire, leg 10).
 
 export const DEFAULT_KNOCK_DEBOUNCE_MS = 2_000
 
@@ -101,6 +103,20 @@ export class KnockCoalescer {
     }, delay)
   }
 
+  /**
+   * Drop a pending retry knock, if there is one; returns whether there was.
+   * The debounce timer and later knocks are unaffected. For when nothing is
+   * owed any more — a run read the whole tray, or the tray was found empty —
+   * so the retry would only ring for a backlog that is already handled.
+   */
+  cancelDelayed(): boolean {
+    if (this.delayed === null) return false
+    this._clearTimeout(this.delayed)
+    this.delayed = null
+    this.delayedDeadline = null
+    return true
+  }
+
   /** Cancel everything; later knocks are ignored. */
   stop(): void {
     this.stopped = true
@@ -108,11 +124,7 @@ export class KnockCoalescer {
       this._clearTimeout(this.timer)
       this.timer = null
     }
-    if (this.delayed !== null) {
-      this._clearTimeout(this.delayed)
-      this.delayed = null
-      this.delayedDeadline = null
-    }
+    this.cancelDelayed()
   }
 
   private fire(): void {

@@ -83,6 +83,24 @@ describe('KnockCoalescer', () => {
     expect(fires).toEqual([2_000, 62_000])
   })
 
+  it('cancelDelayed drops only the pending retry; the debounce and later knocks still work', () => {
+    const clock = new FakeClock()
+    const { c, fires } = coalescer(clock, 2_000)
+    expect(c.cancelDelayed()).toBe(false) // nothing pending
+    c.knockAfter(60_000)
+    c.knock()
+    expect(c.cancelDelayed()).toBe(true)
+    expect(c.delayedPending).toBe(false)
+    expect(c.delayedDue).toBeNull()
+    clock.advance(2_000)
+    expect(fires).toEqual([2_000]) // the debounced knock was not touched
+    clock.advance(120_000)
+    expect(fires).toEqual([2_000]) // the retry never fires
+    c.knockAfter(60_000) // and a later retry can be scheduled again
+    clock.advance(62_000)
+    expect(fires).toEqual([2_000, 184_000])
+  })
+
   it('stop cancels everything and ignores later knocks', () => {
     const clock = new FakeClock()
     const { c, fires } = coalescer(clock)

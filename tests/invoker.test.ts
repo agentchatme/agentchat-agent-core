@@ -371,3 +371,49 @@ describe('DoorbellInvoker — stop interrupts, preflight watch after an exhauste
     expect(runner.requests).toHaveLength(3)
   })
 })
+
+describe('DoorbellInvoker — a successful run cancels a pending re-knock (E2)', () => {
+  it('failure → re-knock pending → a knock runs ok → past the rung, no extra run', async () => {
+    // Codex live-fire leg 10: rung 2 was due in 300 s; a new DM ran ok and the
+    // rung went to 0, but the stale re-knock still fired 4.5 min later.
+    const clock = new FakeClock()
+    const outcomes = [failed(), ok()]
+    const runner = new FakeRunner(() => outcomes.shift() ?? ok())
+    const inv = invoker(clock, runner)
+    inv.knock('message')
+    await clock.advanceAsync(2_000)
+    await inv.settled()
+    expect(inv.counters()).toMatchObject({ retryRung: 1, retryDueAt: 62_000 })
+
+    await clock.advanceAsync(10_000)
+    inv.knock('message') // a new DM, mid-outage
+    await clock.advanceAsync(2_000)
+    await inv.settled()
+    expect(runner.requests).toHaveLength(2)
+    expect(inv.counters()).toMatchObject({ runsOk: 1, retryRung: 0, retryDueAt: null })
+
+    await clock.advanceAsync(10 * 60_000) // well past the 60 s rung
+    await inv.settled()
+    expect(runner.requests).toHaveLength(2)
+    expect(clock.pending()).toBe(0)
+  })
+
+  it('an ok INVITE run leaves a pending knock re-knock alone — it never read the tray', async () => {
+    const clock = new FakeClock()
+    const outcomes = [failed(), ok(), ok()]
+    const runner = new FakeRunner(() => outcomes.shift() ?? ok())
+    const inv = invoker(clock, runner)
+    inv.knock('message')
+    await clock.advanceAsync(2_000)
+    await inv.settled()
+    expect(inv.counters()).toMatchObject({ retryRung: 1, retryDueAt: 62_000 })
+    inv.invite({ inviteId: 'gri_1', groupId: 'grp_1', groupName: 'Ops', inviterHandle: 'alice' })
+    await flush()
+    await inv.settled()
+    expect(inv.counters()).toMatchObject({ runsOk: 1, retryRung: 1, retryDueAt: 62_000 })
+    await clock.advanceAsync(60_000)
+    await clock.advanceAsync(2_000)
+    await inv.settled()
+    expect(runner.requests.map((r) => r.kind)).toEqual(['knock', 'invite', 'knock'])
+  })
+})

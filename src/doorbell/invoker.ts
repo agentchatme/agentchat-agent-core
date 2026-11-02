@@ -22,7 +22,9 @@ import type { DoorbellLastRun } from './status.js'
 // nothing on stdout), fails, or exceeds its budget schedules a re-knock on a
 // local ladder (60 s, 5 min, 30 min), because a connected socket gets no
 // re-ring from the server. One outage climbs one rung: a retry already on its
-// way is never replaced by a later one. A successful run resets the ladder.
+// way is never replaced by a later one. A successful knock run resets the
+// ladder and cancels a pending re-knock: it read the whole tray, so the retry
+// would only ring for a backlog that is already handled.
 //
 // When the ladder is exhausted the invoker does not go deaf. It asks the
 // runner's `preflight()` every PREFLIGHT_WATCH_MS; if the runtime was found
@@ -267,8 +269,13 @@ export class DoorbellInvoker {
     switch (outcome.state) {
       case 'ok':
         this.runsOk += 1
-        this.retryRung = 0
-        this.clearPreflightWatch()
+        // A knock run read the whole tray: nothing is owed any more. An invite
+        // run did not, so it leaves a pending knock retry alone.
+        if (kind === 'knock') {
+          this.retryRung = 0
+          if (this.coalescer.cancelDelayed()) log.info('pending re-knock cancelled — the run just read the whole tray')
+          this.clearPreflightWatch()
+        }
         log.info(`run ok kind=${kind} id=${runId} ${Math.round(outcome.durationMs / 1000)}s (output discarded; any send was the agent's own hosted-tool call)`)
         break
       case 'failed':
