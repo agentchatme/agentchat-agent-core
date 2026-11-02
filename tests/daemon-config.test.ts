@@ -163,4 +163,9 @@ describe('the installed service runs the entry it was given', () => {
     expect(plist).toContain('&gt;')
     expect(plist).not.toContain('/tmp/a&b<c>')
   })
+
+  it('gives launchd an ExitTimeOut above the daemon’s shutdown grace, so a stop reaches a run in flight', () => {
+    const p = planForTest({ label: 'agentchatd-x', home: homeA, entry: '/stable/path/daemon.js' })
+    expect(launchdPlist(p)).toContain('<key>ExitTimeOut</key><integer>15</integer>')
+  })
 })

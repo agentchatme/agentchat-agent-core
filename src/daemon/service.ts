@@ -317,6 +317,12 @@ export function launchdPlist(p: Plan): string {
     ...(envXml ? ['  <key>EnvironmentVariables</key><dict>', envXml, '  </dict>'] : []),
     '  <key>RunAtLoad</key><true/>',
     '  <key>KeepAlive</key><true/>',
+    // On `launchctl unload`/`stop` launchd sends SIGTERM and SIGKILLs after
+    // this many seconds. The daemon uses the window to SIGTERM a headless run
+    // in flight and wait up to 10 s for it (run.ts SHUTDOWN_GRACE_MS), so the
+    // value is above that and below launchd's 20 s default, which would let a
+    // slow stop look like a hang.
+    '  <key>ExitTimeOut</key><integer>15</integer>',
     `  <key>StandardErrorPath</key><string>${xmlEscape(logPath)}</string>`,
     `  <key>StandardOutPath</key><string>${xmlEscape(logPath)}</string>`,
     '</dict></plist>',

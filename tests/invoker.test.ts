@@ -267,3 +267,107 @@ describe('DoorbellInvoker — invites', () => {
     expect(inv.counters()).toMatchObject({ runsFailed: 1, retryRung: 0, retryDueAt: null })
   })
 })
+
+describe('DoorbellInvoker — stop interrupts, preflight watch after an exhausted ladder', () => {
+  it('stop aborts the run in flight; settled resolves once it has ended; nothing is rescheduled', async () => {
+    const clock = new FakeClock()
+    const runner = new FakeRunner(
+      (request) =>
+        new Promise<RunOutcome>((resolve) => {
+          request.signal?.addEventListener('abort', () => resolve({ state: 'failed', exitCode: null, durationMs: 1, detail: 'interrupted' }), { once: true })
+        }),
+    )
+    const inv = invoker(clock, runner)
+    inv.knock('message')
+    await clock.advanceAsync(2_000)
+    await flush()
+    expect(runner.inFlight).toBe(1)
+    inv.stop()
+    await inv.settled()
+    expect(runner.requests[0]!.signal?.aborted).toBe(true)
+    expect(runner.inFlight).toBe(0)
+    expect(inv.counters().runsFailed).toBe(1)
+    expect(clock.pending()).toBe(0) // no retry: stopped
+  })
+
+  it('after the ladder is exhausted, a runtime that was down and comes back earns ONE re-knock', async () => {
+    const clock = new FakeClock()
+    let preflightOk = false
+    let mode: 'down' | 'ok' = 'down'
+    const runner = new FakeRunner(() => (mode === 'down' ? notStarted() : ok()))
+    runner.preflight = async () => ({ ok: preflightOk })
+    const inv = new DoorbellInvoker({
+      runner,
+      prompts: PROMPTS,
+      budgetMs: 600_000,
+      debounceMs: 2_000,
+      retryLadderMs: [1_000, 2_000, 3_000],
+      preflightWatchMs: 10_000,
+      now: () => clock.now(),
+      setTimeout: (fn, ms) => clock.setTimeout(fn, ms),
+      clearTimeout: (h) => clock.clearTimeout(h),
+    })
+    inv.knock('message')
+    await clock.advanceAsync(2_000)
+    await inv.settled() // run 1 → rung 1
+    await clock.advanceAsync(1_000 + 2_000)
+    await inv.settled() // run 2 → rung 2
+    await clock.advanceAsync(2_000 + 2_000)
+    await inv.settled() // run 3 → rung 3
+    await clock.advanceAsync(3_000 + 2_000)
+    await inv.settled() // run 4 → exhausted; the watch is armed
+    expect(runner.requests).toHaveLength(4)
+    expect(inv.counters().retryRung).toBe(3)
+    expect(clock.pending()).toBe(1)
+
+    // First probe: still down. Keep watching, no run.
+    await clock.advanceAsync(10_000)
+    await flush()
+    expect(runner.requests).toHaveLength(4)
+    expect(clock.pending()).toBe(1)
+
+    // The user signs back in.
+    preflightOk = true
+    mode = 'ok'
+    await clock.advanceAsync(10_000)
+    await flush()
+    await clock.advanceAsync(2_000) // the re-knock coalesces like any other
+    await inv.settled()
+    expect(runner.requests).toHaveLength(5)
+    expect(inv.counters().runsOk).toBe(1)
+    expect(inv.counters().retryRung).toBe(0)
+    expect(clock.pending()).toBe(0) // success ends the watch
+  })
+
+  it('when preflight was already ok, an exhausted ladder waits for the next knock — no re-knock, no endless probing', async () => {
+    const clock = new FakeClock()
+    const runner = new FakeRunner(() => failed())
+    const inv = new DoorbellInvoker({
+      runner,
+      prompts: PROMPTS,
+      budgetMs: 600_000,
+      debounceMs: 2_000,
+      retryLadderMs: [1_000],
+      preflightWatchMs: 10_000,
+      now: () => clock.now(),
+      setTimeout: (fn, ms) => clock.setTimeout(fn, ms),
+      clearTimeout: (h) => clock.clearTimeout(h),
+    })
+    inv.knock('message')
+    await clock.advanceAsync(2_000)
+    await inv.settled()
+    await clock.advanceAsync(1_000 + 2_000)
+    await inv.settled() // exhausted
+    expect(runner.requests).toHaveLength(2)
+    expect(clock.pending()).toBe(1)
+    await clock.advanceAsync(10_000)
+    await flush()
+    expect(runner.requests).toHaveLength(2)
+    expect(clock.pending()).toBe(0) // the watch stopped: the failures were not readiness
+    // A peer's knock still runs as always.
+    inv.knock('message')
+    await clock.advanceAsync(2_000)
+    await inv.settled()
+    expect(runner.requests).toHaveLength(3)
+  })
+})

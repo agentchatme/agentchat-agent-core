@@ -18,11 +18,26 @@ import type { DoorbellLastRun } from './status.js'
 // flight earns exactly one more run after it (the tray is re-read, so whatever
 // the knock announced is covered); ten knocks during a run still earn one.
 //
-// A run that fails to start (runtime missing, auth expired, non-zero exit
-// before any output), fails, or exceeds its budget schedules a re-knock on a
+// A run that fails to start (runtime missing, auth expired, non-zero exit with
+// nothing on stdout), fails, or exceeds its budget schedules a re-knock on a
 // local ladder (60 s, 5 min, 30 min), because a connected socket gets no
 // re-ring from the server. One outage climbs one rung: a retry already on its
 // way is never replaced by a later one. A successful run resets the ladder.
+//
+// When the ladder is exhausted the invoker does not go deaf. It asks the
+// runner's `preflight()` every PREFLIGHT_WATCH_MS; if the runtime was found
+// unusable (signed out, binary gone) and later answers ok, that flip earns ONE
+// re-knock — a day's backlog behind a signed-out CLI is read when the user
+// signs back in, not when the next new peer happens to write. If the first
+// probe already says ok, the failures are not the runtime's readiness and the
+// watch stops: the backlog waits for the next knock, as it always did. A knock
+// from any source while watching is served as usual and, if it succeeds, ends
+// the watch.
+//
+// `stop()` interrupts a run in flight: the run's `AbortSignal` fires, the
+// runner SIGTERMs the run's process group, and `settled()` resolves when it
+// has ended. A doorbell that stops without doing this leaves a model call
+// running that nobody will read and that the next connect would run again.
 //
 // Group invites are the second knock kind: not on the tray, one run each with
 // the fixed invite prompt, serialized on the same worker, deduplicated by
@@ -31,6 +46,9 @@ import type { DoorbellLastRun } from './status.js'
 // The doorbell reads NO tray and makes NO verdicts. That is the run's job.
 
 export const RETRY_LADDER_MS: readonly number[] = [60_000, 300_000, 1_800_000]
+
+/** After the ladder is exhausted: how often the runtime is asked whether it is usable again. */
+export const PREFLIGHT_WATCH_MS = 5 * 60_000
 
 const MAX_SEEN_INVITES = 1_000
 
@@ -41,6 +59,7 @@ export interface DoorbellInvokerOptions {
   readonly budgetMs: number
   readonly debounceMs?: number
   readonly retryLadderMs?: readonly number[]
+  readonly preflightWatchMs?: number
   /** Called after every state change (a status writer hangs off this). */
   readonly onChange?: () => void
   readonly now?: () => number
@@ -69,17 +88,23 @@ export class DoorbellInvoker {
   private readonly prompts: DoorbellPrompts
   private readonly budgetMs: number
   private readonly ladder: readonly number[]
+  private readonly preflightWatchMs: number
   private readonly now: () => number
+  private readonly _setTimeout: (fn: () => void, ms: number) => TimerHandle
+  private readonly _clearTimeout: (handle: TimerHandle) => void
   private readonly onChange: () => void
   private readonly newRunId: () => string
   private readonly coalescer: KnockCoalescer
 
   private cycleDue = false
   private running: Promise<void> | null = null
+  private inFlight: AbortController | null = null
   private stopped = false
   private readonly invites: InviteKnock[] = []
   private readonly seenInvites: string[] = []
   private retryRung = 0
+  private preflightWatch: TimerHandle | null = null
+  private preflightWasDown = false
 
   private invitesSeen = 0
   private runsStarted = 0
@@ -94,7 +119,10 @@ export class DoorbellInvoker {
     this.prompts = options.prompts
     this.budgetMs = options.budgetMs
     this.ladder = options.retryLadderMs ?? RETRY_LADDER_MS
+    this.preflightWatchMs = options.preflightWatchMs ?? PREFLIGHT_WATCH_MS
     this.now = options.now ?? Date.now
+    this._setTimeout = options.setTimeout ?? ((fn, ms) => setTimeout(fn, ms))
+    this._clearTimeout = options.clearTimeout ?? ((handle) => clearTimeout(handle))
     this.onChange = options.onChange ?? (() => undefined)
     this.newRunId = options.runId ?? (() => crypto.randomUUID())
     this.coalescer = new KnockCoalescer({
@@ -108,7 +136,7 @@ export class DoorbellInvoker {
 
   // ─── knocks ─────────────────────────────────────────────────────────────
 
-  /** A knock from the socket (a frame, a connect) or any other source. Coalesced, then run. */
+  /** A knock from the socket (a frame), the connect-time catch-up, or any other source. Coalesced, then run. */
   knock(source: string): void {
     if (this.stopped) return
     log.debug(`knock (${source})`)
@@ -132,10 +160,16 @@ export class DoorbellInvoker {
     return true
   }
 
-  /** Cancel timers; a run in flight finishes on its own. */
+  /**
+   * Cancel timers and interrupt a run in flight (its signal aborts; the
+   * runner SIGTERMs the run's process group). `settled()` resolves when the
+   * interrupted run has ended.
+   */
   stop(): void {
     this.stopped = true
     this.coalescer.stop()
+    this.clearPreflightWatch()
+    this.inFlight?.abort()
   }
 
   /** The promise of the work currently running, for tests and graceful stops. */
@@ -202,9 +236,11 @@ export class DoorbellInvoker {
     this.onChange()
     log.info(`run start kind=${kind} id=${runId} budget=${Math.round(this.budgetMs / 1000)}s`)
 
+    const controller = new AbortController()
+    this.inFlight = controller
     let outcome: RunOutcome
     try {
-      outcome = await this.runner.start({ kind, prompt, runId, budgetMs: this.budgetMs })
+      outcome = await this.runner.start({ kind, prompt, runId, budgetMs: this.budgetMs, signal: controller.signal })
     } catch (err) {
       // The runner contract is "never throws"; a throw is a bug in the runner,
       // not a reason to drop the knock.
@@ -214,6 +250,8 @@ export class DoorbellInvoker {
         durationMs: this.now() - startedAt,
         detail: `runner threw: ${err instanceof Error ? err.message : String(err)}`,
       }
+    } finally {
+      if (this.inFlight === controller) this.inFlight = null
     }
 
     this.lastRun = {
@@ -230,6 +268,7 @@ export class DoorbellInvoker {
       case 'ok':
         this.runsOk += 1
         this.retryRung = 0
+        this.clearPreflightWatch()
         log.info(`run ok kind=${kind} id=${runId} ${Math.round(outcome.durationMs / 1000)}s (output discarded; any send was the agent's own hosted-tool call)`)
         break
       case 'failed':
@@ -245,7 +284,10 @@ export class DoorbellInvoker {
 
     if (outcome.state !== 'ok') {
       log.warn(`run ${outcome.state} kind=${kind} id=${runId}${outcome.detail ? `: ${outcome.detail}` : ''}`)
-      if (kind === 'knock') {
+      if (this.stopped) {
+        // Interrupted by stop(): nothing to schedule, the tray stays stored
+        // and the next connect's catch-up finds it.
+      } else if (kind === 'knock') {
         // The agent never saw the tray, or did not finish: the cards are still
         // stored. Look again on the ladder instead of waiting for the next peer.
         this.scheduleRetry(`run ${outcome.state}`)
@@ -267,12 +309,58 @@ export class DoorbellInvoker {
       return
     }
     if (this.retryRung >= this.ladder.length) {
-      log.warn(`${reason} — retry ladder exhausted; waiting for the next knock (the backlog stays stored)`)
+      log.warn(
+        `${reason} — retry ladder exhausted; the backlog stays stored. Watching the runtime's preflight every ${Math.round(this.preflightWatchMs / 1000)}s: if it comes back, one re-knock; any knock also re-runs`,
+      )
+      this.armPreflightWatch()
       return
     }
     const delay = this.ladder[this.retryRung] ?? this.ladder[this.ladder.length - 1] ?? 60_000
     this.retryRung += 1
     log.warn(`${reason} — re-knocking in ${Math.round(delay / 1000)}s (rung ${this.retryRung}/${this.ladder.length})`)
     this.coalescer.knockAfter(delay)
+  }
+
+  // ─── preflight watch, after an exhausted ladder ─────────────────────────
+
+  private armPreflightWatch(): void {
+    if (this.stopped || this.preflightWatch !== null) return
+    this.preflightWatch = this._setTimeout(() => {
+      this.preflightWatch = null
+      void this.probePreflight()
+    }, this.preflightWatchMs)
+    this.onChange()
+  }
+
+  private clearPreflightWatch(): void {
+    if (this.preflightWatch !== null) {
+      this._clearTimeout(this.preflightWatch)
+      this.preflightWatch = null
+    }
+    this.preflightWasDown = false
+  }
+
+  private async probePreflight(): Promise<void> {
+    if (this.stopped) return
+    let ok: boolean
+    try {
+      ok = (await this.runner.preflight()).ok
+    } catch {
+      ok = false
+    }
+    if (this.stopped) return
+    if (!ok) {
+      if (!this.preflightWasDown) log.info('runtime preflight is not ok — watching for it to come back')
+      this.preflightWasDown = true
+      this.armPreflightWatch()
+      return
+    }
+    if (this.preflightWasDown) {
+      this.preflightWasDown = false
+      log.info('runtime preflight is ok again after an exhausted ladder — re-knocking once')
+      this.knock('preflight')
+      return
+    }
+    log.info('runtime preflight was already ok — the failures are not its readiness; the backlog waits for the next knock')
   }
 }

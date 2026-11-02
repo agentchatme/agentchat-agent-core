@@ -7,6 +7,7 @@ import { resolveDaemonConfig } from '../daemon/config.js'
 import { idle } from '../daemon/health.js'
 import { Doorbell } from './doorbell.js'
 import type { DoorbellPrompts } from './prompt.js'
+import type { TerminalReason } from './socket.js'
 import { doorbellDisabled, resolveRunBudgetMs, resolveRunProfile, type RunProfile } from './profile.js'
 import type { RunRunner } from './runner.js'
 import { writeDoorbellStatus } from './status.js'
@@ -25,6 +26,12 @@ import { writeDoorbellStatus } from './status.js'
 //   AGENTCHAT_DOORBELL=off → stay resident, hold nothing, ring nothing.
 //
 // The only thing that removes this process is an explicit `daemon disable`.
+//
+// SIGTERM/SIGINT (launchd/systemd stop, Ctrl-C) interrupts a run in flight:
+// the doorbell SIGTERMs the run's process group and this process waits up to
+// SHUTDOWN_GRACE_MS for it before exiting. A daemon that exited at once left
+// the detached run orphaned, and the restarted daemon's connect found the same
+// tray and started a second run beside it.
 
 /** How often to re-read the identity. A `stat`; the watcher usually beats it. */
 const POLL_MS = 5_000
@@ -32,6 +39,20 @@ const POLL_MS = 5_000
 const TICK_MS = 250
 /** Ceiling for retry backoff when the runtime simply is not usable yet. */
 const MAX_BACKOFF_MS = 5 * 60_000
+/**
+ * After the socket's reconnect hard cap (hours of an unreachable control
+ * plane): how long before a fresh socket is opened. Doubles per give-up, from
+ * one minute, to this ceiling. Reset when the identity changes.
+ */
+const SOCKET_GIVEUP_HOLD_BASE_MS = 60_000
+const SOCKET_GIVEUP_HOLD_MAX_MS = 10 * 60_000
+/**
+ * How long a shutdown waits for an interrupted run to end before the process
+ * exits. The runner SIGTERMs the run's process group at once and SIGKILLs 5 s
+ * later, so this is normally over in well under a second. Below launchd's
+ * `ExitTimeOut` (15 s in the plist this package writes).
+ */
+const SHUTDOWN_GRACE_MS = 10_000
 const MAX_LOG_BYTES = 5 * 1024 * 1024
 const KEEP_LOG_BYTES = 1024 * 1024
 
@@ -51,6 +72,8 @@ export interface RunDoorbellOpts {
   /** Ends the loop (tests). Production runs until SIGTERM/SIGINT. */
   signal?: AbortSignal
   env?: NodeJS.ProcessEnv
+  /** Test seam: what a signal-initiated shutdown calls last. Defaults to `process.exit`. */
+  exit?: (code: number) => void
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
@@ -117,6 +140,10 @@ export async function runDoorbell(opts: RunDoorbellOpts): Promise<number> {
   let refused: string | null = null
   /** Consecutive start failures, for backoff. Reset on success or on a new credential. */
   let failures = 0
+  /** Times the socket reached its reconnect cap for this credential; sets the hold before a fresh socket. */
+  let socketGiveUps = 0
+  /** No new socket before this instant (epoch ms). */
+  let holdUntil = 0
   let lastFailure: string | null = null
   let shuttingDown = false
 
@@ -146,21 +173,19 @@ export async function runDoorbell(opts: RunDoorbellOpts): Promise<number> {
 
   const disconnect = (why: string): void => {
     if (live === null) return
-    log.info(`${why} — disconnecting, staying resident`)
+    log.info(`${why} — disconnecting (a run in flight is interrupted), staying resident`)
     live.stop()
     live = null
     liveFingerprint = null
     idle(home)
   }
 
+  // The loop notices `shuttingDown` within a tick and takes the one exit path
+  // below: stop the doorbell, give an interrupted run its grace, release, exit.
   const shutdown = (sig: string): void => {
     if (shuttingDown) return
     shuttingDown = true
     log.info(`${sig} — shutting down`)
-    live?.stop()
-    idle(home)
-    lock.release()
-    process.exit(0)
   }
   const onSigint = (): void => shutdown('SIGINT')
   const onSigterm = (): void => shutdown('SIGTERM')
@@ -204,6 +229,8 @@ export async function runDoorbell(opts: RunDoorbellOpts): Promise<number> {
       disconnect(fp === null ? 'signed out' : 'identity changed')
       observedFingerprint = fp
       failures = 0
+      socketGiveUps = 0
+      holdUntil = 0
       lastFailure = null
       // A refusal applies only to the exact rejected credential.
       if (fp !== refused) refused = null
@@ -220,6 +247,9 @@ export async function runDoorbell(opts: RunDoorbellOpts): Promise<number> {
       if (fp === refused) {
         // Same key the server already rejected; wait for a different one
         // rather than hammering the endpoint.
+      } else if (Date.now() < holdUntil) {
+        // The socket gave up on an unreachable control plane; a fresh one
+        // waits out the hold.
       } else {
         try {
           const cfg = await resolveDaemonConfig({ home, workdir })
@@ -229,13 +259,25 @@ export async function runDoorbell(opts: RunDoorbellOpts): Promise<number> {
             prompts: opts.prompts,
             profile,
             budgetMs,
-            onTerminal: (reason) => {
-              log.warn(`credential refused (${reason}) — idling until it changes`)
-              refused = fp
-              lastFailure = reason
+            onTerminal: (reason: TerminalReason, detail: string) => {
               live = null
               liveFingerprint = null
+              lastFailure = detail
               idle(home)
+              if (reason === 'auth') {
+                // The server refused this exact key. Sit out until it changes;
+                // retrying would start a paid run per attempt against a key
+                // every hosted tool rejects.
+                log.warn(`credential refused (${detail}) — idling until it changes`)
+                refused = fp
+                return
+              }
+              // `cap`: hours of an unreachable control plane, not a bad key.
+              // A fresh socket, after a hold that grows per give-up.
+              socketGiveUps += 1
+              const hold = Math.min(SOCKET_GIVEUP_HOLD_BASE_MS * 2 ** (socketGiveUps - 1), SOCKET_GIVEUP_HOLD_MAX_MS)
+              holdUntil = Date.now() + hold
+              log.warn(`socket gave up (${detail}) — opening a fresh socket in ${Math.round(hold / 1000)}s`)
             },
           })
           await candidate.start()
@@ -276,8 +318,16 @@ export async function runDoorbell(opts: RunDoorbellOpts): Promise<number> {
 
   process.off('SIGINT', onSigint)
   process.off('SIGTERM', onSigterm)
-  live?.stop()
+  if (live !== null) {
+    const ended = await live.stopAndWait(SHUTDOWN_GRACE_MS)
+    if (!ended) log.warn(`a run in flight did not end within ${Math.round(SHUTDOWN_GRACE_MS / 1000)}s of being interrupted — exiting anyway`)
+    live = null
+  }
   idle(home)
   lock.release()
+  if (shuttingDown) {
+    log.info('shutdown complete')
+    ;(opts.exit ?? process.exit)(0)
+  }
   return 0
 }

@@ -6,6 +6,7 @@ import { runDoorbell } from '../src/doorbell/run.js'
 import { readDoorbellStatus } from '../src/doorbell/status.js'
 import { alwaysOnState, markAlwaysOnWanted } from '../src/daemon/health.js'
 import type { RunRunner } from '../src/doorbell/runner.js'
+import { startServerDouble, until } from './helpers/server-double.js'
 
 // ─── The supervisor is resident, follows the credential, and honours `off` ──
 
@@ -79,4 +80,43 @@ describe('runDoorbell', () => {
     first.abort()
     expect(await a).toBe(0)
   }, 10_000)
+})
+
+describe('runDoorbell — shutdown', () => {
+  it('SIGTERM interrupts the run in flight, waits for it, and exits 0 (a launchd stop must reach the child)', async () => {
+    const double = await startServerDouble({ tray: { waiting: 1 } })
+    try {
+      markAlwaysOnWanted(home)
+      fs.writeFileSync(
+        path.join(home, 'credentials'),
+        JSON.stringify({ api_key: 'ac_' + 'a'.repeat(40), handle: 'probe', api_base: double.apiBase }),
+      )
+      const r: RunRunner & { starts: number; aborted: number } = {
+        name: 'fake-runtime',
+        starts: 0,
+        aborted: 0,
+        async preflight() {
+          return { ok: true }
+        },
+        async start(request) {
+          this.starts += 1
+          await new Promise<void>((resolve) => request.signal?.addEventListener('abort', () => resolve(), { once: true }))
+          this.aborted += 1
+          return { state: 'failed', exitCode: null, durationMs: 1, detail: 'interrupted' }
+        },
+      }
+      const exits: number[] = []
+      const done = runDoorbell({ home, runner: r, prompts, env: {}, exit: (code) => exits.push(code) })
+      await until(() => r.starts === 1, 6_000)
+      const started = Date.now()
+      process.emit('SIGTERM')
+      expect(await done).toBe(0)
+      expect(Date.now() - started).toBeLessThan(3_000)
+      expect(r.aborted).toBe(1)
+      expect(exits).toEqual([0])
+      expect(fs.existsSync(path.join(home, 'daemon.heartbeat'))).toBe(false) // idle() ran before exit
+    } finally {
+      await double.close()
+    }
+  }, 15_000)
 })
