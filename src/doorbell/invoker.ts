@@ -9,22 +9,36 @@ import type { DoorbellLastRun } from './status.js'
 // ─── Knock → one run. The only path from the socket to the agent ────────────
 //
 // 1. Coalesce. Knocks inside a short window become one (`KnockCoalescer`).
-// 2. Run. Start ONE headless run of the resident coding agent with the fixed
+// 2. Count. Ask the tray whether anything is waiting (`trayHasWaiting`: one
+//    `GET /v1/inbox?wait_ms=0&limit=1` — a count, never a card; marks nothing
+//    delivered). Empty → no run: nothing is owed, so the retry ladder resets
+//    too. A count that cannot be read (network, 5xx) is not evidence of an
+//    empty tray and the knock was real: the run starts anyway.
+// 3. Run. Start ONE headless run of the resident coding agent with the fixed
 //    knock prompt. The agent reads the tray with the hosted inbox tool, judges
 //    every card with the tray's own question, decides or sends through the
 //    hosted tools. The run's output is discarded.
 //
+// The count guards EVERY knock run — a frame, the connect-time catch-up, a
+// ladder re-knock, the preflight re-knock, the follow-on after a busy run — so
+// no source needs its own "is this worth a run?" logic. It is what keeps a
+// deferred conversation from costing a run per reconnect: `defer` leaves the
+// envelope stored, the server re-offers it as a plain `message.new` on every
+// (re)connect, and the tray (which hides the deferred card until its time or
+// a newer message) says nothing is waiting.
+//
 // One run at a time per agent, ever. A knock that lands while a run is in
-// flight earns exactly one more run after it (the tray is re-read, so whatever
-// the knock announced is covered); ten knocks during a run still earn one.
+// flight earns exactly one more cycle after it (counted first, so a burst the
+// first run already answered costs a count, not a run); ten knocks during a
+// run still earn one.
 //
 // A run that fails to start (runtime missing, auth expired, non-zero exit with
 // nothing on stdout), fails, or exceeds its budget schedules a re-knock on a
 // local ladder (60 s, 5 min, 30 min), because a connected socket gets no
 // re-ring from the server. One outage climbs one rung: a retry already on its
-// way is never replaced by a later one. A successful knock run resets the
-// ladder and cancels a pending re-knock: it read the whole tray, so the retry
-// would only ring for a backlog that is already handled.
+// way is never replaced by a later one. A successful knock run, or a count
+// that finds the tray empty, resets the ladder and cancels a pending re-knock:
+// nothing is owed any more.
 //
 // When the ladder is exhausted the invoker does not go deaf. It asks the
 // runner's `preflight()` every PREFLIGHT_WATCH_MS; if the runtime was found
@@ -62,6 +76,12 @@ export interface DoorbellInvokerOptions {
   readonly debounceMs?: number
   readonly retryLadderMs?: readonly number[]
   readonly preflightWatchMs?: number
+  /**
+   * Is anything waiting on the tray? Asked before every knock run (never
+   * before an invite run). Resolves the answer; rejects when the count could
+   * not be read, and then the run starts anyway. Absent: every knock runs.
+   */
+  readonly trayHasWaiting?: () => Promise<boolean>
   /** Called after every state change (a status writer hangs off this). */
   readonly onChange?: () => void
   readonly now?: () => number
@@ -79,6 +99,8 @@ export interface InvokerCounters {
   readonly runsFailed: number
   readonly runsTimedOut: number
   readonly runsNotStarted: number
+  /** Knock cycles that found the tray empty and started no run. */
+  readonly runsSkippedEmpty: number
   readonly retryRung: number
   readonly retryDueAt: number | null
   readonly lastRun: DoorbellLastRun | null
@@ -96,6 +118,7 @@ export class DoorbellInvoker {
   private readonly _clearTimeout: (handle: TimerHandle) => void
   private readonly onChange: () => void
   private readonly newRunId: () => string
+  private readonly trayHasWaiting: (() => Promise<boolean>) | null
   private readonly coalescer: KnockCoalescer
 
   private cycleDue = false
@@ -114,6 +137,7 @@ export class DoorbellInvoker {
   private runsFailed = 0
   private runsTimedOut = 0
   private runsNotStarted = 0
+  private runsSkippedEmpty = 0
   private lastRun: DoorbellLastRun | null = null
 
   constructor(options: DoorbellInvokerOptions) {
@@ -127,6 +151,7 @@ export class DoorbellInvoker {
     this._clearTimeout = options.clearTimeout ?? ((handle) => clearTimeout(handle))
     this.onChange = options.onChange ?? (() => undefined)
     this.newRunId = options.runId ?? (() => crypto.randomUUID())
+    this.trayHasWaiting = options.trayHasWaiting ?? null
     this.coalescer = new KnockCoalescer({
       onFire: () => this.onKnockFired(),
       debounceMs: options.debounceMs ?? DEFAULT_KNOCK_DEBOUNCE_MS,
@@ -189,6 +214,7 @@ export class DoorbellInvoker {
       runsFailed: this.runsFailed,
       runsTimedOut: this.runsTimedOut,
       runsNotStarted: this.runsNotStarted,
+      runsSkippedEmpty: this.runsSkippedEmpty,
       retryRung: this.retryRung,
       retryDueAt: this.coalescer.delayedDue,
       lastRun: this.lastRun,
@@ -221,14 +247,52 @@ export class DoorbellInvoker {
         continue
       }
       if (this.cycleDue) {
-        // Clear BEFORE the run: a knock landing during the run sets it again
-        // and earns exactly one more run afterwards.
+        // Clear BEFORE the count and the run: a knock landing during either
+        // sets it again and earns exactly one more cycle afterwards.
         this.cycleDue = false
+        if (!(await this.trayOwesRun())) continue
         await this.run('knock', this.prompts.knock)
         continue
       }
       return
     }
+  }
+
+  /**
+   * The count before a knock run. True: start the run (something waits, or
+   * the count could not be read). False: the tray is empty — no run, nothing
+   * owed — or the invoker stopped while counting.
+   */
+  private async trayOwesRun(): Promise<boolean> {
+    if (this.trayHasWaiting === null) return true
+    let waiting: boolean
+    try {
+      waiting = await this.trayHasWaiting()
+    } catch (err) {
+      if (this.stopped) return false
+      log.warn(
+        `tray count failed (${err instanceof Error ? err.message : String(err)}) — starting the run anyway: a failed count is not an empty tray`,
+      )
+      return true
+    }
+    if (this.stopped) return false
+    if (waiting) return true
+    this.runsSkippedEmpty += 1
+    log.info(`knock: the tray is empty — no run (nothing is owed; ${this.runsSkippedEmpty} skipped so far)`)
+    this.settleLadder()
+    this.onChange()
+    return false
+  }
+
+  /**
+   * Nothing is owed any more — a knock run read the whole tray, or a count
+   * found it empty: back to the first rung, drop a pending re-knock (it would
+   * only ring for a backlog that is already handled), end the preflight watch.
+   */
+  private settleLadder(): void {
+    this.retryRung = 0
+    if (this.coalescer.cancelDelayed()) log.info('pending re-knock cancelled — nothing is owed any more')
+    this.clearPreflightWatch()
   }
 
   private async run(kind: RunKind, prompt: string): Promise<void> {
@@ -269,13 +333,9 @@ export class DoorbellInvoker {
     switch (outcome.state) {
       case 'ok':
         this.runsOk += 1
-        // A knock run read the whole tray: nothing is owed any more. An invite
-        // run did not, so it leaves a pending knock retry alone.
-        if (kind === 'knock') {
-          this.retryRung = 0
-          if (this.coalescer.cancelDelayed()) log.info('pending re-knock cancelled — the run just read the whole tray')
-          this.clearPreflightWatch()
-        }
+        // A knock run read the whole tray. An invite run did not, so it leaves
+        // a pending knock retry alone.
+        if (kind === 'knock') this.settleLadder()
         log.info(`run ok kind=${kind} id=${runId} ${Math.round(outcome.durationMs / 1000)}s (output discarded; any send was the agent's own hosted-tool call)`)
         break
       case 'failed':

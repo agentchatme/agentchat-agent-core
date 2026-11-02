@@ -44,6 +44,8 @@ const StatusSchema = z.object({
   runs_failed: z.number(),
   runs_timed_out: z.number(),
   runs_not_started: z.number(),
+  /** Knocks whose tray count came back empty, so no run started. Absent in files from older daemons. */
+  runs_skipped_empty: z.number().default(0),
   last_run: LastRunSchema.nullable(),
   retry_rung: z.number(),
   retry_due_at: z.string().nullable(),
@@ -103,7 +105,7 @@ export function formatDoorbellStatus(status: DoorbellStatus | null, now = Date.n
     `Doorbell: socket ${status.socket}${stale ? ` (status last written ${ago(age)} — the daemon may be down)` : ''}`,
     `  ack capability: ${status.ack_negotiated === null ? 'not negotiated yet' : status.ack_negotiated ? 'negotiated (the server keeps envelopes stored until the agent decides; this daemon never acknowledges)' : 'NOT echoed by the server (legacy server marks on send)'}`,
     `  knocks: ${status.knocks} (${status.knocks_absorbed} absorbed into a pending run), invites: ${status.invites}`,
-    `  runs: ${status.runs_started} started, ${status.runs_ok} ok, ${status.runs_failed} failed, ${status.runs_timed_out} timed out, ${status.runs_not_started} did not start`,
+    `  runs: ${status.runs_started} started, ${status.runs_ok} ok, ${status.runs_failed} failed, ${status.runs_timed_out} timed out, ${status.runs_not_started} did not start; ${status.runs_skipped_empty} knock(s) found the tray empty (no run)`,
     `  profile: ${status.profile}${status.runtime ? ` (${status.runtime})` : ''}`,
   ]
   if (status.last_run) {

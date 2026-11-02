@@ -11,19 +11,31 @@ import { WebSocketServer, type WebSocket } from 'ws'
 //                production path a reconnect storm hides behind.
 //   * a number — the upgrade is answered with that HTTP status (what a load
 //                balancer does mid-deploy: 502/503, or a 401 from a proxy).
-// And the two connect-time reads the doorbell makes over HTTP:
-//   * GET /v1/inbox?wait_ms=0&limit=N  → a tray with `waiting` cards
+// After `hello.ok` the double can replay `drain` frames on every connection,
+// the way `ws/handler.ts` `drainUndelivered` re-offers every stored envelope
+// (deferred ones included) as a plain `message.new`.
+// And the two reads the doorbell makes over HTTP:
+//   * GET /v1/inbox?wait_ms=0&limit=N  → a tray with `waiting` cards (and a
+//                                        `deferred` count the cards exclude)
 //   * GET /v1/groups/invites           → the configured pending invites
 // Every frame a client sends after the upgrade is recorded, so a test can
 // assert the list stays EMPTY.
 
 export type UpgradeMode = 'hello' | 'refuse' | number
 
+export interface Tray {
+  waiting: number
+  truncated?: boolean
+  deferred?: number
+}
+
 export interface ServerDoubleOptions {
   upgrade?: UpgradeMode
   helloCapabilities?: readonly string[]
-  /** Cards on the tray; `truncated` when more wait than one page shows. */
-  tray?: { waiting: number; truncated?: boolean }
+  /** Cards on the tray; `truncated` when more wait than one page shows; `deferred` hidden from the cards. */
+  tray?: Tray
+  /** Frames sent right after `hello.ok` on every connection (the server's connect-time drain). */
+  drain?: readonly unknown[]
   invites?: ReadonlyArray<{ id: string; group_id?: string; group_name?: string; inviter_handle?: string }>
 }
 
@@ -44,7 +56,7 @@ export interface ServerDouble {
   readonly requests: string[]
   /** Change how the NEXT upgrade is answered. */
   setUpgrade(mode: UpgradeMode): void
-  setTray(tray: { waiting: number; truncated?: boolean }): void
+  setTray(tray: Tray): void
   /** Push a frame to the most recent live socket. */
   send(frame: unknown): void
   close(): Promise<void>
@@ -52,7 +64,8 @@ export interface ServerDouble {
 
 export async function startServerDouble(options: ServerDoubleOptions = {}): Promise<ServerDouble> {
   let mode: UpgradeMode = options.upgrade ?? 'hello'
-  let tray = options.tray ?? { waiting: 0 }
+  let tray: Tray = options.tray ?? { waiting: 0 }
+  const drain = options.drain ?? []
   const invites = options.invites ?? []
   const caps = options.helloCapabilities ?? ['ack']
   const served: Served[] = []
@@ -74,7 +87,7 @@ export async function startServerDouble(options: ServerDoubleOptions = {}): Prom
           question: 'q',
           categories: [],
           conversations: cards,
-          deferred: 0,
+          deferred: tray.deferred ?? 0,
           truncated: tray.truncated ?? tray.waiting > limit,
           waited_ms: null,
         }),
@@ -133,6 +146,7 @@ export async function startServerDouble(options: ServerDoubleOptions = {}): Prom
         return
       }
       ws.send(JSON.stringify({ type: 'hello.ok', capabilities: caps }))
+      for (const frame of drain) ws.send(JSON.stringify(frame))
     })
   })
 

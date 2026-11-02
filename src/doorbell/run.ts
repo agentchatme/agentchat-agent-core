@@ -165,6 +165,7 @@ export async function runDoorbell(opts: RunDoorbellOpts): Promise<number> {
       runs_failed: 0,
       runs_timed_out: 0,
       runs_not_started: 0,
+      runs_skipped_empty: 0,
       last_run: null,
       retry_rung: 0,
       retry_due_at: null,

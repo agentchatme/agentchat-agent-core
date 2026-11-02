@@ -35,6 +35,7 @@ const sample = (over: Partial<DoorbellStatus> = {}): DoorbellStatus => ({
   runs_failed: 1,
   runs_timed_out: 0,
   runs_not_started: 0,
+  runs_skipped_empty: 3,
   last_run: { kind: 'knock', started_at: new Date().toISOString(), ended_at: new Date().toISOString(), state: 'ok', exit_code: 0, duration_ms: 4_000, detail: null },
   retry_rung: 1,
   retry_due_at: new Date(Date.now() + 60_000).toISOString(),
@@ -65,9 +66,16 @@ describe('doorbell status file', () => {
     expect(lines).toContain('never acknowledges')
     expect(lines).toContain('knocks: 4 (2 absorbed')
     expect(lines).toContain('runs: 2 started, 1 ok, 1 failed')
+    expect(lines).toContain('3 knock(s) found the tray empty (no run)')
     expect(lines).toContain('profile: answer (fake)')
     expect(lines).toContain('last run: knock, ok (exit 0)')
     expect(lines).toContain('retry: rung 1')
+  })
+
+  it('reads a file from an older daemon without runs_skipped_empty as 0', () => {
+    const { runs_skipped_empty: _dropped, ...older } = sample()
+    fs.writeFileSync(doorbellStatusPath(home), JSON.stringify(older))
+    expect(readDoorbellStatus(home)).toMatchObject({ socket: 'ready', runs_skipped_empty: 0 })
   })
 
   it('shows a refused key as socket terminal with the close as the last error', () => {

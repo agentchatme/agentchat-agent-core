@@ -52,7 +52,21 @@ const timedOut = (): RunOutcome => ({ state: 'timed_out', exitCode: null, durati
 
 const PROMPTS = { knock: 'KNOCK PROMPT', invite: 'INVITE PROMPT' }
 
-function invoker(clock: FakeClock, runner: FakeRunner, ladder: readonly number[] = RETRY_LADDER_MS) {
+/**
+ * The wire's tray count, faked: `GET /v1/inbox?wait_ms=0&limit=1` answering
+ * waiting / empty, or failing (network, 5xx). Counts how often it was asked.
+ */
+class FakeTray {
+  calls = 0
+  constructor(public answer: boolean | Error = true) {}
+  readonly hasWaiting = async (): Promise<boolean> => {
+    this.calls += 1
+    if (this.answer instanceof Error) throw this.answer
+    return this.answer
+  }
+}
+
+function invoker(clock: FakeClock, runner: FakeRunner, ladder: readonly number[] = RETRY_LADDER_MS, tray?: FakeTray) {
   return new DoorbellInvoker({
     runner,
     prompts: PROMPTS,
@@ -63,6 +77,7 @@ function invoker(clock: FakeClock, runner: FakeRunner, ladder: readonly number[]
     setTimeout: (fn, ms) => clock.setTimeout(fn, ms),
     clearTimeout: (h) => clock.clearTimeout(h),
     runId: () => `run-${runner.requests.length + 1}`,
+    ...(tray ? { trayHasWaiting: tray.hasWaiting } : {}),
   })
 }
 
@@ -369,6 +384,166 @@ describe('DoorbellInvoker — stop interrupts, preflight watch after an exhauste
     await clock.advanceAsync(2_000)
     await inv.settled()
     expect(runner.requests).toHaveLength(3)
+  })
+})
+
+describe('DoorbellInvoker — the tray count before every knock run (E1)', () => {
+  it('a deferred-only tray plus the drain knocks → zero runs: one count, nothing owed', async () => {
+    // Connect knock + the server's drain re-offering a deferred envelope as
+    // message.new: the tray hides the deferred card, so nothing is waiting.
+    const clock = new FakeClock()
+    const runner = new FakeRunner()
+    const tray = new FakeTray(false)
+    const inv = invoker(clock, runner, RETRY_LADDER_MS, tray)
+    inv.knock('connect')
+    inv.knock('message')
+    inv.knock('message')
+    await clock.advanceAsync(2_000)
+    await inv.settled()
+    expect(runner.requests).toHaveLength(0)
+    expect(tray.calls).toBe(1)
+    expect(inv.counters()).toMatchObject({ knocks: 3, absorbed: 2, runsStarted: 0, runsSkippedEmpty: 1, retryRung: 0 })
+
+    // The next reconnect drains the same deferred envelope again: still no run.
+    inv.knock('connect')
+    inv.knock('message')
+    await clock.advanceAsync(2_000)
+    await inv.settled()
+    expect(runner.requests).toHaveLength(0)
+    expect(inv.counters().runsSkippedEmpty).toBe(2)
+  })
+
+  it('a live message (the tray has a card) → exactly one run', async () => {
+    const clock = new FakeClock()
+    const runner = new FakeRunner()
+    const tray = new FakeTray(true)
+    const inv = invoker(clock, runner, RETRY_LADDER_MS, tray)
+    inv.knock('message')
+    await clock.advanceAsync(2_000)
+    await inv.settled()
+    expect(tray.calls).toBe(1)
+    expect(runner.requests).toHaveLength(1)
+    expect(runner.requests[0]).toMatchObject({ kind: 'knock', prompt: 'KNOCK PROMPT' })
+    expect(inv.counters()).toMatchObject({ runsStarted: 1, runsOk: 1, runsSkippedEmpty: 0 })
+  })
+
+  it('a count that fails (network, 5xx) starts the run anyway — a failed count is not an empty tray', async () => {
+    const clock = new FakeClock()
+    const runner = new FakeRunner()
+    const tray = new FakeTray(new Error('AgentChat API 503: upstream unavailable'))
+    const inv = invoker(clock, runner, RETRY_LADDER_MS, tray)
+    inv.knock('message')
+    await clock.advanceAsync(2_000)
+    await inv.settled()
+    expect(tray.calls).toBe(1)
+    expect(runner.requests).toHaveLength(1)
+    expect(inv.counters()).toMatchObject({ runsStarted: 1, runsSkippedEmpty: 0 })
+  })
+
+  it('the burst follow-on finds the tray empty → no second run', async () => {
+    // Live-fire leg 3 at 1.2 s spacing: the third knock lands mid-run and
+    // earns one follow-on; the first run already answered everything.
+    const clock = new FakeClock()
+    const runner = new FakeRunner()
+    runner['script'] = runner.holding()
+    const tray = new FakeTray(true)
+    const inv = invoker(clock, runner, RETRY_LADDER_MS, tray)
+    inv.knock('message')
+    inv.knock('message')
+    await clock.advanceAsync(2_000)
+    expect(runner.requests).toHaveLength(1)
+    inv.knock('message') // mid-run
+    await clock.advanceAsync(2_000)
+    tray.answer = false // the run replied to all three
+    runner.release(ok())
+    await flush()
+    await inv.settled()
+    expect(tray.calls).toBe(2)
+    expect(runner.requests).toHaveLength(1)
+    expect(runner.maxInFlight).toBe(1)
+    expect(inv.counters()).toMatchObject({ runsStarted: 1, runsOk: 1, runsSkippedEmpty: 1 })
+  })
+
+  it('the ladder re-knock finds the tray empty → no run, and the rung is reset', async () => {
+    const clock = new FakeClock()
+    const runner = new FakeRunner(() => failed())
+    const tray = new FakeTray(true)
+    const inv = invoker(clock, runner, RETRY_LADDER_MS, tray)
+    inv.knock('message')
+    await clock.advanceAsync(2_000)
+    await inv.settled()
+    expect(inv.counters()).toMatchObject({ runsFailed: 1, retryRung: 1, retryDueAt: 62_000 })
+
+    // Before the re-knock lands, the agent's own session settled the card.
+    tray.answer = false
+    await clock.advanceAsync(60_000) // the delayed knock
+    await clock.advanceAsync(2_000) // its debounce
+    await inv.settled()
+    expect(runner.requests).toHaveLength(1)
+    expect(inv.counters()).toMatchObject({ runsSkippedEmpty: 1, retryRung: 0, retryDueAt: null })
+    expect(clock.pending()).toBe(0) // nothing left scheduled: nothing is owed
+
+    // A later failure starts the ladder from its first rung again.
+    tray.answer = true
+    inv.knock('message')
+    await clock.advanceAsync(2_000)
+    await inv.settled()
+    expect(inv.counters()).toMatchObject({ runsFailed: 2, retryRung: 1 })
+    expect(inv.counters().retryDueAt).toBe(clock.now() + 60_000)
+  })
+
+  it('an empty count while a re-knock is pending cancels it and ends the preflight watch', async () => {
+    const clock = new FakeClock()
+    const runner = new FakeRunner(() => failed())
+    const tray = new FakeTray(true)
+    const inv = invoker(clock, runner, RETRY_LADDER_MS, tray)
+    inv.knock('message')
+    await clock.advanceAsync(2_000)
+    await inv.settled()
+    expect(inv.counters().retryDueAt).toBe(62_000)
+    tray.answer = false
+    inv.knock('message') // a frame for something already settled
+    await clock.advanceAsync(2_000)
+    await inv.settled()
+    expect(inv.counters()).toMatchObject({ runsSkippedEmpty: 1, retryRung: 0, retryDueAt: null })
+    await clock.advanceAsync(10 * 60_000)
+    expect(runner.requests).toHaveLength(1)
+    expect(tray.calls).toBe(2)
+  })
+
+  it('invite runs are not counted against the tray', async () => {
+    const clock = new FakeClock()
+    const runner = new FakeRunner()
+    const tray = new FakeTray(false)
+    const inv = invoker(clock, runner, RETRY_LADDER_MS, tray)
+    inv.invite({ inviteId: 'gri_9', groupId: 'grp_9', groupName: 'Ops', inviterHandle: 'alice' })
+    await flush()
+    await inv.settled()
+    expect(runner.requests).toHaveLength(1)
+    expect(runner.requests[0]?.kind).toBe('invite')
+    expect(tray.calls).toBe(0)
+  })
+
+  it('stop() while the count is in flight starts no run', async () => {
+    const clock = new FakeClock()
+    const runner = new FakeRunner()
+    let answer: (v: boolean) => void = () => undefined
+    const inv = new DoorbellInvoker({
+      runner,
+      prompts: PROMPTS,
+      budgetMs: 600_000,
+      debounceMs: 2_000,
+      now: () => clock.now(),
+      setTimeout: (fn, ms) => clock.setTimeout(fn, ms),
+      clearTimeout: (h) => clock.clearTimeout(h),
+      trayHasWaiting: () => new Promise<boolean>((resolve) => (answer = resolve)),
+    })
+    inv.knock('message')
+    await clock.advanceAsync(2_000)
+    inv.stop()
+    answer(true)
+    await inv.settled()
+    expect(runner.requests).toHaveLength(0)
   })
 })
 

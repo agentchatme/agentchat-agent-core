@@ -17,10 +17,11 @@ import type { SocketState } from './status.js'
 //                                tools inside its run.
 //   * `group.invite.received`  → the second knock kind.
 //   * `hello.ok`               → the connection is live (`ready`). NOT a knock
-//                                by itself: the holder decides whether anything
-//                                is waiting (the server re-offers stored
-//                                envelopes as `message.new` frames right after
-//                                it, and the doorbell reads two counts).
+//                                by itself: the holder knocks once on it, and
+//                                the server re-offers stored envelopes as
+//                                `message.new` frames right after it. Whether
+//                                any of that deserves a run is the invoker's
+//                                tray count, never this class's call.
 //
 // AUTHENTICATION, as the server actually does it (`apps/api-server/src/ws/
 // agent-socket.ts`): a bad bearer is NOT answered with HTTP 401 on `/v1/ws`.
@@ -44,8 +45,9 @@ import type { SocketState } from './status.js'
 // the absence of a send path against a real server double.
 //
 // NEVER DRAINS over REST either: `/v1/messages/sync` is not called by this
-// package. The server re-offers unacked envelopes as frames on reconnect,
-// which land here as knocks and coalesce into one run.
+// package. The server re-offers unacked envelopes as frames on reconnect —
+// deferred ones included — which land here as knocks and coalesce into one
+// cycle; the invoker's tray count decides whether that cycle is a run.
 
 const BASE_BACKOFF_MS = 1_000
 const MAX_BACKOFF_MS = 60_000

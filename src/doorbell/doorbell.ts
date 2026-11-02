@@ -15,19 +15,23 @@ import { writeDoorbellStatus, type DoorbellStatus, type SocketState } from './st
 // knows about the coding agent arrives as a `RunRunner`. It cannot name a
 // host, so it cannot act on the wrong one.
 //
-// CONNECT IS NOT A KNOCK. Sleep/wake, Wi-Fi roaming and every server deploy
-// reconnect the whole fleet, and a paid headless run per reconnect regardless
-// of the tray was the cost of treating it as one. Instead, on `hello.ok` the
-// doorbell reads two COUNTS — never a card, never a body — and knocks only
-// when something is waiting:
-//   * the tray (`GET /v1/inbox?wait_ms=0&limit=1`): non-empty → one knock.
-//     The server re-offers stored envelopes as `message.new` frames right
-//     after `hello.ok`, so those frames usually knock first and this count
-//     coalesces with them; it is what catches a backlog no frame announced.
-//   * pending group invites (`GET /v1/groups/invites`): the server pushes an
-//     invite live only and never re-offers it, so an invite that arrived while
-//     the laptop was closed is surfaced here. Deduplicated by id downstream.
-// Either read failing degrades to "frames only" and is logged, never fatal.
+// A KNOCK IS NOT A RUN. Every knock — a `message.new` frame, the connect-time
+// catch-up, a ladder re-knock — goes through the invoker, which reads one
+// COUNT before it starts a run (`trayHasWaiting`: `GET /v1/inbox?wait_ms=0&
+// limit=1`, never a card, never a body, marks nothing delivered) and starts
+// none when the tray is empty. That single guard is what makes reconnects
+// cheap: sleep/wake, Wi-Fi roaming and every server deploy reconnect the whole
+// fleet, and the server's connect-time drain re-offers every stored envelope
+// as a plain `message.new` — including ones the agent deferred, which `defer`
+// leaves stored and the tray hides. Without the count each reconnect cost a
+// paid run that found nothing (live-fire leg 7, both integrations).
+//
+// On `hello.ok` the doorbell therefore simply knocks once (catching a backlog
+// no frame announced; it coalesces with the drain frames) and reads the
+// pending group invites (`GET /v1/groups/invites`): the server pushes an
+// invite live only and never re-offers it, so an invite that arrived while the
+// laptop was closed is surfaced here. Deduplicated by id downstream. A failed
+// invite read is logged, never fatal.
 
 const HEARTBEAT_MS = 30_000
 const STATUS_MS = 30_000
@@ -59,11 +63,13 @@ export class Doorbell {
 
   constructor(private readonly options: DoorbellOptions) {
     const { cfg } = options
+    const wire: WireConfig = { apiKey: cfg.apiKey, apiBase: cfg.apiBase }
     this.invoker = new DoorbellInvoker({
       runner: options.runner,
       prompts: options.prompts,
       budgetMs: options.budgetMs,
       onChange: () => this.writeStatus(),
+      trayHasWaiting: () => trayHasWaiting(wire),
     })
     this.socket =
       options.socket ?? new DoorbellSocket({ url: cfg.wsUrl, apiKey: cfg.apiKey, selfHandle: cfg.handle })
@@ -176,6 +182,7 @@ export class Doorbell {
       runs_failed: c.runsFailed,
       runs_timed_out: c.runsTimedOut,
       runs_not_started: c.runsNotStarted,
+      runs_skipped_empty: c.runsSkippedEmpty,
       last_run: c.lastRun,
       retry_rung: c.retryRung,
       retry_due_at: c.retryDueAt === null ? null : new Date(c.retryDueAt).toISOString(),
@@ -183,22 +190,16 @@ export class Doorbell {
     }
   }
 
-  /** The connect-time catch-up: two counts, a knock only when something is waiting. */
+  /**
+   * The connect-time catch-up: one knock (the invoker counts the tray before
+   * any run, so an empty tray costs a count, not a run) and the pending invites.
+   */
   private async catchUp(): Promise<void> {
     const { cfg } = this.options
     const wire: WireConfig = { apiKey: cfg.apiKey, apiBase: cfg.apiBase }
-    try {
-      const waiting = await trayHasWaiting(wire)
-      if (this.stopping) return
-      if (waiting) {
-        log.info('knock — connect: the tray is not empty')
-        this.invoker.knock('connect')
-      } else {
-        log.info('connect: the tray is empty — no run')
-      }
-    } catch (err) {
-      log.warn(`connect-time tray count failed (${err instanceof Error ? err.message : String(err)}) — relying on frames`)
-    }
+    if (this.stopping) return
+    log.info('knock — connect (a run starts only if the tray has something waiting)')
+    this.invoker.knock('connect')
     try {
       const invites = await listGroupInvites(wire)
       if (this.stopping) return
