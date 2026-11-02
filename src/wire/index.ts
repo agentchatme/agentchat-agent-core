@@ -1,73 +1,15 @@
 import { z } from 'zod'
-import { log } from '../util/log.js'
 import { CODING_AGENTS_CLIENT_HEADERS } from '../client-identity.js'
 
-// ─── Raw sync/ack wire client ───────────────────────────────────────────────
+// ─── Raw HTTP to the main line ──────────────────────────────────────────────
 //
-// The hooks deliberately do NOT use the `agentchatme` SDK for /sync and
-// /sync/ack: production returns a BARE ARRAY of rows whose `delivery_id`
-// is an opaque STRING cursor (`del_<32 hex>`), and SDK v1.0.2 still types
-// this path as an envelope object with numeric ids — a silent zero-row
-// drain. These two endpoints are typed here against the real wire until
-// the SDK ships its fix; everything else goes through the SDK.
-//
-// Rows failing the minimal schema are skipped, never fatal: a hook that
-// throws on an unexpected field would break every session start.
-
-const SyncRowSchema = z
-  .object({
-    id: z.string(),
-    conversation_id: z.string(),
-    delivery_id: z.string().nullable(),
-    // The public message shape carries the sender's handle as `sender`
-    // (live-fire verified against prod 2026-07-12; `sender_handle` is the
-    // dashboard-RPC shape and never appears on this wire — kept only as a
-    // fallback against a future server-side rename).
-    sender: z.string().optional(),
-    sender_handle: z.string().optional(),
-    seq: z.number().optional(),
-    type: z.string().optional(),
-    content: z.record(z.unknown()).optional(),
-    metadata: z.record(z.unknown()).optional(),
-    status: z.string().optional(),
-    created_at: z.string().optional(),
-  })
-  .passthrough()
-
-export type SyncRow = z.infer<typeof SyncRowSchema>
-
-/** Platform-authored trusted context (server `message.context`) — resolved
- *  sender identity, the conversation descriptor, and the parsed mention list.
- *  Read defensively off the passthrough row; kept in sync with the daemon's
- *  copy at daemon/src/wire.ts (same deliberate duplication as SyncRow). */
-export interface MessageContext {
-  senderDisplayName: string | null
-  senderKind: 'agent' | 'system'
-  groupName: string | null
-  memberCount: number | null
-  mentions: string[]
-}
-
-export function contextOf(row: SyncRow): MessageContext {
-  const raw = (row as { context?: unknown }).context
-  const c = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>
-  const sender = (c.sender && typeof c.sender === 'object' ? c.sender : {}) as Record<
-    string,
-    unknown
-  >
-  const conv = (c.conversation && typeof c.conversation === 'object'
-    ? c.conversation
-    : {}) as Record<string, unknown>
-  return {
-    senderDisplayName: typeof sender.display_name === 'string' ? sender.display_name : null,
-    senderKind: sender.kind === 'system' ? 'system' : 'agent',
-    groupName: typeof conv.group_name === 'string' ? conv.group_name : null,
-    memberCount: typeof conv.member_count === 'number' ? conv.member_count : null,
-    mentions: Array.isArray(c.mentions)
-      ? c.mentions.filter((m): m is string => typeof m === 'string').map((m) => m.toLowerCase())
-      : [],
-  }
-}
+// Two small reads the CLI commands need and the SDK pinned here does not type:
+// who the key authenticates as, and how many conversations are waiting on the
+// tray. Neither moves a message out of `stored`; `GET /v1/inbox` marks nothing
+// delivered (it is the tray the agent itself reads with `agentchat_inbox`),
+// and `/v1/messages/sync` — the one path that can be acknowledged — is
+// deliberately not here: delivered means pulled and acknowledged BY THE AGENT,
+// through the hosted tools, never by an integration.
 
 export interface WireConfig {
   apiKey: string
@@ -75,36 +17,7 @@ export interface WireConfig {
   timeoutMs?: number
 }
 
-const DEFAULT_TIMEOUT_MS = 4_000
-
-async function request(
-  cfg: WireConfig,
-  method: 'GET' | 'POST' | 'PUT' | 'DELETE',
-  pathname: string,
-  body?: unknown,
-): Promise<unknown> {
-  // Join by concatenation, exactly like the SDK's HttpTransport — `new URL`
-  // with an absolute pathname would clobber a path component in the base
-  // (e.g. a reverse-proxy prefix), splitting behavior between the SDK-based
-  // commands and the hooks.
-  const url = cfg.apiBase.replace(/\/+$/, '') + pathname
-  const res = await fetch(url, {
-    method,
-    headers: {
-      ...CODING_AGENTS_CLIENT_HEADERS,
-      authorization: `Bearer ${cfg.apiKey}`,
-      ...(body !== undefined ? { 'content-type': 'application/json' } : {}),
-    },
-    ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
-    signal: AbortSignal.timeout(cfg.timeoutMs ?? DEFAULT_TIMEOUT_MS),
-  })
-
-  if (!res.ok) {
-    const text = await res.text().catch(() => '')
-    throw new WireError(res.status, text.slice(0, 300))
-  }
-  return res.json()
-}
+const DEFAULT_TIMEOUT_MS = 6_000
 
 export class WireError extends Error {
   readonly status: number
@@ -115,65 +28,41 @@ export class WireError extends Error {
   }
 }
 
-/**
- * Non-destructive peek at undelivered messages, oldest first. Does not
- * mark anything delivered — pair with `syncAck` once the rows have been
- * handed to the agent.
- */
-export async function syncPeek(
+export async function wireRequest(
   cfg: WireConfig,
-  opts: { limit?: number; after?: string } = {},
-): Promise<SyncRow[]> {
-  const params = new URLSearchParams()
-  if (opts.limit !== undefined) params.set('limit', String(opts.limit))
-  if (opts.after !== undefined) params.set('after', opts.after)
-  const qs = params.toString()
-
-  const data = await request(cfg, 'GET', `/v1/messages/sync${qs ? `?${qs}` : ''}`)
-  if (!Array.isArray(data)) {
-    log.warn(`sync returned non-array payload (${typeof data}); treating as empty`)
-    return []
-  }
-
-  // Stop at the FIRST row that fails the schema instead of skipping it:
-  // the ack cursor covers everything at-or-before it, so acking past an
-  // unparsed row would mark a message delivered that was never surfaced.
-  // Processing the clean prefix keeps us safe AND making progress.
-  const rows: SyncRow[] = []
-  for (const [index, item] of data.entries()) {
-    const parsed = SyncRowSchema.safeParse(item)
-    if (!parsed.success) {
-      log.warn(
-        `sync row ${index} failed schema parse — processing the ${rows.length}-row prefix only`,
-      )
-      break
-    }
-    rows.push(parsed.data)
-  }
-  return rows
-}
-
-/**
- * Commit every delivery at-or-before the cursor as delivered. In the
- * host integration this is called at the moment rows are injected into the
- * agent's context — injection IS delivery.
- */
-export async function syncAck(cfg: WireConfig, lastDeliveryId: string): Promise<number> {
-  const data = await request(cfg, 'POST', '/v1/messages/sync/ack', {
-    last_delivery_id: lastDeliveryId,
+  method: 'GET' | 'POST',
+  pathname: string,
+  body?: unknown,
+): Promise<unknown> {
+  // Join by concatenation, exactly like the SDK's HttpTransport — `new URL`
+  // with an absolute pathname would clobber a path component in the base
+  // (e.g. a reverse-proxy prefix).
+  const url = cfg.apiBase.replace(/\/+$/, '') + pathname
+  const res = await fetch(url, {
+    method,
+    headers: {
+      ...CODING_AGENTS_CLIENT_HEADERS,
+      authorization: `Bearer ${cfg.apiKey}`,
+      accept: 'application/json',
+      ...(body !== undefined ? { 'content-type': 'application/json' } : {}),
+    },
+    ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+    signal: AbortSignal.timeout(cfg.timeoutMs ?? DEFAULT_TIMEOUT_MS),
   })
-  const parsed = z.object({ acked: z.number() }).safeParse(data)
-  return parsed.success ? parsed.data.acked : 0
+  if (!res.ok) {
+    const text = await res.text().catch(() => '')
+    throw new WireError(res.status, text.slice(0, 300))
+  }
+  return res.json()
 }
 
 /**
- * Minimal self-lookup for hooks that resolved an env-var key with no
- * credentials file (so no cached handle). Full profile reads go through
- * the SDK; hooks only ever need the handle.
+ * Minimal self-lookup for an env-var key with no credentials file (so no
+ * cached handle). Only the handle is read.
  */
 export async function getMeLite(cfg: WireConfig): Promise<{ handle: string } | null> {
   try {
-    const data = await request(cfg, 'GET', '/v1/agents/me')
+    const data = await wireRequest(cfg, 'GET', '/v1/agents/me')
     const parsed = z.object({ handle: z.string() }).passthrough().safeParse(data)
     return parsed.success ? { handle: parsed.data.handle } : null
   } catch {
@@ -181,119 +70,37 @@ export async function getMeLite(cfg: WireConfig): Promise<{ handle: string } | n
   }
 }
 
-// ─── Reply coordination (always-on daemon coexistence) ──────────────────────
-//
-// When a user also runs the always-on daemon for this agent, these let a live
-// session and the daemon agree on ONE replier. Coordination is FAIL-OPEN: if the
-// API predates /v1/reply or coordination is briefly down, the session behaves
-// exactly as it does today (announce nothing, surface everything) — never hide
-// mail, never block a turn.
+/** Server caps on the tray: `INBOX_TRAY_MAX_LIMIT`. */
+export const INBOX_MAX_LIMIT = 50
 
-/** Legacy single-flag activity marker retained for older integrations. */
-export async function markSessionActive(cfg: WireConfig, ttlSeconds?: number): Promise<void> {
-  try {
-    await request(cfg, 'PUT', '/v1/reply/active', ttlSeconds !== undefined ? { ttl_seconds: ttlSeconds } : {})
-  } catch (err) {
-    log.warn(`reply-active mark failed (ignored): ${String(err)}`)
-  }
-}
-
-/** Release the active flag (session ended) so the daemon resumes immediately
- *  instead of waiting out the TTL. Best-effort. */
-export async function clearSessionActive(cfg: WireConfig): Promise<void> {
-  try {
-    await request(cfg, 'DELETE', '/v1/reply/active')
-  } catch {
-    /* best-effort — the TTL expires it anyway */
-  }
+export interface TraySummary {
+  /** Conversations with something waiting (cards on the tray). */
+  waiting: number
+  /** Conversations the agent deferred and that are hidden until their time. */
+  deferred: number
+  /** More conversations are waiting than one tray shows. */
+  truncated: boolean
 }
 
 /**
- * Lease one concrete foreground turn. Unlike the legacy boolean marker, this
- * is keyed by host session id so one terminal reaching Stop cannot clear
- * another terminal that is still reasoning.
+ * How many conversations are waiting, for `status`. Reads `GET /v1/inbox`
+ * with `wait_ms=0` and counts the cards — card contents (the previews) are
+ * never read, never logged.
  */
-export async function markForegroundTurn(
-  cfg: WireConfig,
-  sessionId: string,
-  ttlSeconds: number,
-): Promise<void> {
-  try {
-    await request(cfg, 'PUT', '/v1/reply/active', {
-      session_id: sessionId,
-      ttl_seconds: ttlSeconds,
+export async function traySummary(cfg: WireConfig): Promise<TraySummary> {
+  const data = await wireRequest(cfg, 'GET', `/v1/inbox?wait_ms=0&limit=${INBOX_MAX_LIMIT}`)
+  const parsed = z
+    .object({
+      conversations: z.array(z.unknown()).optional(),
+      deferred: z.number().optional(),
+      truncated: z.boolean().optional(),
     })
-  } catch (err) {
-    log.warn(`foreground-turn mark failed (ignored): ${String(err)}`)
+    .passthrough()
+    .safeParse(data)
+  if (!parsed.success) throw new WireError(200, 'GET /v1/inbox: unexpected shape')
+  return {
+    waiting: parsed.data.conversations?.length ?? 0,
+    deferred: parsed.data.deferred ?? 0,
+    truncated: parsed.data.truncated === true,
   }
-}
-
-/** Release only this host session's foreground lease. Best-effort. */
-export async function clearForegroundTurn(cfg: WireConfig, sessionId: string): Promise<void> {
-  try {
-    await request(cfg, 'DELETE', '/v1/reply/active', { session_id: sessionId })
-  } catch {
-    // Best-effort — the lease expires after a crash or an older API rollout.
-  }
-}
-
-/** Claim the sole right to reply to one message so the daemon stands down for
- *  it. Fail-OPEN to TRUE: if coordination is unavailable, surface the message
- *  anyway (degrade to today's behavior) rather than hide it. */
-export async function claimReply(cfg: WireConfig, messageId: string, holder: string): Promise<boolean> {
-  try {
-    const data = await request(cfg, 'POST', '/v1/reply/claim', { message_id: messageId, holder })
-    const parsed = z.object({ claimed: z.boolean() }).passthrough().safeParse(data)
-    return parsed.success ? parsed.data.claimed : true
-  } catch (err) {
-    log.warn(`reply-claim failed (surfacing anyway): ${String(err)}`)
-    return true
-  }
-}
-
-/**
- * Claim the contiguous oldest-first prefix of a batch. The batch endpoint
- * avoids claiming newer rows past a message another replier owns. During a
- * rolling server upgrade, fall back to ordered single-message claims only
- * when the endpoint itself is absent. Other coordination failures stay
- * fail-open and surface the whole batch.
- */
-export async function claimReplyBatch(
-  cfg: WireConfig,
-  messageIds: string[],
-  holder: string,
-): Promise<number> {
-  if (messageIds.length === 0) return 0
-  try {
-    const data = await request(cfg, 'POST', '/v1/reply/claim-batch', {
-      message_ids: messageIds,
-      holder,
-    })
-    const parsed = z
-      .object({ claimed_count: z.number().int().min(0).max(messageIds.length) })
-      .passthrough()
-      .safeParse(data)
-    return parsed.success ? parsed.data.claimed_count : messageIds.length
-  } catch (err) {
-    if (!/AgentChat API (404|405)\b/.test(String(err))) {
-      log.warn(`reply-batch-claim failed (surfacing all): ${String(err)}`)
-      return messageIds.length
-    }
-  }
-
-  let claimed = 0
-  for (const messageId of messageIds) {
-    if (!(await claimReply(cfg, messageId, holder))) break
-    claimed += 1
-  }
-  return claimed
-}
-
-/** Latest ackable cursor from a batch of rows (rows arrive oldest-first). */
-export function lastDeliveryId(rows: SyncRow[]): string | null {
-  for (let i = rows.length - 1; i >= 0; i--) {
-    const id = rows[i]?.delivery_id
-    if (typeof id === 'string' && id.length > 0) return id
-  }
-  return null
 }

@@ -1,35 +1,28 @@
 import * as path from 'node:path'
 import * as fs from 'node:fs'
 import { log } from '../util/log.js'
-import { acquireLeaderLock } from './leader-lock.js'
+import { acquireLeaderLock } from '../daemon/leader-lock.js'
 import { resolveIdentity, credentialsPath } from '../identity/credentials.js'
-import { resolveDaemonConfig } from './config.js'
-import { Daemon } from './loop.js'
-import { idle } from './health.js'
-import type { RuntimeAdapter } from './adapter-types.js'
+import { resolveDaemonConfig } from '../daemon/config.js'
+import { idle } from '../daemon/health.js'
+import { Doorbell } from './doorbell.js'
+import type { DoorbellPrompts } from './prompt.js'
+import { doorbellDisabled, resolveRunBudgetMs, resolveRunProfile, type RunProfile } from './profile.js'
+import type { RunRunner } from './runner.js'
+import { writeDoorbellStatus } from './status.js'
 
-// ─── The always-on supervisor ───────────────────────────────────────────────
+// ─── The resident supervisor ────────────────────────────────────────────────
 //
 // This process is RESIDENT. It is registered as a service when the integration
 // is installed, and from then on it simply exists — whether or not anyone has
-// signed in.
+// signed in. Installation and authentication are different lifecycles (the
+// shape every comparable daemon uses: tailscaled runs before `tailscale up`,
+// and logging out idles it rather than uninstalling it).
 //
-// That separation is the whole design, and getting it wrong was a real defect:
-// the service used to be created by `daemon install`, which refuses without
-// credentials. So the daemon's EXISTENCE was tied to the user's LOGIN STATE,
-// and three things followed. Installing the product did not give you always-on.
-// `logout` deleted the credentials but left the service, so the daemon threw
-// "no identity", exited 1, and KeepAlive restarted it — forever. And signing
-// back in restored nothing, because nothing re-created the service.
-//
-// Installation and authentication are different lifecycles. This is the shape
-// every comparable daemon uses (tailscaled is installed and running before
-// `tailscale up`; logging out idles it rather than uninstalling it).
-//
-// So:
-//   no credentials → idle. No socket, no retries, no CPU. Just watch.
-//   credentials    → connect and serve.
-//   credentials change (sign out, sign in, swap agents) → follow them.
+//   no credentials      → idle. No socket, no retries, no CPU. Just watch.
+//   credentials         → connect and ring.
+//   credentials change  → follow them.
+//   AGENTCHAT_DOORBELL=off → stay resident, hold nothing, ring nothing.
 //
 // The only thing that removes this process is an explicit `daemon disable`.
 
@@ -42,13 +35,22 @@ const MAX_BACKOFF_MS = 5 * 60_000
 const MAX_LOG_BYTES = 5 * 1024 * 1024
 const KEEP_LOG_BYTES = 1024 * 1024
 
-export interface RunDaemonOpts {
+export interface RunDoorbellOpts {
   /** THE identity home for the agent this daemon serves. */
   home: string
-  /** How to spawn one headless turn of this integration's coding agent. */
-  adapter: RuntimeAdapter
-  /** Scratch dir override; defaults to `<home>/daemon-workdir`. */
+  /** How to start one headless run of this integration's coding agent. */
+  runner: RunRunner
+  /** The fixed prompts, with this runtime's tool names. */
+  prompts: DoorbellPrompts
+  /** Scratch dir for runs; defaults to `<home>/daemon-workdir`. */
   workdir?: string
+  /** Defaults to `AGENTCHAT_RUN_PROFILE`, then `answer`. */
+  profile?: RunProfile
+  /** Defaults to `AGENTCHAT_RUN_BUDGET_MS`, then 10 minutes. */
+  budgetMs?: number
+  /** Ends the loop (tests). Production runs until SIGTERM/SIGINT. */
+  signal?: AbortSignal
+  env?: NodeJS.ProcessEnv
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
@@ -86,18 +88,20 @@ function boundDaemonLog(home: string): void {
 }
 
 /**
- * Run the always-on daemon. Returns only on a condition that makes running
- * pointless — namely another daemon already holding this home's lock.
+ * Run the doorbell daemon. Returns only on a condition that makes running
+ * pointless — another daemon already holding this home's lock — or when
+ * `signal` aborts (tests).
  */
-export async function runDaemon(opts: RunDaemonOpts): Promise<number> {
+export async function runDoorbell(opts: RunDoorbellOpts): Promise<number> {
   const home = path.resolve(opts.home)
   const workdir = opts.workdir ?? path.join(home, 'daemon-workdir')
+  const env = opts.env ?? process.env
+  const profile = opts.profile ?? resolveRunProfile(env)
+  const budgetMs = opts.budgetMs ?? resolveRunBudgetMs(env)
   boundDaemonLog(home)
 
-  // Hooks default to `warn` because they run on every session start and must
-  // stay silent. A resident service is the opposite case: its output goes to a
-  // log file nobody sees until something is wrong, and an empty log is useless
-  // for answering "is always-on actually working?". Still overridable.
+  // A resident service's output goes to a log file nobody sees until something
+  // is wrong, and an empty log is useless for "is the doorbell working?".
   if (process.env['AGENTCHAT_LOG_LEVEL'] === undefined) process.env['AGENTCHAT_LOG_LEVEL'] = 'info'
 
   // Taken for the PROCESS, not for a connection: one resident daemon per
@@ -105,18 +109,40 @@ export async function runDaemon(opts: RunDaemonOpts): Promise<number> {
   const lock = acquireLeaderLock(home)
   if (lock === null) return 1
 
-  let live: Daemon | null = null
+  const disabled = doorbellDisabled(env)
+  let live: Doorbell | null = null
   let liveFingerprint: string | null = null
   let observedFingerprint: string | null = null
-  let adapterFingerprint: string | null = null
   /** A credential the server refused. Sit out until it CHANGES. */
   let refused: string | null = null
-  /** Consecutive connect failures, for backoff. Reset on success or on a new
-   *  credential — a fresh sign-in always deserves a fast first attempt. */
+  /** Consecutive start failures, for backoff. Reset on success or on a new credential. */
   let failures = 0
-  /** Last failure message, so a persistent condition is logged once. */
   let lastFailure: string | null = null
   let shuttingDown = false
+
+  const offStatus = (handle: string | null): void =>
+    writeDoorbellStatus(home, {
+      version: 1,
+      updated_at: new Date().toISOString(),
+      pid: process.pid,
+      runtime: opts.runner.name,
+      handle,
+      profile,
+      socket: disabled ? 'off' : 'idle',
+      ack_negotiated: null,
+      knocks: 0,
+      knocks_absorbed: 0,
+      invites: 0,
+      runs_started: 0,
+      runs_ok: 0,
+      runs_failed: 0,
+      runs_timed_out: 0,
+      runs_not_started: 0,
+      last_run: null,
+      retry_rung: 0,
+      retry_due_at: null,
+      last_error: lastFailure,
+    })
 
   const disconnect = (why: string): void => {
     if (live === null) return
@@ -136,22 +162,20 @@ export async function runDaemon(opts: RunDaemonOpts): Promise<number> {
     lock.release()
     process.exit(0)
   }
-  process.on('SIGINT', () => shutdown('SIGINT'))
-  process.on('SIGTERM', () => shutdown('SIGTERM'))
+  const onSigint = (): void => shutdown('SIGINT')
+  const onSigterm = (): void => shutdown('SIGTERM')
+  process.on('SIGINT', onSigint)
+  process.on('SIGTERM', onSigterm)
 
   // Best-effort accelerator so signing in connects in about a second instead of
-  // waiting out a poll. fs.watch is unreliable on some filesystems and network
-  // mounts, so the poll below is the real guarantee and this is pure upside.
+  // waiting out a poll. fs.watch is unreliable on some filesystems, so the poll
+  // below is the real guarantee and this is pure upside.
   let nudged = false
   try {
     fs.mkdirSync(home, { recursive: true })
     const watcher = fs.watch(home, (_event, filename) => {
       if (filename === null || String(filename).startsWith('credentials')) nudged = true
     })
-    // Resource exhaustion and unsupported filesystems can surface as an
-    // asynchronous `error` after fs.watch has returned. Without a listener
-    // Node treats that as fatal; polling is already the source of truth, so
-    // losing this best-effort accelerator must never take down the daemon.
     watcher.on('error', (err) => {
       log.warn(`credential watcher unavailable; polling instead: ${String(err)}`)
       try {
@@ -165,11 +189,15 @@ export async function runDaemon(opts: RunDaemonOpts): Promise<number> {
     /* polling covers it */
   }
 
-  log.info(`always-on resident for ${home} (${credentialsPath(home)})`)
+  log.info(`doorbell resident for ${home} (${credentialsPath(home)})`)
+  if (disabled) {
+    log.info('AGENTCHAT_DOORBELL=off — holding no socket and starting no run; the hosted tools and the manual still work in every session')
+  }
   idle(home)
+  offStatus(null)
 
   for (;;) {
-    if (shuttingDown) break
+    if (shuttingDown || opts.signal?.aborted) break
     const fp = fingerprint(home)
     const identityChanged = fp !== observedFingerprint
     if (identityChanged) {
@@ -179,12 +207,15 @@ export async function runDaemon(opts: RunDaemonOpts): Promise<number> {
       lastFailure = null
       // A refusal applies only to the exact rejected credential.
       if (fp !== refused) refused = null
+      if (fp === null || disabled) offStatus(fp === null ? null : resolveIdentity(home)?.handle ?? null)
     }
 
     if (fp === null) {
       // Signed out, or never signed in. Idle — and forget any refusal, since
       // the next credential to appear deserves a fresh attempt.
       if (refused !== null) refused = null
+    } else if (disabled) {
+      // Signed in, switched off. Resident, silent.
     } else if (fp !== liveFingerprint) {
       if (fp === refused) {
         // Same key the server already rejected; wait for a different one
@@ -192,26 +223,20 @@ export async function runDaemon(opts: RunDaemonOpts): Promise<number> {
       } else {
         try {
           const cfg = await resolveDaemonConfig({ home, workdir })
-          // A new AgentChat identity must not inherit the previous identity's
-          // Codex/Claude conversation transcripts.
-          if (adapterFingerprint !== fp) {
-            opts.adapter.reset?.(`${cfg.apiBase}:${cfg.handle}`)
-            adapterFingerprint = fp
-          }
-          const candidate = new Daemon(cfg, opts.adapter, undefined, (failure) => {
-            if (failure.kind === 'socket-auth') {
-              // Auth refused: stop trying THIS credential, keep the process.
-              log.warn(`credential refused (${failure.reason}) — idling until it changes`)
+          const candidate = new Doorbell({
+            cfg,
+            runner: opts.runner,
+            prompts: opts.prompts,
+            profile,
+            budgetMs,
+            onTerminal: (reason) => {
+              log.warn(`credential refused (${reason}) — idling until it changes`)
               refused = fp
-            } else {
-              // Runtime auth/setup can fail after preflight. Retry the same
-              // AgentChat identity through the normal bounded supervisor loop.
-              log.warn(`runtime became unhealthy (${failure.reason}) — re-running preflight`)
-              failures += 1
-            }
-            live = null
-            liveFingerprint = null
-            idle(home)
+              lastFailure = reason
+              live = null
+              liveFingerprint = null
+              idle(home)
+            },
           })
           await candidate.start()
           live = candidate
@@ -219,17 +244,15 @@ export async function runDaemon(opts: RunDaemonOpts): Promise<number> {
           failures = 0
           lastFailure = null
         } catch (err) {
-          // Runtime not ready (host CLI missing or not logged in), network
+          // Runtime not ready (host CLI missing or not signed in), network
           // down, whatever. Stay resident and try again later — exiting would
-          // just make the service manager restart us in a loop.
-          //
-          // Backed off and de-duplicated: "codex CLI not found on PATH" is a
-          // condition that can last days, and retrying every 5s would write
-          // ~17k identical lines a day into a log meant to be readable.
+          // just make the service manager restart us in a loop. Backed off and
+          // de-duplicated so a condition that lasts days does not fill the log.
           const msg = String(err instanceof Error ? err.message : err)
           if (msg !== lastFailure) {
             log.warn(`not connecting yet: ${msg}`)
             lastFailure = msg
+            offStatus(resolveIdentity(home)?.handle ?? null)
           }
           failures += 1
           live = null
@@ -240,20 +263,21 @@ export async function runDaemon(opts: RunDaemonOpts): Promise<number> {
     }
 
     // Wait out the poll interval, but wake as soon as the watcher fires so a
-    // sign-in connects in well under a second instead of up to POLL_MS. The
-    // flag has to be checked DURING the wait — an earlier version only
-    // consulted it afterwards, which made the watcher useless.
-    // Exponential backoff while a connect keeps failing, capped — but the
-    // watcher still wakes us instantly when credentials change, so backing off
-    // never delays a real sign-in.
+    // sign-in connects in well under a second. Exponential backoff while a
+    // start keeps failing, capped — the watcher still wakes us instantly when
+    // credentials change, so backing off never delays a real sign-in.
     const waitMs = failures === 0 ? POLL_MS : Math.min(POLL_MS * 2 ** Math.min(failures, 6), MAX_BACKOFF_MS)
     nudged = false
     const deadline = Date.now() + waitMs
-    while (!nudged && !shuttingDown && Date.now() < deadline) {
+    while (!nudged && !shuttingDown && !opts.signal?.aborted && Date.now() < deadline) {
       await sleep(TICK_MS)
     }
   }
 
+  process.off('SIGINT', onSigint)
+  process.off('SIGTERM', onSigterm)
+  live?.stop()
+  idle(home)
   lock.release()
   return 0
 }

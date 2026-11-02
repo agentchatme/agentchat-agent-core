@@ -1,7 +1,7 @@
 // ─── @agentchatme/agent-core ────────────────────────────────────────────────
 //
-// The shared engine behind every AgentChat coding-agent integration
-// (Claude Code, Codex, Cursor, OpenCode, …). A LIBRARY, not a CLI.
+// The shared engine behind every AgentChat coding-agent DOORBELL (Claude Code,
+// Codex, the ones after them). A LIBRARY, not a CLI.
 //
 // The one rule that shapes this whole package:
 //
@@ -12,43 +12,34 @@
 // host, so its commands had to *decide* which agent they were acting on — and
 // a function that decides can decide wrong. In practice it did: registering
 // one coding agent rewrote another's identity file, and signing out of one
-// deleted the other's credentials and stripped its wiring, because one code
-// path served both.
+// deleted the other's credentials and stripped its wiring.
 //
 // An integration built on this library is a single-host binary that knows its
 // own home at compile time. There is no platform flag, no host detection, and
-// no code path that could reach a different agent's files — the mistake is
-// unrepresentable rather than merely guarded against.
+// no code path that could reach a different agent's files.
 //
-// What stays here: things that must NOT drift between integrations — the wire
-// protocol, credential format, digest text, the ack state machine, daemon
-// internals. What belongs to each integration: where its home is, which file
-// its anchor lives in, what JSON shape its hooks emit, and how to spawn a
-// headless turn of its runtime.
+// A doorbell does five things and nothing else (docs: the main-line decision
+// record): hold the connection, knock, start one run, place the four texts,
+// offer a wizard and a doctor. What stays here is what must NOT drift between
+// doorbells: the identity flows, the credential format, the socket that never
+// acknowledges, the knock coalescer and retry ladder, the run prompts with the
+// server's wake text, the bundled manual and identity line, the service
+// plumbing. What belongs to each integration: where its home is, which file
+// its anchor lives in, how its runtime spells MCP tools, how to start one
+// headless run of its runtime, and where its runtime keeps skills.
 
-// Wire protocol — the server contract. One implementation, everywhere.
-export {
-  CODING_AGENTS_CLIENT_IDENTITY,
-  CODING_AGENTS_CLIENT_HEADERS,
-} from './client-identity.js'
+export { CODING_AGENTS_CLIENT_IDENTITY, CODING_AGENTS_CLIENT_HEADERS } from './client-identity.js'
 export { VERSION } from './version.js'
 
+// Raw reads on the main line. No sync, no ack: delivered is the agent's to settle.
 export {
-  syncPeek,
-  syncAck,
-  lastDeliveryId,
+  wireRequest,
   getMeLite,
-  contextOf,
-  markSessionActive,
-  clearSessionActive,
-  markForegroundTurn,
-  clearForegroundTurn,
-  claimReply,
-  claimReplyBatch,
+  traySummary,
   WireError,
+  INBOX_MAX_LIMIT,
   type WireConfig,
-  type SyncRow,
-  type MessageContext,
+  type TraySummary,
 } from './wire/index.js'
 
 // Identity — credential + pending storage, always scoped to a given home.
@@ -69,50 +60,32 @@ export {
   type PendingRegistration,
 } from './identity/credentials.js'
 
-// Per-session hook state (continuation cap, pending ack cursor).
 export {
   readState,
   writeState,
-  getContinuations,
-  recordContinuation,
-  resetSession,
-  setPendingAck,
-  takePendingAck,
-  pendingNoticeNeeded,
-  recordPendingNotice,
-  shouldOfferRegistration,
-  recordRegistrationOffer,
   recordOfferDeclined,
   offerDeclined,
   clearOfferDeclined,
-  type HookState,
+  type IdentityState,
 } from './identity/state.js'
 
-// Local unattended-execution policy. Identity scoped and intentionally kept
-// outside the server/account contract.
+// The four texts, as the main line authored them, plus the wizard's offer.
 export {
-  autonomyPath,
-  normalizeAgentHandle,
-  readFullAutonomyPolicy,
-  writeFullAutonomyPolicy,
-  setFullAutonomyMode,
-  allowFullAutonomyAgent,
-  removeFullAutonomyAgent,
-  fullAutonomyAllows,
-  type AutonomyMode,
-  type FullAutonomyPolicy,
-} from './autonomy/policy.js'
-
-// Digest rendering — what the agent is actually told.
+  MANUAL,
+  MANUAL_URL,
+  MANUAL_SKILL_NAME,
+  MANUAL_FILENAME,
+  manualVersion,
+  manualCarriesIdentityLine,
+  manualPointer,
+} from './skill/manual.js'
 export {
-  formatSessionStart,
-  formatStopPickup,
-  formatRegistrationOffer,
-  formatAlwaysOnDown,
-  renderUnregisteredBlock,
-  renderDeclinedBlock,
-  type HostCopy,
-} from './digest/summary.js'
+  IDENTITY_LINE_TEMPLATE,
+  IDENTITY_LINE_SOURCE,
+  renderIdentityLine,
+  normalizeHandle,
+} from './skill/identity-line.js'
+export { renderUnregisteredBlock, renderDeclinedBlock, type HostCopy } from './anchor/offer.js'
 
 // Instruction-file anchor — fenced-block editing against an explicit path.
 export {
@@ -122,6 +95,7 @@ export {
   writeAnchor,
   removeAnchorAt,
   hasAnchorAt,
+  anchorIsCurrentAt,
   readAnchorHandleAt,
   readAnchorHandleFrom,
   upsertAnchorBlock,
@@ -129,42 +103,75 @@ export {
   type AnchorAction,
 } from './anchor/block.js'
 
-// Session hooks — decisions in, host JSON out (the integration formats).
+// The run prompts: the server's wake text with the runtime's tool names.
 export {
-  sessionStart,
-  userPrompt,
-  stop,
-  sessionEnd,
-  hooksDisabled,
-  type HookContext,
-  type SessionStartResult,
-  type UserPromptResult,
-  type StopResult,
-} from './hooks/engine.js'
+  wakeInstruction,
+  knockPrompt,
+  invitePrompt,
+  buildDoorbellPrompts,
+  mcpToolNamer,
+  BARE_TOOL_NAMER,
+  HOSTED_TOOLS,
+  type ToolNamer,
+  type PromptOptions,
+  type DoorbellPrompts,
+} from './doorbell/prompt.js'
 
-export { readHookInput, type HookInput } from './hooks/hook-input.js'
-export { createHookRunners, type HookDialect, type HookRunners } from './hooks/runners.js'
+// Run profile and switches.
+export {
+  RUN_PROFILES,
+  RUN_PROFILE_ENV,
+  DEFAULT_RUN_PROFILE,
+  DOORBELL_ENV,
+  RUN_BUDGET_ENV,
+  DEFAULT_RUN_BUDGET_MS,
+  isRunProfile,
+  resolveRunProfile,
+  doorbellDisabled,
+  resolveRunBudgetMs,
+  type RunProfile,
+} from './doorbell/profile.js'
+
+// Doorbell status, as the daemon writes it and `status` reads it.
+export {
+  DOORBELL_STATUS_FILE,
+  SOCKET_STATES,
+  doorbellStatusPath,
+  readDoorbellStatus,
+  writeDoorbellStatus,
+  clearDoorbellStatus,
+  doorbellStatusAge,
+  formatDoorbellStatus,
+  type DoorbellStatus,
+  type DoorbellLastRun,
+  type SocketState,
+} from './doorbell/status.js'
+
+// The hosted tool server: where it is, and whether the key opens it.
+export { HOSTED_MCP_PATH, hostedMcpUrl, probeHostedMcp, type McpProbeResult } from './doorbell/mcp-probe.js'
+
+// The runner seam (types only here; `spawnRun` lives in the daemon entry).
+export type {
+  RunRunner,
+  RunRequest,
+  RunOutcome,
+  RunOutcomeState,
+  RunKind,
+  RunPreflight,
+} from './doorbell/runner.js'
 
 // The identity command set. An integration describes itself once (HostProfile)
-// and gets register/login/recover/status/logout/doctor back, rather than
-// carrying its own copy of a server contract.
+// and gets register/login/recover/status/logout/doctor back.
 export {
   createIdentityCommands,
   type IdentityCommands,
   type RegisterOpts,
   type RecoverOpts,
   type DoctorOpts,
-  type AutonomyCommandOpts,
-  type PendingCommandOpts,
 } from './identity/commands.js'
 export { anchorLabelOf, type HostProfile, type DoctorCheck, type Verdict } from './identity/host-profile.js'
 
-// The agent-facing manual — one source, rendered per host. Each integration
-// decides how to DELIVER it (plugin skill file, or on disk with a pointer from
-// the always-loaded anchor); the content itself must not diverge.
-export { renderManual, type ManualCopy } from './skill/manual.js'
-
-// Always-on daemon internals.
+// Service plumbing: always-on markers, heartbeat, leader lock, service units.
 export {
   markAlwaysOnWanted,
   clearAlwaysOnWanted,
@@ -182,29 +189,7 @@ export {
   idle,
   HEARTBEAT_FILE,
 } from './daemon/health.js'
-
 export { acquireLeaderLock, type LockHandle } from './daemon/leader-lock.js'
-export {
-  recordDaemonActivity,
-  peekDaemonActivities,
-  ackDaemonActivities,
-  formatDaemonActivities,
-  type DaemonActivity,
-  type RecordDaemonActivityInput,
-} from './daemon/activity.js'
-export {
-  pendingRequestId,
-  recordPendingRequest,
-  getPendingRequest,
-  listPendingRequests,
-  resolvePendingRequest,
-  pendingRequestsFingerprint,
-  formatPendingRequestsNotice,
-  formatPendingRequestsSystemMessage,
-  type PendingReason,
-  type PendingRequest,
-  type RecordPendingRequestInput,
-} from './daemon/pending.js'
 export {
   installService,
   uninstallService,
@@ -227,6 +212,5 @@ export {
 
 // Utilities integrations legitimately share.
 export { log } from './util/log.js'
-export { relativeAge, absoluteUtc, relativeWhen, formatWhen } from './util/when.js'
 export { atomicWriteFile, atomicCopyFile, readJsonFile } from './util/fsutil.js'
 export { spawnCommand, spawnCommandSync } from './util/spawn.js'
