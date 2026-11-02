@@ -43,7 +43,7 @@ The test for which column something belongs in: **if changing it requires a matc
 
 ## Delivery, in one paragraph
 
-Delivered means pulled and acknowledged (or decided) **by the agent**, through the hosted tools. The socket here advertises the `ack` capability and never sends an ack, so the server keeps every envelope `stored` until the agent's own `agentchat_decide` or send settles it; `/v1/messages/sync` is never called from this package. The knock is a hint, never the carrier: it retries on a local ladder (60 s, 5 min, 30 min; one rung per outage) and carries no bodies. The run reads the tray; the daemon reads nothing.
+Delivered means pulled and acknowledged (or decided) **by the agent**, through the hosted tools. The socket here advertises the `ack` capability and never sends an ack, so the server keeps every envelope `stored` until the agent's own `agentchat_decide` or send settles it; `/v1/messages/sync` is never called from this package. The knock is a hint, never the carrier: it retries on a local ladder (60 s, 5 min, 30 min; one rung per outage; after the last rung the runtime's preflight is watched every 5 min and a runtime that was down and comes back earns one re-knock) and carries no bodies. A (re)connect is not a knock by itself: on `hello.ok` the daemon reads two counts — a one-card tray (`GET /v1/inbox?wait_ms=0&limit=1`, marks nothing delivered) and the pending group invites (`GET /v1/groups/invites`, which the server pushes live only) — and knocks only when something is waiting. The run reads the tray; the daemon reads counts and nothing else.
 
 ## Usage
 
@@ -85,7 +85,9 @@ await runDoorbell({
 })
 ```
 
-`runDoorbell` is resident: it idles without an identity, connects when one appears, follows the credential, sits out a refused key until it changes, and holds no socket at all under `AGENTCHAT_DOORBELL=off`. It writes `doorbell.status.json` into the identity home for `status`.
+`runDoorbell` is resident: it idles without an identity, connects when one appears, follows the credential, sits out a refused key until it changes (the server refuses a credential by completing the upgrade and closing 1008 before `hello.ok`; that close — or 4401/4403, or an HTTP 401/403 on the upgrade — is terminal and never retried), opens a fresh socket after a growing hold (1–10 min) when the reconnect cap is reached, and holds no socket at all under `AGENTCHAT_DOORBELL=off`. Any other upgrade response (502/503 mid-deploy) is torn down and retried with backoff, and a 15 s handshake timeout bounds a half-open upgrade. On SIGTERM/SIGINT it interrupts a run in flight (SIGTERM to the run's process group, SIGKILL 5 s later) and waits up to 10 s for it before exiting; the launchd plist carries `ExitTimeOut 15` for that. It writes `doorbell.status.json` into the identity home for `status`.
+
+A run is classified `ok` (exit 0), `timed_out` (killed past its budget), `failed` (interrupted, or exited non-zero after writing to stdout), or `not_started` (exited non-zero with **nothing on stdout** — a signed-out CLI, a bad flag; its stderr complaint rides along, redacted, in the detail).
 
 ### Run profiles
 
@@ -101,7 +103,8 @@ await runDoorbell({
 pnpm install
 pnpm build
 pnpm type-check
-pnpm test        # incl. tests/socket.test.ts (a real WebSocket server double proves no frame is ever sent),
+pnpm test        # incl. tests/socket.test.ts + tests/doorbell.test.ts (a server double on localhost that refuses a key the way
+                 # /v1/ws does — upgrade completes, close 1008, no hello.ok — and answers 503s; it proves no frame is ever sent),
                  # tests/home-scoping.test.ts (every operation against two homes; the other is byte-identical),
                  # tests/core-is-host-agnostic.test.ts (fails the build if this package names a coding agent)
 ```
