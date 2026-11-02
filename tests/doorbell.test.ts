@@ -3,6 +3,7 @@ import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import { Doorbell } from '../src/doorbell/doorbell.js'
+import { readDoorbellStatus } from '../src/doorbell/status.js'
 import type { RunRequest, RunRunner } from '../src/doorbell/runner.js'
 import type { TerminalReason } from '../src/doorbell/socket.js'
 import { startServerDouble, until, pause, type ServerDouble } from './helpers/server-double.js'
@@ -102,7 +103,7 @@ describe('Doorbell — connect-time catch-up', () => {
     expect(b.snapshot().invites).toBe(1)
   })
 
-  it('a refused key is terminal with reason auth, starts no run, and does not reconnect', async () => {
+  it('a refused key is terminal with reason auth, starts no run, does not reconnect, and status says terminal (E3)', async () => {
     double = await startServerDouble({ upgrade: 'refuse', tray: { waiting: 5 } })
     const runner = new FakeRunner()
     const terminal: Array<{ reason: TerminalReason; detail: string }> = []
@@ -113,8 +114,10 @@ describe('Doorbell — connect-time catch-up', () => {
     expect(double.upgrades).toBe(1)
     expect(double.requests).toEqual([]) // no catch-up without hello.ok
     expect(runner.requests).toHaveLength(0)
-    expect(b.snapshot().socket).toBe('closed')
+    // `closed` would read as a clean shutdown and hide the refusal.
+    expect(b.snapshot().socket).toBe('terminal')
     expect(b.snapshot().last_error).toMatch(/auth rejected/)
+    expect(readDoorbellStatus(home)?.socket).toBe('terminal')
   })
 
   it('stopAndWait interrupts the run in flight and resolves once it has ended', async () => {

@@ -70,6 +70,12 @@ describe('doorbell status file', () => {
     expect(lines).toContain('retry: rung 1')
   })
 
+  it('shows a refused key as socket terminal with the close as the last error', () => {
+    const lines = formatDoorbellStatus(sample({ socket: 'terminal', last_error: "auth rejected (close 1008 Invalid token) — check the agent's API key" })).join('\n')
+    expect(lines).toContain('Doorbell: socket terminal')
+    expect(lines).toContain('last error: auth rejected (close 1008 Invalid token)')
+  })
+
   it('flags a stale file as a daemon that may be down', () => {
     const lines = formatDoorbellStatus(sample({ updated_at: new Date(Date.now() - 10 * 60_000).toISOString() })).join('\n')
     expect(lines).toContain('may be down')

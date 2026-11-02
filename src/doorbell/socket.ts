@@ -170,7 +170,10 @@ export class DoorbellSocket extends EventEmitter {
   stop(): void {
     this.stopped = true
     this.clearTimers()
-    this.setState('closed')
+    // A socket that gave up stays `terminal`: stopping it afterwards (the
+    // holder does, on `terminal`) must not dress a refused key up as a clean
+    // close in `status`.
+    if (this._state !== 'terminal') this.setState('closed')
     const ws = this.ws
     this.ws = null
     if (ws) {

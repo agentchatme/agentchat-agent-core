@@ -154,7 +154,11 @@ export class Doorbell {
 
   snapshot(): DoorbellStatus {
     const c = this.invoker.counters()
-    const socket: SocketState = this.stopping ? 'closed' : this.socket.state
+    // A socket that gave up (refused key, reconnect cap) stays `terminal` even
+    // though giving up also stops the doorbell: `closed` would read as a
+    // clean shutdown and hide the refusal from `status` and `doctor`.
+    const socket: SocketState =
+      this.socket.state === 'terminal' ? 'terminal' : this.stopping ? 'closed' : this.socket.state
     return {
       version: 1,
       updated_at: new Date().toISOString(),
