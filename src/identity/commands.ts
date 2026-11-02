@@ -602,6 +602,11 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
     const reports: string[] = []
     let any = false
 
+    // Read BEFORE clearing: `unplace` recognises the host's own registration
+    // by the key and the API base that were placed, and both are gone from
+    // disk once the credential is deleted.
+    const identity = resolveIdentity(home)
+
     if (clearCredentials(home)) {
       any = true
       reports.push('  credentials deleted')
@@ -612,7 +617,7 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
     }
     if (profile.unplace !== undefined) {
       try {
-        const lines = profile.unplace()
+        const lines = profile.unplace(identity)
         if (lines.length > 0) any = true
         reports.push(...lines)
       } catch (err) {

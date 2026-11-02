@@ -1,3 +1,5 @@
+import type { ResolvedIdentity } from './credentials.js'
+
 export type Verdict = 'PASS' | 'WARN' | 'FAIL'
 
 export interface DoctorCheck {
@@ -61,8 +63,14 @@ export interface HostProfile {
    * tool server registration and anything else that would still authenticate
    * as the old identity. The anchor is removed by the shared flow. Returns
    * report lines.
+   *
+   * `identity` is the identity AS IT WAS BEFORE the credential was cleared
+   * (its key and API base), or null when there was none: a host recognises
+   * its own registration by that key and that server, and guessing either
+   * after the fact left a non-default `api_base` entry classified as foreign
+   * and the key still registered.
    */
-  unplace?(): string[]
+  unplace?(identity: ResolvedIdentity | null): string[]
   /** Host-specific doctor checks, appended after the shared ones. */
   extraDoctorChecks?(opts: { fix?: boolean }): DoctorCheck[]
   /** Extra lines printed after a successful logout. */
