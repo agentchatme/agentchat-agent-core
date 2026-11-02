@@ -22,6 +22,13 @@ describe('the bundled manual', () => {
     expect(MANUAL).toContain(MANUAL_URL.replace('https://', ''))
   })
 
+  it('is the version the platform publishes — a stale bundle is a deliberate choice, not drift', () => {
+    // Bump this with the two-command refresh (README § Refreshing the manual)
+    // when https://agentchat.me/skill.md moves on. The Hermes and OpenClaw
+    // doorbells place the same version.
+    expect(manualVersion()).toBe('2.1.1')
+  })
+
   it('carries the identity line template verbatim — the engine writes what the manual publishes', () => {
     expect(manualCarriesIdentityLine()).toBe(true)
     expect(MANUAL).toContain(IDENTITY_LINE_TEMPLATE)
