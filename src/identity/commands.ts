@@ -62,6 +62,16 @@ async function prompt(question: string): Promise<string> {
   }
 }
 
+/**
+ * All of stdin, trimmed — for `login --api-key -`, so a key can be piped in
+ * instead of typed into argv (where `ps` and shell history keep it).
+ */
+async function readAllStdin(): Promise<string> {
+  const chunks: Buffer[] = []
+  for await (const chunk of process.stdin) chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : (chunk as Buffer))
+  return Buffer.concat(chunks).toString('utf-8').trim()
+}
+
 interface ApiErrorLike {
   code?: string
   message?: string
@@ -355,12 +365,24 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
     const apiBase = opts.apiBase ?? process.env['AGENTCHAT_API_BASE'] ?? DEFAULT_API_BASE
     let apiKey = opts.apiKey?.trim()
 
-    if (!apiKey) {
-      if (process.stdin.isTTY !== true) {
-        console.error(`Missing --api-key. Usage: ${invocation()} login --api-key ac_live_…`)
+    // Where the key comes from, most explicit first. `--api-key <key>` keeps
+    // working, but argv is visible in `ps` and kept in shell history, so a
+    // key can also be piped in (`--api-key -`) or passed in the environment.
+    if (apiKey === '-') {
+      apiKey = await readAllStdin()
+    } else if (!apiKey) {
+      const fromEnv = process.env['AGENTCHAT_API_KEY']?.trim()
+      if (fromEnv) {
+        apiKey = fromEnv
+        console.log('Using the key from AGENTCHAT_API_KEY.')
+      } else if (process.stdin.isTTY !== true) {
+        console.error(
+          `Missing API key. Pipe it in: printf %s "$KEY" | ${invocation()} login --api-key -   (or set AGENTCHAT_API_KEY, or pass --api-key ac_live_…, which \`ps\` and shell history can see)`,
+        )
         return 1
+      } else {
+        apiKey = await prompt('AgentChat API key (ac_…): ')
       }
-      apiKey = await prompt('AgentChat API key (ac_…): ')
     }
     if (apiKey.length < 20) {
       console.error('That does not look like an AgentChat API key (too short).')
