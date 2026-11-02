@@ -196,6 +196,9 @@ export { acquireLeaderLock, type LockHandle } from './daemon/leader-lock.js'
 export {
   installService,
   uninstallService,
+  serviceLabelFor,
+  parseServiceHome,
+  setServiceCommandRunnerForTests,
   serviceStatus,
   serviceInstalled,
   serviceDefinitionCurrent,
@@ -206,6 +209,7 @@ export {
   launchdPlist,
   type ServiceOpts,
   type ServiceRef,
+  type ServiceCommandRunner,
   type Plan,
 } from './daemon/service.js'
 
