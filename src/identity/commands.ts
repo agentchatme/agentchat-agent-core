@@ -80,6 +80,12 @@ function handlesOf(e: ApiErrorLike): string[] {
   return Array.isArray(handles) ? handles.filter((h): h is string => typeof h === 'string') : []
 }
 
+/** The HTTP status an SDK error carries (`AgentChatError.status`), or null for a transport failure. */
+function httpStatusOf(err: unknown): number | null {
+  const status = (err as { status?: unknown } | null)?.status
+  return typeof status === 'number' && Number.isFinite(status) && status > 0 ? status : null
+}
+
 function recoverUsage(invocation: string): string {
   return `${invocation} recover --handle <handle> --email <email>`
 }
@@ -542,52 +548,88 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
       return 0
     }
 
+    let me: Awaited<ReturnType<AgentChatClient['getMe']>>
     try {
       const client = new AgentChatClient({
         apiKey: identity.apiKey,
         baseUrl: identity.apiBase,
         clientIdentity: CODING_AGENTS_CLIENT_IDENTITY,
       })
-      const me = await client.getMe()
-      const tray = await traySummary({ apiKey: identity.apiKey, apiBase: identity.apiBase }).catch(() => null)
-
+      me = await client.getMe()
+    } catch (err) {
+      // A refused key is not an unreachable server, and neither hides the
+      // doorbell: its socket state and last error (`terminal`, `auth rejected
+      // (close 1008 …)`) are exactly what explains the failure.
+      const status = httpStatusOf(err)
+      const refused = status === 401 || status === 403
+      const detail = apiErr(err)
       if (opts.json) {
         console.log(
           JSON.stringify({
             configured: true,
             host: profile.id,
-            handle: me.handle,
-            status: me.status ?? 'unknown',
-            tray,
+            handle: identity.handle,
+            error: { kind: refused ? 'key_refused' : 'unreachable', status, detail },
             key_source: identity.source,
             api_base: identity.apiBase,
             home,
             anchor: hasAnchorAt(anchorFile),
-            anchor_current: anchorIsCurrentAt(anchorFile, me.handle),
             doorbell,
           }),
         )
       } else {
-        const trayLine =
-          tray === null
-            ? 'Tray: could not be read'
-            : `Tray: ${tray.waiting}${tray.truncated ? '+' : ''} conversation(s) waiting${tray.deferred > 0 ? `, ${tray.deferred} deferred` : ''}`
+        console.error(
+          refused
+            ? `AgentChat refused this agent's key (${detail}). Sign in with a current key: \`${invocation()} login\`; lost it? \`${recoverUsage(invocation())}\`.`
+            : `Could not reach AgentChat: ${detail}`,
+        )
         console.log(
           [
-            `@${me.handle} — ${me.status ?? 'active'}  (${LABEL})`,
-            trayLine,
+            `${identity.handle !== null ? `@${identity.handle}` : 'This agent'} — ${refused ? `key refused (HTTP ${status})` : 'AgentChat unreachable'}  (${LABEL})`,
             `Key source: ${identity.source} (${identity.source === 'file' ? credentialsPath(home) : 'AGENTCHAT_API_KEY'})`,
             `API: ${identity.apiBase}`,
-            `Identity line: ${hasAnchorAt(anchorFile) ? (anchorIsCurrentAt(anchorFile, me.handle) ? 'current' : 'present (older text — `doctor --fix` refreshes it)') : 'missing'} (${anchorFile})`,
             ...formatDoorbellStatus(doorbell),
           ].join('\n'),
         )
       }
-      return 0
-    } catch (err) {
-      console.error(`Could not reach AgentChat: ${apiErr(err)}`)
       return 1
     }
+
+    const tray = await traySummary({ apiKey: identity.apiKey, apiBase: identity.apiBase }).catch(() => null)
+
+    if (opts.json) {
+      console.log(
+        JSON.stringify({
+          configured: true,
+          host: profile.id,
+          handle: me.handle,
+          status: me.status ?? 'unknown',
+          tray,
+          key_source: identity.source,
+          api_base: identity.apiBase,
+          home,
+          anchor: hasAnchorAt(anchorFile),
+          anchor_current: anchorIsCurrentAt(anchorFile, me.handle),
+          doorbell,
+        }),
+      )
+    } else {
+      const trayLine =
+        tray === null
+          ? 'Tray: could not be read'
+          : `Tray: ${tray.waiting}${tray.truncated ? '+' : ''} conversation(s) waiting${tray.deferred > 0 ? `, ${tray.deferred} deferred` : ''}`
+      console.log(
+        [
+          `@${me.handle} — ${me.status ?? 'active'}  (${LABEL})`,
+          trayLine,
+          `Key source: ${identity.source} (${identity.source === 'file' ? credentialsPath(home) : 'AGENTCHAT_API_KEY'})`,
+          `API: ${identity.apiBase}`,
+          `Identity line: ${hasAnchorAt(anchorFile) ? (anchorIsCurrentAt(anchorFile, me.handle) ? 'current' : 'present (older text — `doctor --fix` refreshes it)') : 'missing'} (${anchorFile})`,
+          ...formatDoorbellStatus(doorbell),
+        ].join('\n'),
+      )
+    }
+    return 0
   }
 
   /**
