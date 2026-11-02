@@ -3,11 +3,12 @@ import { CODING_AGENTS_CLIENT_HEADERS } from '../client-identity.js'
 
 // ─── Raw HTTP to the main line ──────────────────────────────────────────────
 //
-// Two small reads the CLI commands need and the SDK pinned here does not type:
-// who the key authenticates as, and how many conversations are waiting on the
-// tray. Neither moves a message out of `stored`; `GET /v1/inbox` marks nothing
-// delivered (it is the tray the agent itself reads with `agentchat_inbox`),
-// and `/v1/messages/sync` — the one path that can be acknowledged — is
+// A few small reads the CLI commands and the doorbell need and the SDK pinned
+// here does not type: who the key authenticates as, whether (and how many)
+// conversations are waiting on the tray, which group invites are pending. None
+// moves a message out of `stored`; `GET /v1/inbox` marks nothing delivered (it
+// is the tray the agent itself reads with `agentchat_inbox`), and
+// `/v1/messages/sync` — the one path that can be acknowledged — is
 // deliberately not here: delivered means pulled and acknowledged BY THE AGENT,
 // through the hosted tools, never by an integration.
 
@@ -103,4 +104,61 @@ export async function traySummary(cfg: WireConfig): Promise<TraySummary> {
     deferred: parsed.data.deferred ?? 0,
     truncated: parsed.data.truncated === true,
   }
+}
+
+/**
+ * Is anything waiting on the tray? `GET /v1/inbox?wait_ms=0&limit=1` — a
+ * count, never a card: the one card the server may return is not read, not
+ * kept, not logged. Marks nothing delivered. This is the connect-time question
+ * "does this (re)connect deserve a run at all?" — the server re-offers stored
+ * envelopes as `message.new` frames right after `hello.ok`, so this is a
+ * second opinion that coalesces with them, and the reason a reconnect with an
+ * empty tray starts no run.
+ */
+export async function trayHasWaiting(cfg: WireConfig): Promise<boolean> {
+  const data = await wireRequest(cfg, 'GET', '/v1/inbox?wait_ms=0&limit=1')
+  const parsed = z
+    .object({ conversations: z.array(z.unknown()).optional(), truncated: z.boolean().optional() })
+    .passthrough()
+    .safeParse(data)
+  if (!parsed.success) throw new WireError(200, 'GET /v1/inbox: unexpected shape')
+  return (parsed.data.conversations?.length ?? 0) > 0 || parsed.data.truncated === true
+}
+
+/** A pending group invite, as the doorbell knocks for it: the same four fields the live frame carries. */
+export interface PendingInvite {
+  readonly inviteId: string
+  readonly groupId: string | null
+  readonly groupName: string | null
+  readonly inviterHandle: string | null
+}
+
+/**
+ * Pending group invites: `GET /v1/groups/invites`. The server pushes an invite
+ * live only (`group.service.ts`) and never re-offers it on reconnect, so an
+ * invite that arrived while the socket was down is surfaced by this read on
+ * connect — the invoker deduplicates by id, so one seen live is not run twice.
+ * Four fields read; descriptions, avatars and member counts are ignored.
+ */
+export async function listGroupInvites(cfg: WireConfig): Promise<PendingInvite[]> {
+  const data = await wireRequest(cfg, 'GET', '/v1/groups/invites')
+  const parsed = z
+    .array(
+      z
+        .object({
+          id: z.string(),
+          group_id: z.string().nullable().optional(),
+          group_name: z.string().nullable().optional(),
+          inviter_handle: z.string().nullable().optional(),
+        })
+        .passthrough(),
+    )
+    .safeParse(data)
+  if (!parsed.success) throw new WireError(200, 'GET /v1/groups/invites: unexpected shape')
+  return parsed.data.map((row) => ({
+    inviteId: row.id,
+    groupId: row.group_id ?? null,
+    groupName: row.group_name ?? null,
+    inviterHandle: row.inviter_handle ?? null,
+  }))
 }

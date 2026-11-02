@@ -1,11 +1,12 @@
 import { log } from '../util/log.js'
 import type { DaemonConfig } from '../daemon/config.js'
 import { beat, idle } from '../daemon/health.js'
+import { listGroupInvites, trayHasWaiting, type WireConfig } from '../wire/index.js'
 import { DoorbellInvoker } from './invoker.js'
 import type { DoorbellPrompts } from './prompt.js'
 import type { RunProfile } from './profile.js'
 import type { RunRunner } from './runner.js'
-import { DoorbellSocket } from './socket.js'
+import { DoorbellSocket, type TerminalReason } from './socket.js'
 import { writeDoorbellStatus, type DoorbellStatus, type SocketState } from './status.js'
 
 // ─── The doorbell: a socket, a coalescer, a runner ──────────────────────────
@@ -13,6 +14,20 @@ import { writeDoorbellStatus, type DoorbellStatus, type SocketState } from './st
 // Everything it knows about the agent arrives in `DaemonConfig`; everything it
 // knows about the coding agent arrives as a `RunRunner`. It cannot name a
 // host, so it cannot act on the wrong one.
+//
+// CONNECT IS NOT A KNOCK. Sleep/wake, Wi-Fi roaming and every server deploy
+// reconnect the whole fleet, and a paid headless run per reconnect regardless
+// of the tray was the cost of treating it as one. Instead, on `hello.ok` the
+// doorbell reads two COUNTS — never a card, never a body — and knocks only
+// when something is waiting:
+//   * the tray (`GET /v1/inbox?wait_ms=0&limit=1`): non-empty → one knock.
+//     The server re-offers stored envelopes as `message.new` frames right
+//     after `hello.ok`, so those frames usually knock first and this count
+//     coalesces with them; it is what catches a backlog no frame announced.
+//   * pending group invites (`GET /v1/groups/invites`): the server pushes an
+//     invite live only and never re-offers it, so an invite that arrived while
+//     the laptop was closed is surfaced here. Deduplicated by id downstream.
+// Either read failing degrades to "frames only" and is logged, never fatal.
 
 const HEARTBEAT_MS = 30_000
 const STATUS_MS = 30_000
@@ -25,9 +40,13 @@ export interface DoorbellOptions {
   readonly budgetMs: number
   /** Injectable for tests; defaults to a real socket. */
   readonly socket?: DoorbellSocket
-  /** Called when the socket gives up for good (auth refused). The supervisor
-   *  above decides what happens next — this class does not end the process. */
-  readonly onTerminal?: (reason: string) => void
+  /**
+   * Called when the socket gives up for good. `auth`: the credential was
+   * refused — sit out until it changes. `cap`: the reconnect cap was reached —
+   * open a fresh socket after a backoff. The supervisor above decides; this
+   * class does not end the process.
+   */
+  readonly onTerminal?: (reason: TerminalReason, detail: string) => void
 }
 
 export class Doorbell {
@@ -52,20 +71,24 @@ export class Doorbell {
     this.socket.on('invite', (invite) => {
       this.invoker.invite(invite)
     })
+    this.socket.on('ready', () => {
+      void this.catchUp()
+    })
     this.socket.on('state', (state) => {
       if (state === 'ready') beat(cfg.home)
       else idle(cfg.home)
       this.writeStatus()
     })
     this.socket.on('ack', () => this.writeStatus())
-    this.socket.on('terminal', (reason) => {
-      // Auth refused. Do NOT end the process: this daemon is resident, and a
-      // rejected key is a state to sit out, not to die from — the user may sign
-      // in again with a good one.
-      this.lastError = reason
-      log.error(`doorbell terminal: ${reason}`)
+    this.socket.on('terminal', (reason, detail) => {
+      // Do NOT end the process: this daemon is resident. A refused key is a
+      // state to sit out, not to die from — the user may sign in again with a
+      // good one — and an unreachable control plane deserves a fresh socket
+      // later, not a dead daemon.
+      this.lastError = detail
+      log.error(`doorbell terminal (${reason}): ${detail}`)
       this.stop()
-      options.onTerminal?.(reason)
+      options.onTerminal?.(reason, detail)
     })
   }
 
@@ -87,6 +110,11 @@ export class Doorbell {
     this.writeStatus()
   }
 
+  /**
+   * Stop holding the socket and interrupt a run in flight (its process group
+   * is SIGTERMed by the runner). Synchronous; `settled()` or `stopAndWait()`
+   * tell when the run has actually ended.
+   */
   stop(): void {
     if (this.stopping) return
     this.stopping = true
@@ -96,6 +124,27 @@ export class Doorbell {
     this.socket.stop()
     idle(this.options.cfg.home)
     this.writeStatus()
+  }
+
+  /**
+   * `stop()`, then wait up to `graceMs` for the interrupted run to end. What a
+   * shutdown awaits before the process exits, so a launchd/systemd stop
+   * reaches the child and the restarted daemon does not find a run still
+   * going. Resolves true when nothing is running any more.
+   */
+  async stopAndWait(graceMs: number): Promise<boolean> {
+    this.stop()
+    let timer: ReturnType<typeof setTimeout> | null = null
+    try {
+      return await Promise.race([
+        this.invoker.settled().then(() => true),
+        new Promise<boolean>((resolve) => {
+          timer = setTimeout(() => resolve(false), graceMs)
+        }),
+      ])
+    } finally {
+      if (timer !== null) clearTimeout(timer)
+    }
   }
 
   /** A run in flight finishes on its own; this resolves when it has. */
@@ -128,6 +177,34 @@ export class Doorbell {
       retry_due_at: c.retryDueAt === null ? null : new Date(c.retryDueAt).toISOString(),
       last_error: this.lastError,
     }
+  }
+
+  /** The connect-time catch-up: two counts, a knock only when something is waiting. */
+  private async catchUp(): Promise<void> {
+    const { cfg } = this.options
+    const wire: WireConfig = { apiKey: cfg.apiKey, apiBase: cfg.apiBase }
+    try {
+      const waiting = await trayHasWaiting(wire)
+      if (this.stopping) return
+      if (waiting) {
+        log.info('knock — connect: the tray is not empty')
+        this.invoker.knock('connect')
+      } else {
+        log.info('connect: the tray is empty — no run')
+      }
+    } catch (err) {
+      log.warn(`connect-time tray count failed (${err instanceof Error ? err.message : String(err)}) — relying on frames`)
+    }
+    try {
+      const invites = await listGroupInvites(wire)
+      if (this.stopping) return
+      let surfaced = 0
+      for (const invite of invites) if (this.invoker.invite(invite)) surfaced += 1
+      if (surfaced > 0) log.info(`knock — ${surfaced} pending group invite(s) surfaced on connect`)
+    } catch (err) {
+      log.warn(`connect-time invite list failed (${err instanceof Error ? err.message : String(err)}) — live invite frames are unaffected`)
+    }
+    this.writeStatus()
   }
 
   private writeStatus(): void {

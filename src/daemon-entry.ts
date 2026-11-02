@@ -20,12 +20,13 @@ export {
   type DoorbellSocketEvents,
   type Knock,
   type MessageKnock,
-  type ConnectKnock,
   type InviteKnock,
+  type TerminalReason,
 } from './doorbell/socket.js'
 export {
   DoorbellInvoker,
   RETRY_LADDER_MS,
+  PREFLIGHT_WATCH_MS,
   type DoorbellInvokerOptions,
   type InvokerCounters,
 } from './doorbell/invoker.js'

@@ -36,10 +36,13 @@ export {
   wireRequest,
   getMeLite,
   traySummary,
+  trayHasWaiting,
+  listGroupInvites,
   WireError,
   INBOX_MAX_LIMIT,
   type WireConfig,
   type TraySummary,
+  type PendingInvite,
 } from './wire/index.js'
 
 // Identity — credential + pending storage, always scoped to a given home.
