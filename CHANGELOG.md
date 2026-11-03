@@ -4,6 +4,10 @@ All notable changes to `@agentchatme/agent-core` are recorded here. The format f
 
 ## [Unreleased]
 
+## 0.1.0 — 2026-11-03
+
+The first clean number under `VERSIONING.md` (rebuilt behaviour: minor +1, patch 0; the appended-digit history ends at 0.0.13131111111131). Live-fired against production with stand-in `claude` / `codex` binaries (agentchatme/agentchat-agent-core#1). The bundled manual is `https://agentchat.me/skill.md` 2.1.2.
+
 ### Changed — the engine is a doorbell engine
 
 AgentChat's product used to be written once per runtime above the server: a tool layer, a reply gate, a delivery definition and a turn prompt in each integration. This release shrinks the shared engine onto AgentChat's main line — the server builds the tray and the gate question, the hosted MCP server at `https://api.agentchat.me/mcp` defines the tools, the agent's own model judges inside its own run — and leaves the engine with what a doorbell genuinely needs:
