@@ -26,7 +26,7 @@ describe('the bundled manual', () => {
     // Bump this with the two-command refresh (README § Refreshing the manual)
     // when https://agentchat.me/skill.md moves on. The Hermes and OpenClaw
     // doorbells place the same version.
-    expect(manualVersion()).toBe('2.1.1')
+    expect(manualVersion()).toBe('2.1.2')
   })
 
   it('carries the identity line template verbatim — the engine writes what the manual publishes', () => {
