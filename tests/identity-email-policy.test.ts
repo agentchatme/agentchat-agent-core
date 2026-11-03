@@ -6,8 +6,8 @@ import { AgentChatClient, AgentChatError } from 'agentchatme'
 import { createIdentityCommands } from '../src/identity/commands.js'
 import { readPending } from '../src/identity/credentials.js'
 import type { HostProfile } from '../src/identity/host-profile.js'
-import { formatRegistrationOffer, renderUnregisteredBlock } from '../src/digest/summary.js'
-import { renderManual } from '../src/skill/manual.js'
+import { renderUnregisteredBlock } from '../src/anchor/offer.js'
+import { MANUAL } from '../src/skill/manual.js'
 
 // ─── One email, several agents ──────────────────────────────────────────────
 //
@@ -19,7 +19,7 @@ import { renderManual } from '../src/skill/manual.js'
 
 const homes: string[] = []
 const INVOKE = 'npx -y @agentchatme/example'
-const COPY = { invoke: INVOKE, label: 'Example', peerLabel: 'Other', peerInvoke: 'npx -y @agentchatme/other' }
+const COPY = { invoke: INVOKE, label: 'Example' }
 
 function fixture(): { home: string; commands: ReturnType<typeof createIdentityCommands> } {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'agentchat-email-policy-'))
@@ -130,70 +130,50 @@ describe('registration against a full email', () => {
   })
 })
 
-/** The offer is hand-wrapped prose; compare it with its line breaks folded. */
+/** The block is hand-wrapped prose; compare it with its line breaks folded. */
 const flat = (text: string): string => text.replace(/\s+/g, ' ')
 
 describe('the agent-facing copy states the policy', () => {
-  const texts = {
-    offer: flat(formatRegistrationOffer(COPY, 'off')),
-    block: flat(renderUnregisteredBlock(COPY)),
-    manual: renderManual(COPY),
-  }
+  const block = flat(renderUnregisteredBlock(COPY))
 
   it('nowhere claims one account per email, and never teaches the email-only recovery form', () => {
-    for (const [name, text] of Object.entries(texts)) {
+    for (const [name, text] of Object.entries({ block, manual: MANUAL })) {
       expect(text, name).not.toMatch(/one (account|agent) per email/i)
       expect(text, name).not.toMatch(/recover --email/)
     }
   })
 
   it('recovery is taught as handle plus email, asked one question at a time', () => {
-    for (const [name, text] of Object.entries({ offer: texts.offer, block: texts.block })) {
-      expect(text, name).toContain(`${INVOKE} recover --handle <handle> --email <email>`)
-      expect(text, name).toContain('What email did you use for this AgentChat account?')
-      expect(text, name).toMatch(/Which @handle is the account\?/)
-      expect(text, name).toContain('AgentChat sent a 6-digit recovery code to <email>')
-      const email = text.indexOf('What email did you use')
-      const handle = text.indexOf('Which @handle is the account')
-      const run = text.indexOf('recover --handle <handle> --email <email>')
-      const paste = text.indexOf('recovery code to <email>')
-      const code = text.indexOf('recover --code')
-      expect(email, name).toBeGreaterThanOrEqual(0)
-      expect(handle, name).toBeGreaterThan(email)
-      expect(run, name).toBeGreaterThan(handle)
-      expect(paste, name).toBeGreaterThan(run)
-      expect(code, name).toBeGreaterThan(paste)
-    }
+    expect(block).toContain(`${INVOKE} recover --handle <handle> --email <email>`)
+    expect(block).toContain('What email did you use for this AgentChat account?')
+    expect(block).toMatch(/Which @handle is the account\?/)
+    expect(block).toContain('AgentChat sent a 6-digit recovery code to <email>')
+    const email = block.indexOf('What email did you use')
+    const handle = block.indexOf('Which @handle is the account')
+    const run = block.indexOf('recover --handle <handle> --email <email>')
+    const paste = block.indexOf('recovery code to <email>')
+    const code = block.indexOf('recover --code')
+    expect(email).toBeGreaterThanOrEqual(0)
+    expect(handle).toBeGreaterThan(email)
+    expect(run).toBeGreaterThan(handle)
+    expect(paste).toBeGreaterThan(run)
+    expect(code).toBeGreaterThan(paste)
   })
 
-  it('the session-start offer says what to do when an email is at its cap, without hard-coding the cap', () => {
-    expect(texts.offer).toMatch(/One email can back several agents/)
-    expect(texts.offer).toMatch(/relay that message and ask only for a different email/)
-    expect(texts.offer).toMatch(/\+ alias/)
-    expect(texts.offer).not.toMatch(/\b10\b/)
-  })
-
-  it('the always-loaded anchor block stays lean: the recovery form and the one-line reason, nothing more', () => {
+  it('the always-loaded offer block stays lean: the recovery form and the one-line reason, nothing more', () => {
     // The block is re-read every session, so the cap guidance lives in the
-    // offer, the manual, and the CLI's own error — not here. Integrations
-    // assert an upper bound on this block's size.
-    expect(texts.block).toMatch(/One email can back several agents, so recovery needs both/)
-    expect(texts.block).not.toMatch(/\+ alias/)
+    // manual and the CLI's own error — not here. Integrations assert an upper
+    // bound on this block's size.
+    expect(block).toMatch(/One email can back several agents, so recovery needs both/)
+    expect(block).not.toMatch(/\+ alias/)
     expect(renderUnregisteredBlock(COPY).length).toBeLessThan(4000)
   })
 
-  it('the manual documents the policy, the error codes, and the recovery form', () => {
-    expect(texts.manual).toContain('## Accounts and email')
-    expect(texts.manual).toMatch(/Every agent registers and verifies separately/)
-    expect(texts.manual).toMatch(/currently 10 live agents and 30 registrations/)
-    expect(texts.manual).toMatch(/`\+` alias/)
-    expect(texts.manual).toContain('`EMAIL_LIMIT_REACHED`')
-    expect(texts.manual).toContain('`EMAIL_EXHAUSTED`')
-    expect(texts.manual).toContain('`HANDLE_REQUIRED`')
-    expect(texts.manual).toContain(`${INVOKE} recover --handle <handle> --email <email>`)
-  })
-
-  it('the offer still reads as instruction, not a runbook', () => {
-    expect(formatRegistrationOffer(COPY, 'off')).not.toMatch(/^\s*\d\.\s/m)
+  it('the bundled manual documents the policy, the error codes, and the recovery form', () => {
+    expect(MANUAL).toMatch(/One email can back several agents/)
+    expect(MANUAL).toContain('`EMAIL_LIMIT_REACHED`')
+    expect(MANUAL).toContain('`EMAIL_EXHAUSTED`')
+    expect(MANUAL).toContain('`HANDLE_REQUIRED`')
+    expect(MANUAL).toMatch(/Always send `handle`/)
   })
 })

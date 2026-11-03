@@ -1,3 +1,4 @@
+import * as crypto from 'node:crypto'
 import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
@@ -19,6 +20,23 @@ import { spawnCommand, spawnCommandSync } from '../util/spawn.js'
 // this module has no idea which coding agents exist, which is what keeps two
 // integrations' services from ever colliding on a name or clobbering each
 // other's unit file. Convention is `agentchatd-<integration>`.
+//
+// ONE LABEL PER IDENTITY HOME, and never touch a job that serves another one.
+// `launchctl` and `systemctl --user` address the USER's domain, not the
+// current HOME or config dir, while the unit file follows HOME and the
+// identity home follows CLAUDE_CONFIG_DIR / CODEX_HOME. With one global label
+// per integration, a relocated config (a sandbox, a second profile) reported
+// the machine's real service as its own, and `uninstall` there would have
+// `launchctl remove`d it (live-fire E5). So:
+//   * `serviceLabelFor` gives a relocated identity home its own label (a
+//     short stable hash suffix); the default home keeps the plain label, so
+//     existing installs keep working;
+//   * before stopping, replacing or removing a job, its definition (the unit
+//     file at this label's path, and the job the service manager has loaded
+//     under this label) is read, and the operation is refused unless its
+//     `--home` is this config's identity home;
+//   * `AGENTCHAT_SERVICE_DRY_RUN` keeps the service manager out entirely —
+//     not written, not stopped, not even queried for status.
 
 /**
  * Enough to ADDRESS an already-installed service. Removing one or reading its
@@ -27,9 +45,32 @@ import { spawnCommand, spawnCommandSync } from '../util/spawn.js'
  * no use for.
  */
 export interface ServiceRef {
-  /** Unit/service name, e.g. `agentchatd-codex`. Must be unique per integration. */
+  /** Unit/service name, e.g. `agentchatd-codex` — from `serviceLabelFor`, so unique per identity home. */
   label: string
   home: string
+  /**
+   * Labels this service replaces (e.g. the plain label a relocated home was
+   * installed under before labels were per home). On install and uninstall,
+   * a superseded service whose definition serves THIS home is removed; one
+   * serving another home is left alone.
+   */
+  supersedes?: readonly string[]
+}
+
+/**
+ * The service label for an identity home: `base` for the integration's
+ * default home (so existing installs keep their label), `base-<8 hex>` — a
+ * stable hash of the resolved path — for any other. Two configs of one
+ * integration on one machine then never share a launchd/systemd job.
+ */
+export function serviceLabelFor(base: string, home: string, defaultHome: string): string {
+  const key = (p: string): string => {
+    const resolved = path.resolve(p)
+    return process.platform === 'win32' ? resolved.toLowerCase() : resolved
+  }
+  if (key(home) === key(defaultHome)) return serviceLabel(base)
+  const digest = crypto.createHash('sha256').update(key(home)).digest('hex').slice(0, 8)
+  return serviceLabel(`${base}-${digest}`)
 }
 
 export interface ServiceOpts extends ServiceRef {
@@ -155,7 +196,9 @@ function plan(opts: ServiceOpts): Plan {
   }
 }
 
-function run(cmd: string, args: string[]): { ok: boolean; out: string } {
+export type ServiceCommandRunner = (cmd: string, args: string[]) => { ok: boolean; out: string }
+
+function runReal(cmd: string, args: string[]): { ok: boolean; out: string } {
   const r = spawnCommandSync(cmd, args, { encoding: 'utf-8' })
   const out = [
     typeof r.stdout === 'string' ? r.stdout : '',
@@ -169,6 +212,21 @@ function run(cmd: string, args: string[]): { ok: boolean; out: string } {
     ok: !r.error && r.status === 0,
     out,
   }
+}
+
+let commandRunner: ServiceCommandRunner = runReal
+
+/**
+ * Tests only: answer `launchctl` / `systemctl` / `loginctl` with a fake, so a
+ * test can exercise the ownership guard without reaching the real service
+ * manager. `null` restores the real one.
+ */
+export function setServiceCommandRunnerForTests(runner: ServiceCommandRunner | null): void {
+  commandRunner = runner ?? runReal
+}
+
+function run(cmd: string, args: string[]): { ok: boolean; out: string } {
+  return commandRunner(cmd, args)
 }
 
 /**
@@ -186,6 +244,216 @@ function run(cmd: string, args: string[]): { ok: boolean; out: string } {
 function registrationSkipped(): boolean {
   const v = process.env['AGENTCHAT_SERVICE_DRY_RUN']
   return v !== undefined && v !== '' && v !== '0'
+}
+
+// ─── which identity home a service serves ────────────────────────────────────
+
+/** The argument after `--home` in an argument list, or null. */
+function homeFromArgs(args: readonly string[]): string | null {
+  const i = args.indexOf('--home')
+  const next = i >= 0 ? args[i + 1] : undefined
+  return next !== undefined && next.length > 0 ? next : null
+}
+
+function xmlUnescape(value: string): string {
+  return value
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, '&')
+}
+
+/** Split a systemd command line into words, undoing `systemdQuote`. */
+function systemdWords(line: string): string[] {
+  const words: string[] = []
+  let i = 0
+  while (i < line.length) {
+    while (i < line.length && /\s/.test(line[i]!)) i += 1
+    if (i >= line.length) break
+    let word = ''
+    if (line[i] === '"') {
+      i += 1
+      while (i < line.length && line[i] !== '"') {
+        if (line[i] === '\\' && i + 1 < line.length) {
+          const c = line[i + 1]!
+          word += c === 'n' ? '\n' : c === 'r' ? '\r' : c === 't' ? '\t' : c
+          i += 2
+        } else {
+          word += line[i]
+          i += 1
+        }
+      }
+      i += 1 // closing quote
+    } else {
+      while (i < line.length && !/\s/.test(line[i]!)) {
+        word += line[i]
+        i += 1
+      }
+    }
+    words.push(word.replace(/\$\$/g, '$').replace(/%%/g, '%'))
+  }
+  return words
+}
+
+/**
+ * The identity home a service definition serves: the `--home` argument of
+ * its command. `plist` — a launchd plist (ProgramArguments); `launchctl` —
+ * `launchctl print` or `launchctl list <label>` output (one argument per
+ * line); `systemd` — a unit file (ExecStart). Null when there is none.
+ */
+export function parseServiceHome(text: string, format: 'plist' | 'launchctl' | 'systemd'): string | null {
+  if (format === 'plist') {
+    const array = /<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/.exec(text)?.[1]
+    if (array === undefined) return null
+    const args = [...array.matchAll(/<string>([\s\S]*?)<\/string>/g)].map((m) => xmlUnescape(m[1] ?? ''))
+    return homeFromArgs(args)
+  }
+  if (format === 'launchctl') {
+    const args = text
+      .split(/\r?\n/)
+      .map((l) => l.trim().replace(/;$/, '').replace(/^"(.*)"$/, '$1'))
+    return homeFromArgs(args)
+  }
+  const exec = text.split(/\r?\n/).find((l) => l.startsWith('ExecStart='))
+  return exec === undefined ? null : homeFromArgs(systemdWords(exec.slice('ExecStart='.length)))
+}
+
+function canonicalPath(p: string): string {
+  const resolved = path.resolve(p)
+  try {
+    return fs.realpathSync(resolved)
+  } catch {
+    return resolved
+  }
+}
+
+function sameHome(a: string, b: string): boolean {
+  const x = canonicalPath(a)
+  const y = canonicalPath(b)
+  return process.platform === 'win32' ? x.toLowerCase() === y.toLowerCase() : x === y
+}
+
+/** One place a service under a label is defined: the file at its path, or the job the manager has loaded. */
+interface ServiceSighting {
+  /** Human description, for messages. */
+  where: string
+  /** The `--home` it serves; null when it could not be read. */
+  home: string | null
+  /** A loaded job (as opposed to a file on disk). */
+  loaded: boolean
+}
+
+function launchdSightings(label: string): ServiceSighting[] {
+  const out: ServiceSighting[] = []
+  const plistPath = launchdPlistPath(label)
+  if (fs.existsSync(plistPath)) {
+    let text = ''
+    try {
+      text = fs.readFileSync(plistPath, 'utf-8')
+    } catch {
+      /* unreadable: treated as unknown below */
+    }
+    out.push({ where: plistPath, home: parseServiceHome(text, 'plist'), loaded: false })
+  }
+  if (!registrationSkipped()) {
+    const fullLabel = launchdLabel(label)
+    const uid = typeof process.getuid === 'function' ? process.getuid() : os.userInfo().uid
+    const printed = run('launchctl', ['print', `gui/${uid}/${fullLabel}`])
+    const listed = printed.ok ? null : run('launchctl', ['list', fullLabel])
+    if (printed.ok || listed?.ok === true) {
+      const text = printed.ok ? printed.out : (listed?.out ?? '')
+      let home = parseServiceHome(text, 'launchctl')
+      if (home === null) {
+        // Fall back to the plist the job was loaded from (`path = …`).
+        const loadedFrom = /^\s*path = (.+)$/m.exec(text)?.[1]?.trim()
+        if (loadedFrom !== undefined) {
+          try {
+            home = parseServiceHome(fs.readFileSync(loadedFrom, 'utf-8'), 'plist')
+          } catch {
+            /* stays unknown */
+          }
+        }
+      }
+      out.push({ where: `the loaded launchd job ${fullLabel}`, home, loaded: true })
+    }
+  }
+  return out
+}
+
+function systemdSightings(label: string): ServiceSighting[] {
+  const out: ServiceSighting[] = []
+  const unitPath = systemdUnitPath(label)
+  if (fs.existsSync(unitPath)) {
+    let text = ''
+    try {
+      text = fs.readFileSync(unitPath, 'utf-8')
+    } catch {
+      /* unknown */
+    }
+    out.push({ where: unitPath, home: parseServiceHome(text, 'systemd'), loaded: false })
+  }
+  if (!registrationSkipped()) {
+    const shown = run('systemctl', ['--user', 'show', label, '-p', 'LoadState', '-p', 'FragmentPath'])
+    if (shown.ok) {
+      const props = new Map(
+        shown.out.split(/\r?\n/).map((l) => {
+          const eq = l.indexOf('=')
+          return [eq < 0 ? l : l.slice(0, eq), eq < 0 ? '' : l.slice(eq + 1)] as const
+        }),
+      )
+      if (props.get('LoadState') === 'loaded') {
+        const fragment = props.get('FragmentPath') ?? ''
+        let home: string | null = null
+        try {
+          if (fragment) home = parseServiceHome(fs.readFileSync(fragment, 'utf-8'), 'systemd')
+        } catch {
+          /* unknown */
+        }
+        out.push({ where: `the loaded systemd unit ${label}${fragment ? ` (${fragment})` : ''}`, home, loaded: true })
+      }
+    }
+  }
+  return out
+}
+
+function sightings(label: string): ServiceSighting[] {
+  if (winMode()) return [] // see assertServesHome
+  if (process.platform === 'linux') return systemdSightings(label)
+  if (process.platform === 'darwin') return launchdSightings(label)
+  return []
+}
+
+/**
+ * Refuse to `action` (stop, replace, remove) the service under `label` unless
+ * everything defined under it serves `home`. A loaded job whose home cannot be
+ * read is refused too: under the plain label that is exactly the job another
+ * config (another HOME, the default config dir) installed. A definition FILE
+ * at this label's own path with no readable `--home` is not ours to protect —
+ * install overwrites it and uninstall removes it.
+ *
+ * Windows Startup launchers are keyed by HOME and label together, so the
+ * files under one label can only belong to one identity home; no read there.
+ */
+function assertServesHome(label: string, home: string, action: string): void {
+  for (const s of sightings(label)) {
+    if (s.home === null) {
+      if (!s.loaded) continue
+      throw new Error(
+        `refusing to ${action} ${s.where}: it is loaded under this config's label but which identity home it serves could not be read. If it is yours, remove it by hand (launchctl remove / systemctl --user disable --now) and retry.`,
+      )
+    }
+    if (!sameHome(s.home, home)) {
+      throw new Error(
+        `refusing to ${action} ${s.where}: it serves ${s.home}, not this config's identity home ${home}. It belongs to another configuration of this integration (another HOME or config directory) — run the command from that configuration. In a sandbox, set AGENTCHAT_SERVICE_DRY_RUN=1.`,
+      )
+    }
+  }
+}
+
+/** Does anything under `label` serve `home`? (For retiring a superseded label.) */
+function servesHome(label: string, home: string): boolean {
+  return sightings(label).some((s) => s.home !== null && sameHome(s.home, home))
 }
 
 // ─── systemd (Linux) ─────────────────────────────────────────────────────────
@@ -236,6 +504,7 @@ export function systemdUnit(p: Plan): string {
 }
 
 function installSystemd(p: Plan): void {
+  assertServesHome(p.label, p.home, 'replace')
   const unitPath = systemdUnitPath(p.label)
   fs.mkdirSync(path.dirname(unitPath), { recursive: true })
   atomicWriteFile(unitPath, systemdUnit(p), 0o600)
@@ -252,7 +521,8 @@ function installSystemd(p: Plan): void {
   log.info(`service ${p.label} enabled + started`)
 }
 
-function uninstallSystemd(label: string): void {
+function uninstallSystemd(label: string, home: string): void {
+  assertServesHome(label, home, 'remove')
   if (!registrationSkipped()) {
     const disabled = run('systemctl', ['--user', 'disable', '--now', label])
     if (!disabled.ok) {
@@ -277,10 +547,23 @@ function uninstallSystemd(label: string): void {
   log.info(`service ${label} removed`)
 }
 
-function statusSystemd(label: string): string {
+function statusSystemd(label: string, home: string): string {
+  if (registrationSkipped()) return dryRunStatus(`systemd ${label}`, systemdUnitPath(label))
   const active = run('systemctl', ['--user', 'is-active', label]).out || 'unknown'
   const enabled = run('systemctl', ['--user', 'is-enabled', label]).out || 'unknown'
-  return `systemd ${label}: ${active} (${enabled})`
+  return `systemd ${label}: ${active} (${enabled})${foreignNote(label, home)}`
+}
+
+/** Status under AGENTCHAT_SERVICE_DRY_RUN: the service manager is not consulted at all. */
+function dryRunStatus(name: string, definitionPath: string): string {
+  return `${name}: not queried (AGENTCHAT_SERVICE_DRY_RUN) — definition ${fs.existsSync(definitionPath) ? `written at ${definitionPath}` : 'not written'}`
+}
+
+/** `, but it serves <other home> …` when the loaded job under this label is another config's. */
+function foreignNote(label: string, home: string): string {
+  const loaded = sightings(label).find((s) => s.loaded)
+  if (loaded === undefined || loaded.home === null || sameHome(loaded.home, home)) return ''
+  return ` — but it serves ${loaded.home}, not this config (${home})`
 }
 
 // ─── launchd (macOS) ─────────────────────────────────────────────────────────
@@ -317,6 +600,12 @@ export function launchdPlist(p: Plan): string {
     ...(envXml ? ['  <key>EnvironmentVariables</key><dict>', envXml, '  </dict>'] : []),
     '  <key>RunAtLoad</key><true/>',
     '  <key>KeepAlive</key><true/>',
+    // On `launchctl unload`/`stop` launchd sends SIGTERM and SIGKILLs after
+    // this many seconds. The daemon uses the window to SIGTERM a headless run
+    // in flight and wait up to 10 s for it (run.ts SHUTDOWN_GRACE_MS), so the
+    // value is above that and below launchd's 20 s default, which would let a
+    // slow stop look like a hang.
+    '  <key>ExitTimeOut</key><integer>15</integer>',
     `  <key>StandardErrorPath</key><string>${xmlEscape(logPath)}</string>`,
     `  <key>StandardOutPath</key><string>${xmlEscape(logPath)}</string>`,
     '</dict></plist>',
@@ -325,6 +614,9 @@ export function launchdPlist(p: Plan): string {
 }
 
 function installLaunchd(p: Plan): void {
+  // `launchctl unload <plist>` below unloads by the plist's Label — whatever
+  // job holds that label, whichever HOME it was installed from.
+  assertServesHome(p.label, p.home, 'replace')
   const plistPath = launchdPlistPath(p.label)
   fs.mkdirSync(path.dirname(plistPath), { recursive: true })
   atomicWriteFile(plistPath, launchdPlist(p), 0o600)
@@ -336,7 +628,8 @@ function installLaunchd(p: Plan): void {
   log.info(`service ${launchdLabel(p.label)} loaded + started`)
 }
 
-function uninstallLaunchd(label: string): void {
+function uninstallLaunchd(label: string, home: string): void {
+  assertServesHome(label, home, 'remove')
   const plistPath = launchdPlistPath(label)
   if (!registrationSkipped()) {
     run('launchctl', ['unload', '-w', plistPath])
@@ -363,12 +656,13 @@ function uninstallLaunchd(label: string): void {
   log.info(`service ${launchdLabel(label)} removed`)
 }
 
-function statusLaunchd(label: string): string {
+function statusLaunchd(label: string, home: string): string {
   const fullLabel = launchdLabel(label)
+  if (registrationSkipped()) return dryRunStatus(`launchd ${fullLabel}`, launchdPlistPath(label))
   const uid = typeof process.getuid === 'function' ? process.getuid() : os.userInfo().uid
   const modern = run('launchctl', ['print', `gui/${uid}/${fullLabel}`])
   const loaded = modern.ok || run('launchctl', ['list', fullLabel]).ok
-  return `launchd ${fullLabel}: ${loaded ? 'loaded' : 'not loaded'}`
+  return `launchd ${fullLabel}: ${loaded ? `loaded${foreignNote(label, home)}` : 'not loaded'}`
 }
 
 // ─── Windows + WSL (Startup-folder launcher, no admin) ───────────────────────
@@ -545,9 +839,25 @@ function statusWindows(label: string, mode: WinMode): string {
 
 // ─── platform dispatch ───────────────────────────────────────────────────────
 
+/**
+ * Remove each superseded service that serves this home (a relocated home
+ * installed under the plain label before labels were per home); leave one
+ * serving another home alone.
+ */
+function retireSuperseded(opts: ServiceRef, label: string): void {
+  for (const raw of opts.supersedes ?? []) {
+    const old = serviceLabel(raw)
+    if (old === label || winMode() || !servesHome(old, opts.home)) continue
+    log.info(`retiring the service ${old}: this identity home is now served by ${label}`)
+    if (process.platform === 'linux') uninstallSystemd(old, opts.home)
+    else if (process.platform === 'darwin') uninstallLaunchd(old, opts.home)
+  }
+}
+
 export function installService(opts: ServiceOpts): void {
   const p = plan(opts)
   if (!p.bin) throw new Error('no daemon entrypoint given (ServiceOpts.entry)')
+  retireSuperseded(opts, p.label)
   const wm = winMode()
   if (wm) return installWindows(p, wm)
   if (process.platform === 'linux') return installSystemd(p) // native Linux (not WSL)
@@ -557,19 +867,29 @@ export function installService(opts: ServiceOpts): void {
 
 export function uninstallService(opts: ServiceRef): void {
   const label = serviceLabel(opts.label)
+  const home = path.resolve(opts.home)
   const wm = winMode()
   if (wm) return uninstallWindows(label, wm)
-  if (process.platform === 'linux') return uninstallSystemd(label)
-  if (process.platform === 'darwin') return uninstallLaunchd(label)
+  if (process.platform === 'linux') {
+    uninstallSystemd(label, home)
+    retireSuperseded({ ...opts, home }, label)
+    return
+  }
+  if (process.platform === 'darwin') {
+    uninstallLaunchd(label, home)
+    retireSuperseded({ ...opts, home }, label)
+    return
+  }
   throw new Error(`service uninstall is not supported on ${process.platform}`)
 }
 
 export function serviceStatus(opts: ServiceRef): string {
   const label = serviceLabel(opts.label)
+  const home = path.resolve(opts.home)
   const wm = winMode()
   if (wm) return statusWindows(label, wm)
-  if (process.platform === 'linux') return statusSystemd(label)
-  if (process.platform === 'darwin') return statusLaunchd(label)
+  if (process.platform === 'linux') return statusSystemd(label, home)
+  if (process.platform === 'darwin') return statusLaunchd(label, home)
   return `service management not supported on ${process.platform}`
 }
 
@@ -637,12 +957,14 @@ export function disableService(opts: ServiceOpts): void {
   if (wm) {
     disableWindows(label, wm) // drop the Startup copy, keep the master
   } else if (process.platform === 'linux') {
+    assertServesHome(label, path.resolve(opts.home), 'stop')
     // Stops it AND removes the start-on-boot link; the unit file stays.
     if (!registrationSkipped()) {
       const disabled = run('systemctl', ['--user', 'disable', '--now', label])
       if (!disabled.ok) throw new Error(`could not disable ${label}: ${disabled.out}`)
     }
   } else if (process.platform === 'darwin') {
+    assertServesHome(label, path.resolve(opts.home), 'stop')
     if (!registrationSkipped()) {
       const disabled = run('launchctl', ['unload', launchdPlistPath(label)])
       if (!disabled.ok) throw new Error(`could not disable ${label}: ${disabled.out}`)

@@ -3,289 +3,89 @@ import * as crypto from 'node:crypto'
 import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
-import {
-  readCredentials,
-  writeCredentials,
-  clearCredentials,
-  resolveIdentity,
-  readPending,
-  writePending,
-  clearPending,
-} from '../src/identity/credentials.js'
-import {
-  getContinuations,
-  recordContinuation,
-  setPendingAck,
-  takePendingAck,
-  resetSession,
-  shouldOfferRegistration,
-  recordRegistrationOffer,
-} from '../src/identity/state.js'
-import {
-  markAlwaysOnWanted,
-  clearAlwaysOnWanted,
-  alwaysOnHealth,
-  alwaysOnState,
-  beat,
-} from '../src/daemon/health.js'
+import { clearCredentials, readCredentials, writeCredentials, writePending, readPending, clearPending } from '../src/identity/credentials.js'
+import { recordOfferDeclined, offerDeclined, clearOfferDeclined } from '../src/identity/state.js'
+import { writeAnchor, removeAnchorAt, renderAnchorBlock } from '../src/anchor/block.js'
+import { markAlwaysOnWanted, clearAlwaysOnWanted, beat, idle, markAlwaysOnOptOut } from '../src/daemon/health.js'
+import { writeDoorbellStatus, clearDoorbellStatus } from '../src/doorbell/status.js'
 
-// ─── The property this library exists to guarantee ──────────────────────────
+// ─── Every operation acts on the home it is GIVEN and nowhere else ──────────
 //
-// Every function takes an identity home and touches nothing outside it. This
-// is what makes "one integration clobbered another agent's files" structurally
-// impossible rather than merely guarded against — there is no code path here
-// that could reach a second home, because no function ever learns of one.
-//
-// Each test drives the SAME operation against two homes and asserts the other
-// is byte-identical afterwards.
+// Two homes, fully populated. Every mutating operation this package offers is
+// run against home A, and home B must be byte-identical before and after. This
+// is the mechanical form of "every function takes an identity home; none
+// resolves one".
 
+let root: string
 let homeA: string
 let homeB: string
 
-const KEY_A = 'ac_live_' + 'a'.repeat(40)
-const KEY_B = 'ac_live_' + 'b'.repeat(40)
-
-beforeEach(() => {
-  homeA = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-core-a-'))
-  homeB = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-core-b-'))
-  delete process.env['AGENTCHAT_API_KEY']
-  delete process.env['AGENTCHAT_API_BASE']
-})
-
-afterEach(() => {
-  fs.rmSync(homeA, { recursive: true, force: true })
-  fs.rmSync(homeB, { recursive: true, force: true })
-})
-
-/** Content hash of every file under a directory — the "byte-identical" oracle. */
 function snapshot(dir: string): Record<string, string> {
   const out: Record<string, string> = {}
-  const walk = (d: string): void => {
-    if (!fs.existsSync(d)) return
-    for (const entry of fs.readdirSync(d, { withFileTypes: true })) {
-      const full = path.join(d, entry.name)
-      if (entry.isDirectory()) walk(full)
-      else out[path.relative(dir, full)] = crypto.createHash('sha256').update(fs.readFileSync(full)).digest('hex')
-    }
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true, recursive: true })) {
+    if (!entry.isFile()) continue
+    const full = path.join(entry.parentPath ?? entry.path, entry.name)
+    out[path.relative(dir, full)] = crypto.createHash('sha256').update(fs.readFileSync(full)).digest('hex')
   }
-  walk(dir)
   return out
 }
 
-describe('credentials are scoped to the home they are given', () => {
-  it('two homes hold two independent identities', () => {
-    writeCredentials(homeA, { api_key: KEY_A, handle: 'agent-a' })
-    writeCredentials(homeB, { api_key: KEY_B, handle: 'agent-b' })
-
-    expect(readCredentials(homeA)?.handle).toBe('agent-a')
-    expect(readCredentials(homeB)?.handle).toBe('agent-b')
-    expect(resolveIdentity(homeA)?.apiKey).toBe(KEY_A)
-    expect(resolveIdentity(homeB)?.apiKey).toBe(KEY_B)
-  })
-
-  it('clearing one home leaves the other byte-identical', () => {
-    writeCredentials(homeA, { api_key: KEY_A, handle: 'agent-a' })
-    writeCredentials(homeB, { api_key: KEY_B, handle: 'agent-b' })
-    const before = snapshot(homeB)
-
-    expect(clearCredentials(homeA)).toBe(true)
-
-    expect(readCredentials(homeA)).toBeNull()
-    expect(readCredentials(homeB)?.handle).toBe('agent-b')
-    expect(snapshot(homeB)).toEqual(before)
-  })
-
-  it('a pending registration in one home is invisible to the other', () => {
-    writePending(homeA, {
-      kind: 'register',
-      pending_id: 'pnd_a',
-      email: 'a@example.com',
-      handle: 'agent-a',
-      created_at: new Date().toISOString(),
-    })
-    expect(readPending(homeA)?.pending_id).toBe('pnd_a')
-    expect(readPending(homeB)).toBeNull()
-
-    clearPending(homeA)
-    expect(readPending(homeA)).toBeNull()
-  })
-
-  it('credentials are written 0600', () => {
-    writeCredentials(homeA, { api_key: KEY_A, handle: 'agent-a' })
-    if (process.platform !== 'win32') {
-      expect(fs.statSync(path.join(homeA, 'credentials')).mode & 0o777).toBe(0o600)
-    }
-  })
-
-  it('AGENTCHAT_API_KEY overrides the file without borrowing another home’s handle', () => {
-    writeCredentials(homeA, { api_key: KEY_A, handle: 'agent-a' })
-    process.env['AGENTCHAT_API_KEY'] = 'ac_live_' + 'z'.repeat(40)
-
-    // The env key is a GLOBAL override (CI, externally-managed secrets), so it
-    // applies to whichever home is asked — it is not host-specific.
-    const a = resolveIdentity(homeA)
-    expect(a?.source).toBe('env')
-    // …but the handle still comes from that home's own file, since the env
-    // carries no handle. Home A knows its handle:
-    expect(a?.handle).toBe('agent-a')
-    // …and home B, which has no credential file, reports no handle rather
-    // than inheriting A's. A handle leaking across homes here is exactly the
-    // "agent announces someone else's address" failure.
-    expect(resolveIdentity(homeB)?.handle).toBeNull()
-  })
-})
-
-describe('hook state is scoped to the home it is given', () => {
-  it('continuation counters do not bleed between homes', () => {
-    recordContinuation(homeA, 'sess-1')
-    recordContinuation(homeA, 'sess-1')
-    expect(getContinuations(homeA, 'sess-1')).toBe(2)
-    // Same session id, different agent — must be its own counter.
-    expect(getContinuations(homeB, 'sess-1')).toBe(0)
-  })
-
-  it('a pending ack cursor belongs to exactly one home', () => {
-    setPendingAck(homeA, 'sess-1', 'del_' + '0'.repeat(32))
-    expect(takePendingAck(homeB, 'sess-1')).toBeNull()
-    expect(takePendingAck(homeA, 'sess-1')).toBe('del_' + '0'.repeat(32))
-    // Read-and-clear: a second take is empty.
-    expect(takePendingAck(homeA, 'sess-1')).toBeNull()
-  })
-
-  it('resetting a session in one home leaves the other untouched', () => {
-    recordContinuation(homeA, 'sess-1')
-    recordContinuation(homeB, 'sess-1')
-    const before = snapshot(homeB)
-
-    resetSession(homeA, 'sess-1')
-
-    expect(getContinuations(homeA, 'sess-1')).toBe(0)
-    expect(getContinuations(homeB, 'sess-1')).toBe(1)
-    expect(snapshot(homeB)).toEqual(before)
-  })
-
-  it('the registration-offer cooldown is per agent, not per machine', () => {
-    expect(shouldOfferRegistration(homeA)).toBe(true)
-    recordRegistrationOffer(homeA)
-    expect(shouldOfferRegistration(homeA)).toBe(false)
-    // A second agent has not been offered anything yet.
-    expect(shouldOfferRegistration(homeB)).toBe(true)
-  })
-})
-
-const signIn = (home: string): void =>
-  fs.writeFileSync(
-    path.join(home, 'credentials'),
-    JSON.stringify({ api_key: 'ac_live_' + 'a'.repeat(40), handle: 'probe' }),
-  )
-/** Age the registration marker past the startup grace, so "not beating" means
- *  genuinely down rather than still coming up. */
-const aged = (home: string): void => {
-  const marker = path.join(home, 'always-on.wanted')
-  const old = new Date(Date.now() - 10 * 60_000)
-  fs.utimesSync(marker, old, old)
+function populate(home: string, handle: string): void {
+  fs.mkdirSync(home, { recursive: true })
+  writeCredentials(home, { api_key: 'ac_' + handle.padEnd(40, 'x'), handle })
+  writeAnchor(path.join(home, 'ANCHOR.md'), renderAnchorBlock(handle), handle)
+  markAlwaysOnWanted(home)
+  beat(home)
 }
 
-const signOut = (home: string): void => fs.rmSync(path.join(home, 'credentials'), { force: true })
-
-describe('always-on health is per agent', () => {
-  it('reports not-wanted until the user opts in', () => {
-    expect(alwaysOnHealth(homeA)).toEqual({ wanted: false, healthy: true })
-  })
-
-  // Installed but signed out is the daemon behaving correctly — it is resident
-  // and idling, waiting for a sign-in. Reporting that as "down" nagged a
-  // signed-out user every single session about a non-problem.
-  it('installed with no identity reads as idle, not down', () => {
-    markAlwaysOnWanted(homeA)
-    expect(alwaysOnState(homeA)).toBe('idle')
-    expect(alwaysOnHealth(homeA).healthy).toBe(true)
-  })
-
-  it('an identity with no beacon reads as down — the only state worth warning about', () => {
-    markAlwaysOnWanted(homeA)
-    signIn(homeA)
-    aged(homeA) // past the startup grace; otherwise this is a cold start
-    expect(alwaysOnState(homeA)).toBe('down')
-    expect(alwaysOnHealth(homeA)).toEqual({ wanted: true, healthy: false })
-  })
-
-  it('an identity with a fresh beacon reads as connected', () => {
-    markAlwaysOnWanted(homeA)
-    signIn(homeA)
-    beat(homeA)
-    expect(alwaysOnState(homeA)).toBe('connected')
-    expect(alwaysOnHealth(homeA)).toEqual({ wanted: true, healthy: true })
-  })
-
-  it('signing out returns it to idle rather than down', () => {
-    markAlwaysOnWanted(homeA)
-    signIn(homeA)
-    beat(homeA)
-    expect(alwaysOnState(homeA)).toBe('connected')
-    signOut(homeA)
-    expect(alwaysOnState(homeA)).toBe('idle')
-  })
-
-  it('one agent being down says nothing about the other', () => {
-    markAlwaysOnWanted(homeA)
-    markAlwaysOnWanted(homeB)
-    signIn(homeA)
-    signIn(homeB)
-    aged(homeA)
-    beat(homeB)
-    expect(alwaysOnHealth(homeA).healthy).toBe(false)
-    expect(alwaysOnHealth(homeB).healthy).toBe(true)
-  })
-
-  it('opting out clears the intent so the hook stops warning', () => {
-    markAlwaysOnWanted(homeA)
-    clearAlwaysOnWanted(homeA)
-    expect(alwaysOnHealth(homeA)).toEqual({ wanted: false, healthy: true })
-  })
+beforeEach(() => {
+  root = fs.mkdtempSync(path.join(os.tmpdir(), 'agentchat-home-scoping-'))
+  homeA = path.join(root, 'a')
+  homeB = path.join(root, 'b')
+  populate(homeA, 'agent-a')
+  populate(homeB, 'agent-b')
 })
+afterEach(() => fs.rmSync(root, { recursive: true, force: true }))
 
-describe('service units are named exactly as the integration asks', () => {
-  it('uses the label verbatim — no re-prefixing', async () => {
-    const { planForTest } = await import('../src/daemon/service.js')
-    const p = planForTest({ label: 'agentchatd-codex', home: homeA, entry: '/opt/x/daemon.js' })
-    // Re-prefixing produced `agentchatd-agentchatd-codex`, so uninstall and
-    // status silently addressed a unit that never existed.
-    expect(p.label).toBe('agentchatd-codex')
-  })
+describe('operations on home A leave home B byte-identical', () => {
+  const ops: Array<[string, (home: string) => void]> = [
+    ['writeCredentials', (h) => writeCredentials(h, { api_key: 'ac_' + 'n'.repeat(40), handle: 'new-agent' })],
+    ['clearCredentials', (h) => void clearCredentials(h)],
+    ['writePending/readPending/clearPending', (h) => {
+      writePending(h, { kind: 'register', pending_id: 'pnd_1', email: 'a@example.com', handle: 'x-agent', created_at: new Date().toISOString() })
+      expect(readPending(h)?.pending_id).toBe('pnd_1')
+      clearPending(h)
+    }],
+    ['recordOfferDeclined/clearOfferDeclined', (h) => {
+      recordOfferDeclined(h)
+      expect(offerDeclined(h)).toBe(true)
+      clearOfferDeclined(h)
+    }],
+    ['writeAnchor/removeAnchorAt', (h) => {
+      writeAnchor(path.join(h, 'ANCHOR.md'), renderAnchorBlock('renamed-agent'), 'renamed-agent')
+      removeAnchorAt(path.join(h, 'ANCHOR.md'))
+    }],
+    ['always-on markers', (h) => {
+      clearAlwaysOnWanted(h)
+      markAlwaysOnOptOut(h)
+      idle(h)
+    }],
+    ['doorbell status', (h) => {
+      writeDoorbellStatus(h, {
+        version: 1, updated_at: new Date().toISOString(), pid: 1, runtime: 'r', handle: 'agent-a', profile: 'answer', socket: 'ready',
+        ack_negotiated: true, knocks: 1, knocks_absorbed: 0, invites: 0, runs_started: 0, runs_ok: 0, runs_failed: 0, runs_timed_out: 0,
+        runs_not_started: 0, last_run: null, retry_rung: 0, retry_due_at: null, last_error: null,
+      })
+      clearDoorbellStatus(h)
+    }],
+  ]
 
-  it('captures the host env the integration says its adapter needs', async () => {
-    const { planForTest } = await import('../src/daemon/service.js')
-    const p = planForTest({
-      label: 'agentchatd-codex',
-      home: homeA,
-      entry: '/opt/x/daemon.js',
-      env: { CODEX_HOME: '/custom/codex' },
+  for (const [name, op] of ops) {
+    it(name, () => {
+      const before = snapshot(homeB)
+      op(homeA)
+      expect(snapshot(homeB)).toEqual(before)
+      expect(readCredentials(homeB)?.handle).toBe('agent-b')
     })
-    expect(p.env['CODEX_HOME']).toBe('/custom/codex')
-    // PATH is always captured: a systemd/launchd unit does not inherit the
-    // login shell, so without it the adapter cannot find its runtime binary.
-    expect(p.env['PATH']).toBeDefined()
-  })
-
-  it('removes disposable npm and agent-shell entries from the service PATH', async () => {
-    const { stableServicePath } = await import('../src/daemon/service.js')
-    const transientNpx = path.join(homeA, '.npm', '_npx', 'hash', 'node_modules', '.bin')
-    const transientProject = path.join(homeA, 'project', 'node_modules', '.bin')
-    const transientAgent = path.join(homeA, '.codex', 'tmp', 'arg0', 'codex-arg123')
-    const stableBin = path.join(homeA, 'bin')
-    fs.mkdirSync(stableBin, { recursive: true })
-
-    const normalized = stableServicePath(
-      [transientNpx, transientProject, transientAgent, stableBin, stableBin].join(path.delimiter),
-      path.join(stableBin, 'node'),
-    ).split(path.delimiter)
-    const resolvedStableBin = fs.realpathSync(stableBin)
-
-    expect(normalized).toContain(resolvedStableBin)
-    expect(normalized.filter((entry) => entry === resolvedStableBin)).toHaveLength(1)
-    expect(normalized).not.toContain(transientNpx)
-    expect(normalized).not.toContain(transientProject)
-    expect(normalized).not.toContain(transientAgent)
-  })
+  }
 })

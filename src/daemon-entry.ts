@@ -1,46 +1,43 @@
 // ─── @agentchatme/agent-core/daemon ─────────────────────────────────────────
 //
-// The always-on daemon's runtime half, kept OUT of the main entry on purpose.
+// The doorbell daemon's runtime half, kept OUT of the main entry on purpose.
 //
 // `ws` is CommonJS and uses dynamic require, so anything that bundles it must
 // be built as a daemon binary rather than a CLI. Splitting the entry points
-// means an integration's CLI never drags the socket layer in — it stayed a
+// means an integration's CLI never drags the socket layer in — it stays a
 // clean ESM single-file bin, and the failure mode ("Dynamic require of events
 // is not supported" at startup) simply cannot occur there.
 //
-// The runtime ADAPTER — how to spawn a headless turn of a given coding agent —
-// is deliberately NOT here. That is the one part of the daemon that genuinely
-// differs per host, so each integration implements `RuntimeAdapter` itself.
+// The RUNNER — how to start one headless run of a given coding agent — is
+// deliberately NOT here. That is the one part of the doorbell that genuinely
+// differs per host, so each integration implements `RunRunner` itself.
 
-export { AgentWsClient, type WsClientEvents } from './daemon/ws-client.js'
-export { ReplyCoord, type CoordConfig } from './daemon/coord.js'
-export { parseInbound, senderOf } from './daemon/frames.js'
+export { runDoorbell, type RunDoorbellOpts } from './doorbell/run.js'
+export { Doorbell, type DoorbellOptions } from './doorbell/doorbell.js'
 export {
-  buildAgentChatTurnPrompt,
-  describeConversation,
-  describeSender,
-} from './daemon/format.js'
+  DoorbellSocket,
+  type DoorbellSocketOptions,
+  type DoorbellSocketEvents,
+  type Knock,
+  type MessageKnock,
+  type InviteKnock,
+  type TerminalReason,
+} from './doorbell/socket.js'
 export {
-  parseAgentChatTurnOutcome,
-  resolveTurnDisposition,
-} from './daemon/outcome.js'
+  DoorbellInvoker,
+  RETRY_LADDER_MS,
+  PREFLIGHT_WATCH_MS,
+  type DoorbellInvokerOptions,
+  type InvokerCounters,
+} from './doorbell/invoker.js'
+export { KnockCoalescer, DEFAULT_KNOCK_DEBOUNCE_MS, type KnockCoalescerOptions } from './doorbell/knock.js'
+export { spawnRun, redactDiagnostic, type SpawnRunSpec } from './doorbell/spawn-run.js'
 export type {
-  RuntimeAdapter,
-  TurnContext,
-  TurnResult,
-  TurnBatchContext,
-  TurnMentionContext,
-  FullAutonomyTurnContext,
-  TurnDisposition,
-  PendingTurnRequest,
-  SilentReason,
-} from './daemon/adapter-types.js'
-export type { PendingReason } from './daemon/pending.js'
-export type { AutonomyMode } from './autonomy/policy.js'
-
-// The loop and its entrypoint. `runDaemon` is the whole surface a normal
-// integration needs — `Daemon` and `resolveDaemonConfig` are exported for
-// tests and for anything that wants to drive the loop itself.
-export { runDaemon, type RunDaemonOpts } from './daemon/run.js'
-export { Daemon } from './daemon/loop.js'
+  RunRunner,
+  RunRequest,
+  RunOutcome,
+  RunOutcomeState,
+  RunKind,
+  RunPreflight,
+} from './doorbell/runner.js'
 export { resolveDaemonConfig, wsUrlFor, type DaemonConfig, type ResolveDaemonOpts } from './daemon/config.js'

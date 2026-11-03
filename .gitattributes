@@ -1,0 +1,8 @@
+# The bundled manual is compared byte for byte with its embedded copy; a CRLF
+# checkout (Windows autocrlf) must not change what is embedded or compared.
+*.md text eol=lf
+*.ts text eol=lf
+*.mjs text eol=lf
+*.json text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf

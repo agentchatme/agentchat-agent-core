@@ -1,3 +1,5 @@
+import type { ResolvedIdentity } from './credentials.js'
+
 export type Verdict = 'PASS' | 'WARN' | 'FAIL'
 
 export interface DoctorCheck {
@@ -34,7 +36,7 @@ export interface HostProfile {
   anchorFile(): string
   /** Exactly what a user types to reach this integration. */
   invocation(): string
-  /** Render the anchor block body this host wants. */
+  /** Render the anchor block body this host wants (normally the identity block). */
   renderAnchor(handle: string): string
   /**
    * What to call the anchor in output. Defaults to the instruction file's own
@@ -45,10 +47,30 @@ export interface HostProfile {
   /**
    * Whether this host is wired up enough for an anchor to mean anything.
    * An integration uses this so it never writes an identity block announcing
-   * a phone number before its own MCP, hooks, and durable bundle are actually
-   * in place.
+   * a phone number before its own placement is actually in place.
    */
   isWired?(): boolean
+  /**
+   * Place the doorbell's four texts for a freshly established identity: the
+   * identity line, the manual, the hosted tool server with the key, and
+   * whatever the key's home is on this runtime. Called after register, login
+   * and recover (every time the key changes), and by `doctor --fix`. Returns
+   * report lines for the user. When absent, only the anchor is written.
+   */
+  place?(handle: string, apiKey: string): string[]
+  /**
+   * Undo `place` for the identity being signed out: remove the key from the
+   * tool server registration and anything else that would still authenticate
+   * as the old identity. The anchor is removed by the shared flow. Returns
+   * report lines.
+   *
+   * `identity` is the identity AS IT WAS BEFORE the credential was cleared
+   * (its key and API base), or null when there was none: a host recognises
+   * its own registration by that key and that server, and guessing either
+   * after the fact left a non-default `api_base` entry classified as foreign
+   * and the key still registered.
+   */
+  unplace?(identity: ResolvedIdentity | null): string[]
   /** Host-specific doctor checks, appended after the shared ones. */
   extraDoctorChecks?(opts: { fix?: boolean }): DoctorCheck[]
   /** Extra lines printed after a successful logout. */

@@ -13,23 +13,11 @@ import {
 } from './credentials.js'
 import { clearOfferDeclined } from './state.js'
 import { startRecovery } from './recover-request.js'
-import { writeAnchor, removeAnchorAt, readAnchorHandleAt, hasAnchorAt } from '../anchor/block.js'
-import { syncPeek } from '../wire/index.js'
+import { writeAnchor, removeAnchorAt, readAnchorHandleAt, hasAnchorAt, anchorIsCurrentAt } from '../anchor/block.js'
+import { traySummary } from '../wire/index.js'
 import { anchorLabelOf, type DoctorCheck, type HostProfile, type Verdict } from './host-profile.js'
 import { CODING_AGENTS_CLIENT_IDENTITY } from '../client-identity.js'
-import {
-  allowFullAutonomyAgent,
-  normalizeAgentHandle,
-  readFullAutonomyPolicy,
-  removeFullAutonomyAgent,
-  setFullAutonomyMode,
-  type FullAutonomyPolicy,
-} from '../autonomy/policy.js'
-import {
-  getPendingRequest,
-  listPendingRequests,
-  resolvePendingRequest,
-} from '../daemon/pending.js'
+import { formatDoorbellStatus, readDoorbellStatus } from '../doorbell/status.js'
 
 // ─── Identity commands, for exactly one agent ───────────────────────────────
 //
@@ -42,12 +30,12 @@ import {
 // machine, the error vocabulary, what a credential file holds — so they are
 // shared rather than reimplemented per host. They lived in each integration
 // once, and within a week the two copies were 94% identical and had already
-// drifted: the Claude Code copy reported `"host": "codex"` in `status --json`,
-// because that is what copy-paste does to code nobody diffs.
+// drifted.
 //
 // Every function acts on `profile.home()` — the caller's own agent. There is no
 // host argument to get wrong, and no branch that could reach another agent's
-// files.
+// files. Every time the key changes (register, login, recover) the profile's
+// `place` runs, so the hosted tool server always carries the current key.
 
 // Canonical handle rule, mirrored from the server so obviously-bad input fails
 // locally with a helpful message instead of a round-trip.
@@ -60,12 +48,9 @@ function validHandle(handle: string): boolean {
 /**
  * Ask one question on the TTY.
  *
- * Deliberately the classic `node:readline`, not `node:readline/promises`.
+ * Deliberately the classic `node:readline`, not `node:readline/promises`:
  * esbuild strips the `node:` prefix from builtin imports when it bundles this
- * package, and a bare `readline/promises` is not on its builtin list — so the
- * subpath version resolves fine here but fails every integration's build the
- * moment they inline the engine. A callback wrapped in a Promise costs four
- * lines and cannot break a downstream bundle.
+ * package, and a bare `readline/promises` is not on its builtin list.
  */
 async function prompt(question: string): Promise<string> {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout })
@@ -75,6 +60,16 @@ async function prompt(question: string): Promise<string> {
   } finally {
     rl.close()
   }
+}
+
+/**
+ * All of stdin, trimmed — for `login --api-key -`, so a key can be piped in
+ * instead of typed into argv (where `ps` and shell history keep it).
+ */
+async function readAllStdin(): Promise<string> {
+  const chunks: Buffer[] = []
+  for await (const chunk of process.stdin) chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : (chunk as Buffer))
+  return Buffer.concat(chunks).toString('utf-8').trim()
 }
 
 interface ApiErrorLike {
@@ -95,6 +90,12 @@ function handlesOf(e: ApiErrorLike): string[] {
   return Array.isArray(handles) ? handles.filter((h): h is string => typeof h === 'string') : []
 }
 
+/** The HTTP status an SDK error carries (`AgentChatError.status`), or null for a transport failure. */
+function httpStatusOf(err: unknown): number | null {
+  const status = (err as { status?: unknown } | null)?.status
+  return typeof status === 'number' && Number.isFinite(status) && status > 0 ? status : null
+}
+
 function recoverUsage(invocation: string): string {
   return `${invocation} recover --handle <handle> --email <email>`
 }
@@ -109,8 +110,7 @@ function describeApiError(err: unknown, invocation: string): string {
     // An email backs a bounded number of live agents, and the bound is a
     // server-side setting — so the number is always the one the server just
     // reported, never a constant here. `EMAIL_TAKEN` is what a not-yet-upgraded
-    // server says in the same situation (its bound was one); it means the same
-    // thing and gets the same advice.
+    // server says in the same situation (its bound was one).
     case 'EMAIL_LIMIT_REACHED':
     case 'EMAIL_TAKEN': {
       const limit = limitOf(e)
@@ -128,10 +128,6 @@ function describeApiError(err: unknown, invocation: string): string {
           : message
       return `${lead} Register with a different email (a + alias such as you+agent@example.com counts as a different email).`
     }
-    // Only /recover/verify says this, and only when recovery was started
-    // without a handle for an email that backs several agents. This client
-    // always sends the handle, so reaching here means an older client or a
-    // hand-made request started the flow — still, say exactly what to do.
     case 'HANDLE_REQUIRED': {
       const handles = handlesOf(e)
       const listed = handles.length > 0 ? ` Agents on this email: ${handles.map((h) => `@${h}`).join(', ')}.` : ''
@@ -148,8 +144,8 @@ function describeApiError(err: unknown, invocation: string): string {
   }
 }
 
-const RESTART_HINT =
-  'Your messaging tools pick this up immediately — no restart needed. (If a send still says NOT_REGISTERED, you’re on an older MCP; start a fresh session once to refresh it.)'
+const NEXT_HINT =
+  'Open a new session for the hosted AgentChat tools to pick up the key; the doorbell daemon follows the credential on its own.'
 
 export interface RegisterOpts {
   email?: string
@@ -178,26 +174,11 @@ export interface DoctorOpts {
   fix?: boolean
 }
 
-export interface AutonomyCommandOpts {
-  action?: string
-  handle?: string
-  yes?: boolean
-  json?: boolean
-}
-
-export interface PendingCommandOpts {
-  action?: string
-  id?: string
-  json?: boolean
-}
-
 export interface IdentityCommands {
   runRegister(opts: RegisterOpts): Promise<number>
   runLogin(opts: { apiKey?: string; apiBase?: string }): Promise<number>
   runRecover(opts: RecoverOpts): Promise<number>
   runStatus(opts: { json?: boolean }): Promise<number>
-  runAutonomy(opts: AutonomyCommandOpts): Promise<number>
-  runPendingRequests(opts: PendingCommandOpts): Promise<number>
   runLogout(): number
   runDoctor(opts?: DoctorOpts): Promise<number>
 }
@@ -208,51 +189,20 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
   const apiErr = (err: unknown): string => describeApiError(err, invocation())
   const LABEL = profile.label
 
-  function localControlMutationAllowed(): boolean {
-    if (process.env['AGENTCHAT_EXECUTION'] !== 'always_on') return true
-    console.error(
-      'This setting can only be changed from a local foreground session or terminal, never from an unattended AgentChat request.',
-    )
-    return false
-  }
-
-  async function currentIdentity(): Promise<{
-    home: string
-    handle: string
-    client: AgentChatClient
-  } | null> {
-    const home = profile.home()
-    const identity = resolveIdentity(home)
-    if (identity === null) {
-      console.error(`No AgentChat account is connected for this ${LABEL} agent.`)
-      return null
+  /**
+   * Place the doorbell for THIS agent's new key: the identity line, the manual,
+   * the hosted tool server with the key. A profile without `place` gets the
+   * anchor alone (the identity line in its instruction file).
+   */
+  function placeIdentity(handle: string, apiKey: string): string[] {
+    if (profile.place !== undefined) {
+      try {
+        return profile.place(handle, apiKey)
+      } catch (err) {
+        return [`  placement FAILED — ${String(err)}; repair with \`${invocation()} doctor --fix\``]
+      }
     }
-    const client = new AgentChatClient({
-      apiKey: identity.apiKey,
-      baseUrl: identity.apiBase,
-      clientIdentity: CODING_AGENTS_CLIENT_IDENTITY,
-    })
-    if (identity.source === 'file' && identity.handle) {
-      return { home, handle: identity.handle, client }
-    }
-    try {
-      const me = await client.getMe()
-      return { home, handle: me.handle, client }
-    } catch (err) {
-      console.error(`Could not identify this AgentChat account: ${apiErr(err)}`)
-      return null
-    }
-  }
-
-  function autonomyDescription(policy: FullAutonomyPolicy): string {
-    switch (policy.mode) {
-      case 'off':
-        return 'off — unattended side-effecting work waits for local review'
-      case 'everyone':
-        return 'everyone who can reach this agent — existing inbox, block, pause, permission, and safety rules still apply'
-      case 'selected':
-        return `selected agents — ${policy.selected_agents.map((handle) => `@${handle}`).join(', ') || 'none'}`
-    }
+    return writeOurAnchor(handle)
   }
 
   /** Write THIS agent's anchor. Only ever touches `profile.anchorFile()`. */
@@ -320,11 +270,11 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
           [
             `Registered: @${pendingHandle} for ${LABEL}.`,
             `API key stored at ${credentialsPath(home)} (never commit this file).`,
-            ...writeOurAnchor(pendingHandle),
+            ...placeIdentity(pendingHandle, result.apiKey),
             '',
             `This handle belongs to your ${LABEL} agent. Another coding agent on this machine is a separate peer with its own handle — you can DM each other.`,
             `Other agents can DM you at @${pendingHandle}. Check \`${invocation()} status\` any time.`,
-            RESTART_HINT,
+            NEXT_HINT,
           ].join('\n'),
         )
         return 0
@@ -415,12 +365,24 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
     const apiBase = opts.apiBase ?? process.env['AGENTCHAT_API_BASE'] ?? DEFAULT_API_BASE
     let apiKey = opts.apiKey?.trim()
 
-    if (!apiKey) {
-      if (process.stdin.isTTY !== true) {
-        console.error(`Missing --api-key. Usage: ${invocation()} login --api-key ac_live_…`)
+    // Where the key comes from, most explicit first. `--api-key <key>` keeps
+    // working, but argv is visible in `ps` and kept in shell history, so a
+    // key can also be piped in (`--api-key -`) or passed in the environment.
+    if (apiKey === '-') {
+      apiKey = await readAllStdin()
+    } else if (!apiKey) {
+      const fromEnv = process.env['AGENTCHAT_API_KEY']?.trim()
+      if (fromEnv) {
+        apiKey = fromEnv
+        console.log('Using the key from AGENTCHAT_API_KEY.')
+      } else if (process.stdin.isTTY !== true) {
+        console.error(
+          `Missing API key. Pipe it in: printf %s "$KEY" | ${invocation()} login --api-key -   (or set AGENTCHAT_API_KEY, or pass --api-key ac_live_…, which \`ps\` and shell history can see)`,
+        )
         return 1
+      } else {
+        apiKey = await prompt('AgentChat API key (ac_…): ')
       }
-      apiKey = await prompt('AgentChat API key (ac_…): ')
     }
     if (apiKey.length < 20) {
       console.error('That does not look like an AgentChat API key (too short).')
@@ -445,8 +407,8 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
         [
           `Signed in as @${me.handle} for ${LABEL}.`,
           `API key stored at ${credentialsPath(home)} (never commit this file).`,
-          ...writeOurAnchor(me.handle),
-          RESTART_HINT,
+          ...placeIdentity(me.handle, apiKey),
+          NEXT_HINT,
         ].join('\n'),
       )
       return 0
@@ -461,10 +423,7 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
   // server treats an email-only request as "the only agent on this email, if
   // there is exactly one" and otherwise fails at verify time with
   // HANDLE_REQUIRED — after the code has been spent. Always sending the handle
-  // keeps this a single round-trip. The handle is resolved in the same order a
-  // person would expect: the flag, then this agent's own stored handle (the
-  // overwhelmingly common case — re-keying the agent that lives here), then a
-  // prompt, and in non-interactive use a message naming the flag.
+  // keeps this a single round-trip.
   async function runRecover(opts: RecoverOpts): Promise<number> {
     const home = profile.home()
     const apiBase = opts.apiBase ?? process.env['AGENTCHAT_API_BASE'] ?? DEFAULT_API_BASE
@@ -498,16 +457,15 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
           [
             `Recovered: @${result.handle} for ${LABEL}.`,
             `New API key stored at ${credentialsPath(home)} (the old key is now revoked; never commit this file).`,
-            ...writeOurAnchor(result.handle),
-            RESTART_HINT,
+            ...placeIdentity(result.handle, result.apiKey),
+            NEXT_HINT,
           ].join('\n'),
         )
         return 0
       } catch (err) {
         // The code was accepted but the server could not pick an agent. That
         // code is spent and the server has dropped the pending record, so the
-        // local one is dead too — clear it rather than let `--code` be retried
-        // against nothing.
+        // local one is dead too.
         if ((err as ApiErrorLike | null)?.code === 'HANDLE_REQUIRED') clearPending(home)
         console.error(`Recovery failed. ${apiErr(err)}`)
         return 1
@@ -553,10 +511,6 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
 
     try {
       const result = await startRecovery({ email, handle, apiBase })
-      // A current server always returns a pending id, whether or not anything
-      // matched, so that a miss is indistinguishable from a hit. A server that
-      // predates that returns only the message when nothing matched; relay it
-      // and stop, exactly as that server intends.
       if (!result.pending_id) {
         console.log(result.message || 'If an agent is registered with that email, a recovery code was sent to it.')
         return 0
@@ -588,11 +542,18 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
     const anchorFile = profile.anchorFile()
     const identity = resolveIdentity(home)
     const pending = readPending(home)
+    const doorbell = readDoorbellStatus(home)
 
     if (identity === null) {
       if (opts.json) {
         console.log(
-          JSON.stringify({ configured: false, pending: pending !== null, pending_kind: pending?.kind ?? null }),
+          JSON.stringify({
+            configured: false,
+            host: profile.id,
+            pending: pending !== null,
+            pending_kind: pending?.kind ?? null,
+            doorbell,
+          }),
         )
       } else if (pending?.kind === 'recover') {
         const who = pending.handle !== undefined ? ` for @${pending.handle}` : ''
@@ -609,230 +570,95 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
       return 0
     }
 
+    let me: Awaited<ReturnType<AgentChatClient['getMe']>>
     try {
       const client = new AgentChatClient({
         apiKey: identity.apiKey,
         baseUrl: identity.apiBase,
         clientIdentity: CODING_AGENTS_CLIENT_IDENTITY,
       })
-      const me = await client.getMe()
-      const rows = await syncPeek({ apiKey: identity.apiKey, apiBase: identity.apiBase }, { limit: 100 })
-      const unread = rows.length === 100 ? '100+' : String(rows.length)
-      const autonomy = readFullAutonomyPolicy(home, me.handle)
-      const pendingRequests = listPendingRequests(home, me.handle)
-
+      me = await client.getMe()
+    } catch (err) {
+      // A refused key is not an unreachable server, and neither hides the
+      // doorbell: its socket state and last error (`terminal`, `auth rejected
+      // (close 1008 …)`) are exactly what explains the failure.
+      const status = httpStatusOf(err)
+      const refused = status === 401 || status === 403
+      const detail = apiErr(err)
       if (opts.json) {
         console.log(
           JSON.stringify({
             configured: true,
-            // Was hard-coded, and the Claude Code copy said 'codex'.
             host: profile.id,
-            handle: me.handle,
-            status: me.status ?? 'unknown',
-            unread: rows.length,
-            unread_capped: rows.length === 100,
+            handle: identity.handle,
+            error: { kind: refused ? 'key_refused' : 'unreachable', status, detail },
             key_source: identity.source,
             api_base: identity.apiBase,
             home,
             anchor: hasAnchorAt(anchorFile),
-            full_autonomy: {
-              mode: autonomy.mode,
-              selected_agents: autonomy.selected_agents.map((handle) => `@${handle}`),
-            },
-            pending_requests: pendingRequests.length,
+            doorbell,
           }),
         )
       } else {
+        console.error(
+          refused
+            ? `AgentChat refused this agent's key (${detail}). Sign in with a current key: \`${invocation()} login\`; lost it? \`${recoverUsage(invocation())}\`.`
+            : `Could not reach AgentChat: ${detail}`,
+        )
         console.log(
           [
-            `@${me.handle} — ${me.status ?? 'active'}  (${LABEL})`,
-            `Unread: ${unread} message(s) queued`,
+            `${identity.handle !== null ? `@${identity.handle}` : 'This agent'} — ${refused ? `key refused (HTTP ${status})` : 'AgentChat unreachable'}  (${LABEL})`,
             `Key source: ${identity.source} (${identity.source === 'file' ? credentialsPath(home) : 'AGENTCHAT_API_KEY'})`,
             `API: ${identity.apiBase}`,
-            `Anchor: ${hasAnchorAt(anchorFile) ? 'yes' : 'no'} (${anchorFile})`,
-            `Full autonomy: ${autonomyDescription(autonomy)}`,
-            `Pending requests: ${pendingRequests.length}`,
+            ...formatDoorbellStatus(doorbell),
           ].join('\n'),
         )
       }
-      return 0
-    } catch (err) {
-      console.error(`Could not reach AgentChat: ${apiErr(err)}`)
       return 1
     }
-  }
 
-  async function runAutonomy(opts: AutonomyCommandOpts): Promise<number> {
-    const current = await currentIdentity()
-    if (current === null) return 1
-    const action = opts.action ?? 'status'
-    const existing = readFullAutonomyPolicy(current.home, current.handle)
+    const tray = await traySummary({ apiKey: identity.apiKey, apiBase: identity.apiBase }).catch(() => null)
 
-    if (action === 'status') {
-      const pendingCount = listPendingRequests(current.home, current.handle).length
-      if (opts.json) {
-        console.log(JSON.stringify({
-          identity: `@${current.handle.replace(/^@/, '')}`,
-          mode: existing.mode,
-          selected_agents: existing.selected_agents.map((handle) => `@${handle}`),
-          pending_requests: pendingCount,
-        }))
-      } else {
-        console.log([
-          `Full autonomy: ${autonomyDescription(existing)}`,
-          `Pending requests: ${pendingCount}`,
-        ].join('\n'))
-      }
-      return 0
-    }
-
-    if (!localControlMutationAllowed()) return 1
-
-    if (action === 'off') {
-      const policy = setFullAutonomyMode(current.home, current.handle, 'off')
-      console.log(`Full autonomy is off for @${policy.identity_handle}. New unattended tasks that need side effects will wait for local review.`)
-      return 0
-    }
-
-    if (action === 'everyone') {
-      let confirmed = opts.yes === true
-      if (!confirmed && process.stdin.isTTY === true && process.stdout.isTTY === true) {
-        confirmed = (await prompt(
-          'Enable full autonomy for every agent allowed to reach this account? Type "enable" to confirm: ',
-        )).toLowerCase() === 'enable'
-      }
-      if (!confirmed) {
-        console.error(`Confirmation required. Re-run with: ${invocation()} autonomy everyone --yes`)
-        return 1
-      }
-      const policy = setFullAutonomyMode(current.home, current.handle, 'everyone')
-      console.log(`Full autonomy now accepts tasks from everyone who can reach @${policy.identity_handle}. Existing inbox, block, pause, permission, and safety rules still apply.`)
-      return 0
-    }
-
-    if (action === 'selected') {
-      if (existing.selected_agents.length === 0) {
-        console.error(`No agents are selected yet. Add one with: ${invocation()} autonomy allow @handle`)
-        return 1
-      }
-      const policy = setFullAutonomyMode(current.home, current.handle, 'selected')
-      console.log(`Full autonomy is limited to: ${policy.selected_agents.map((handle) => `@${handle}`).join(', ')}`)
-      return 0
-    }
-
-    if (action === 'allow') {
-      const peer = normalizeAgentHandle(opts.handle ?? '')
-      if (peer === null) {
-        console.error(`Provide a valid AgentChat handle. Usage: ${invocation()} autonomy allow @handle`)
-        return 1
-      }
-      if (peer === normalizeAgentHandle(current.handle)) {
-        console.error('This agent cannot add itself to its own autonomy list.')
-        return 1
-      }
-      try {
-        await current.client.getAgent(peer)
-      } catch (err) {
-        console.error(`Could not select @${peer}: ${apiErr(err)}`)
-        return 1
-      }
-      const policy = allowFullAutonomyAgent(current.home, current.handle, peer)
-      console.log(`Full autonomy is enabled for @${peer}. Selected agents: ${policy.selected_agents.map((handle) => `@${handle}`).join(', ')}`)
-      return 0
-    }
-
-    if (action === 'remove') {
-      if (existing.mode === 'everyone') {
-        console.error(`Everyone is currently allowed. Switch to selected mode or turn full autonomy off before removing one agent.`)
-        return 1
-      }
-      const peer = normalizeAgentHandle(opts.handle ?? '')
-      if (peer === null) {
-        console.error(`Provide a valid AgentChat handle. Usage: ${invocation()} autonomy remove @handle`)
-        return 1
-      }
-      const policy = removeFullAutonomyAgent(current.home, current.handle, peer)
+    if (opts.json) {
       console.log(
-        policy.mode === 'off'
-          ? `Removed @${peer}. No selected agents remain, so full autonomy is off.`
-          : `Removed @${peer}. Selected agents: ${policy.selected_agents.map((handle) => `@${handle}`).join(', ')}`,
+        JSON.stringify({
+          configured: true,
+          host: profile.id,
+          handle: me.handle,
+          status: me.status ?? 'unknown',
+          tray,
+          key_source: identity.source,
+          api_base: identity.apiBase,
+          home,
+          anchor: hasAnchorAt(anchorFile),
+          anchor_current: anchorIsCurrentAt(anchorFile, me.handle),
+          doorbell,
+        }),
       )
-      return 0
+    } else {
+      const trayLine =
+        tray === null
+          ? 'Tray: could not be read'
+          : `Tray: ${tray.waiting}${tray.truncated ? '+' : ''} conversation(s) waiting${tray.deferred > 0 ? `, ${tray.deferred} deferred` : ''}`
+      console.log(
+        [
+          `@${me.handle} — ${me.status ?? 'active'}  (${LABEL})`,
+          trayLine,
+          `Key source: ${identity.source} (${identity.source === 'file' ? credentialsPath(home) : 'AGENTCHAT_API_KEY'})`,
+          `API: ${identity.apiBase}`,
+          `Identity line: ${hasAnchorAt(anchorFile) ? (anchorIsCurrentAt(anchorFile, me.handle) ? 'current' : 'present (older text — `doctor --fix` refreshes it)') : 'missing'} (${anchorFile})`,
+          ...formatDoorbellStatus(doorbell),
+        ].join('\n'),
+      )
     }
-
-    console.error(`Usage: ${invocation()} autonomy <status|allow @handle|remove @handle|selected|everyone|off>`)
-    return 1
-  }
-
-  async function runPendingRequests(opts: PendingCommandOpts): Promise<number> {
-    const current = await currentIdentity()
-    if (current === null) return 1
-    const action = opts.action ?? 'list'
-
-    if (action === 'list' || action === 'status') {
-      const records = listPendingRequests(current.home, current.handle)
-      if (opts.json) {
-        console.log(JSON.stringify({ pending_requests: records }))
-      } else if (records.length === 0) {
-        console.log('No pending AgentChat requests need local review.')
-      } else {
-        console.log([
-          `${records.length} pending AgentChat request${records.length === 1 ? '' : 's'}:`,
-          ...records.map((record) =>
-            `  ${record.id}  ${record.peer_agents.join(', ') || 'unknown peer'}  ${record.summary}`,
-          ),
-          '',
-          `Inspect one with: ${invocation()} pending show <id>`,
-        ].join('\n'))
-      }
-      return 0
-    }
-
-    if (action === 'show') {
-      const record = getPendingRequest(current.home, current.handle, opts.id ?? '')
-      if (record === null) {
-        console.error('That pending request was not found for this AgentChat account.')
-        return 1
-      }
-      if (opts.json) console.log(JSON.stringify(record))
-      else {
-        console.log([
-          `Pending request: ${record.id}`,
-          `From: ${record.peer_agents.join(', ') || 'unknown peer'}`,
-          `Reason: ${record.reason}`,
-          `Summary: ${record.summary}`,
-          `Conversation: ${record.conversation_id}`,
-          `Focus message: ${record.focus_message_id}`,
-          `Waiting since: ${record.first_requested_at}`,
-          `Last updated: ${record.updated_at}`,
-          '',
-          'The summary is only a local triage note. Read the full AgentChat conversation before deciding.',
-          `After the request is completed or declined: ${invocation()} pending resolve ${record.id}`,
-        ].join('\n'))
-      }
-      return 0
-    }
-
-    if (action === 'resolve') {
-      if (!localControlMutationAllowed()) return 1
-      const id = opts.id ?? ''
-      if (!resolvePendingRequest(current.home, current.handle, id)) {
-        console.error('That pending request was not found for this AgentChat account.')
-        return 1
-      }
-      console.log(`Resolved local pending request ${id}. Its AgentChat conversation remains stored on the server.`)
-      return 0
-    }
-
-    console.error(`Usage: ${invocation()} pending <list|show <id>|resolve <id>>`)
-    return 1
+    return 0
   }
 
   /**
    * Sign out THIS agent. Authentication and integration installation are
-   * separate lifecycles: logout must never silently remove hooks, MCP wiring,
-   * or a resident service. There is no `--all`, because a profile has no way
-   * to reach another agent — that is the point.
+   * separate lifecycles: logout must never silently remove the service or the
+   * manual. It removes what authenticates as the old identity: the credential,
+   * the identity line, and the key the hosted tool server was registered with.
    */
   function runLogout(): number {
     const home = profile.home()
@@ -840,13 +666,27 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
     const reports: string[] = []
     let any = false
 
+    // Read BEFORE clearing: `unplace` recognises the host's own registration
+    // by the key and the API base that were placed, and both are gone from
+    // disk once the credential is deleted.
+    const identity = resolveIdentity(home)
+
     if (clearCredentials(home)) {
       any = true
       reports.push('  credentials deleted')
     }
     if (removeAnchorAt(anchorFile) === 'removed') {
       any = true
-      reports.push(`  ${anchorLabelOf(profile)} anchor removed`)
+      reports.push(`  ${anchorLabelOf(profile)} identity line removed`)
+    }
+    if (profile.unplace !== undefined) {
+      try {
+        const lines = profile.unplace(identity)
+        if (lines.length > 0) any = true
+        reports.push(...lines)
+      } catch (err) {
+        reports.push(`  could not undo placement: ${String(err)}`)
+      }
     }
 
     console.log(
@@ -909,30 +749,32 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
         }
       }
 
-      // The anchor must name THIS agent. Releases of the old shared CLI wrote
-      // the anchor for every host on the machine whenever any one registered,
-      // so a two-agent box could end up with an instruction file announcing the
-      // OTHER agent's handle — telling peers to DM an address that reaches
-      // someone else.
+      // The identity line must name THIS agent, in the current published text.
+      // Releases of the old shared CLI wrote the anchor for every host on the
+      // machine whenever any one registered, so a two-agent box could end up
+      // with an instruction file announcing the OTHER agent's handle.
       const claimed = readAnchorHandleAt(anchorFile)
-      if (claimed === creds.handle) {
-        checks.push({ name: 'anchor', verdict: 'PASS', detail: `@${claimed} in ${anchorFile}` })
+      const current = anchorIsCurrentAt(anchorFile, creds.handle)
+      if (claimed === creds.handle && current) {
+        checks.push({ name: 'identity-line', verdict: 'PASS', detail: `@${claimed} in ${anchorFile}` })
       } else {
         const why =
           claimed === null
-            ? `no identity block in ${anchorFile}`
-            : `${anchorFile} says @${claimed} but this agent is @${creds.handle}`
+            ? `no identity line in ${anchorFile}`
+            : claimed !== creds.handle
+              ? `${anchorFile} says @${claimed} but this agent is @${creds.handle}`
+              : `${anchorFile} carries an older identity text for @${claimed}`
         if (opts.fix === true) {
-          const report = writeOurAnchor(creds.handle)
+          const report = placeIdentity(creds.handle, creds.api_key)
           const failed = report.some((l) => l.includes('FAILED'))
           checks.push({
-            name: 'anchor',
+            name: 'identity-line',
             verdict: failed ? 'FAIL' : 'PASS',
             detail: failed ? `could not repair: ${report.join('; ')}` : `repaired → @${creds.handle}`,
           })
         } else {
           checks.push({
-            name: 'anchor',
+            name: 'identity-line',
             verdict: 'WARN',
             detail: `${why} — repair with \`${invocation()} doctor --fix\``,
           })
@@ -951,8 +793,6 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
     runLogin,
     runRecover,
     runStatus,
-    runAutonomy,
-    runPendingRequests,
     runLogout,
     runDoctor,
   }

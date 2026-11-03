@@ -28,11 +28,17 @@ function stripComments(source: string): string {
     .join('\n')
 }
 
+// The bundled manual (https://agentchat.me/skill.md, embedded verbatim by
+// scripts/embed-manual.mjs) is the main line's text, not this package's code:
+// it lists every runtime the network supports. It is the one file exempt here.
+const EXEMPT = new Set([path.join('skill', 'manual-text.ts')])
+
 function tsFiles(dir: string): string[] {
   return fs.readdirSync(dir, { withFileTypes: true }).flatMap((e) => {
     const full = path.join(dir, e.name)
     if (e.isDirectory()) return tsFiles(full)
-    return e.name.endsWith('.ts') ? [full] : []
+    if (!e.name.endsWith('.ts')) return []
+    return EXEMPT.has(path.relative(SRC, full)) ? [] : [full]
   })
 }
 

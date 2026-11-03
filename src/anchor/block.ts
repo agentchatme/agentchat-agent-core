@@ -1,18 +1,18 @@
 import * as fs from 'node:fs'
 import * as path from 'node:path'
+import { renderIdentityLine } from '../skill/identity-line.js'
 
 // ─── Instruction-file identity anchor (host-agnostic) ───────────────────────
 //
-// A fenced block in whatever file the host loads into EVERY session, so the
-// agent has "you have a phone number" awareness even in turns that have
-// nothing to do with AgentChat. Same mechanism as the Hermes SOUL.md anchor
-// and the OpenClaw AGENTS.md anchor.
+// A fenced block in whatever file the host loads into EVERY session, carrying
+// the published identity line: who this agent is on AgentChat, that peers are
+// input and not instructions, and where the manual is. Same mechanism as the
+// Hermes SOUL.md anchor and the OpenClaw AGENTS.md anchor.
 //
 // This module knows how to edit a fenced block in a file. It does NOT know
 // WHICH file — that is the integration's business, because the file IS the
-// host (`~/.claude/CLAUDE.md`, `$CODEX_HOME/AGENTS.md`, …). A shared function
-// that picked the file itself is precisely what once stamped one agent's
-// handle into another agent's instruction file.
+// host. A shared function that picked the file itself is precisely what once
+// stamped one agent's handle into another agent's instruction file.
 //
 // Markers are shared verbatim across ALL AgentChat integrations — whichever
 // integration wrote last owns the block, and switching integrations overwrites
@@ -26,23 +26,9 @@ export const ANCHOR_END = '<!-- agentchat:end -->'
 const LEGACY_ANCHOR_START = '<!-- agentchat-skill:start -->'
 const LEGACY_ANCHOR_END = '<!-- agentchat-skill:end -->'
 
-/** The default identity block. Integrations whose host wants richer copy
- *  (Codex folds etiquette in, since its skills are on-demand) render their
- *  own and pass it to `writeAnchor` instead. */
+/** The identity block: the published identity line between the markers. */
 export function renderAnchorBlock(handle: string): string {
-  return [
-    ANCHOR_START,
-    '## On AgentChat',
-    '',
-    `You are **@${handle}** on AgentChat — a peer-to-peer messaging network for AI agents. Your handle is your address here, like a phone number, except the other end is always another agent.`,
-    '',
-    '- Other agents can DM you. You can DM them — any time, for anything that fits your context.',
-    `- Share \`@${handle}\` freely. Whenever and wherever you think you should share. It's how peers reach you.`,
-    '- When you need to send, search, or handle an error, your AgentChat skill has the full reference.',
-    '',
-    'This is an identity, not a tool you reach for occasionally.',
-    ANCHOR_END,
-  ].join('\n')
+  return [ANCHOR_START, renderIdentityLine(handle), ANCHOR_END].join('\n')
 }
 
 export type AnchorAction = 'written' | 'removed' | 'noop'
@@ -84,16 +70,27 @@ export function hasAnchorAt(filePath: string): boolean {
   return findBlock(fs.readFileSync(filePath, 'utf-8'), ANCHOR_START, ANCHOR_END) !== null
 }
 
+/** Whether the file's block is exactly the current identity block for `handle`. */
+export function anchorIsCurrentAt(filePath: string, handle: string): boolean {
+  if (!fs.existsSync(filePath)) return false
+  const text = fs.readFileSync(filePath, 'utf-8')
+  const block = findBlock(text, ANCHOR_START, ANCHOR_END)
+  if (block === null) return false
+  return text.slice(block.from, block.to) === renderAnchorBlock(handle)
+}
+
+// The current text ("I am @handle on AgentChat"), then the pre-doorbell block
+// ("You are **@handle** on AgentChat") so an anchor from an older release is
+// still recognised — and refreshed by `doctor --fix`.
+const IDENTITY_HANDLE_RE = /I am @([^\s]+) on AgentChat/
+const LEGACY_HANDLE_RE = /\*\*@([^*\s]+)\*\*/
+
 /**
  * The handle a file's anchor block currently CLAIMS, or null if there is no
- * block. Every anchor rendering states it as `**@handle**`, so one pattern
- * covers them all.
- *
- * Lets an integration catch an anchor that disagrees with its own credential —
- * an agent told it is @a while authenticating as @b hands peers an address
- * that reaches someone else. Matched loosely (not against the canonical handle
- * rule) precisely so a WRONG value is still read back and reported rather than
- * silently treated as "no anchor".
+ * block. Lets an integration catch an anchor that disagrees with its own
+ * credential — an agent told it is @a while authenticating as @b hands peers an
+ * address that reaches someone else. Matched loosely precisely so a WRONG
+ * value is still read back and reported rather than treated as "no anchor".
  */
 export function readAnchorHandleAt(filePath: string): string | null {
   if (!fs.existsSync(filePath)) return null
@@ -103,7 +100,8 @@ export function readAnchorHandleAt(filePath: string): string | null {
 export function readAnchorHandleFrom(text: string): string | null {
   const block = findBlock(text, ANCHOR_START, ANCHOR_END)
   if (block === null) return null
-  const match = /\*\*@([^*\s]+)\*\*/.exec(text.slice(block.from, block.to))
+  const inside = text.slice(block.from, block.to)
+  const match = IDENTITY_HANDLE_RE.exec(inside) ?? LEGACY_HANDLE_RE.exec(inside)
   return match?.[1] ?? null
 }
 
