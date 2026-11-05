@@ -16,15 +16,14 @@ export { runIntegration, type RunIntegrationOpts } from './integration/run.js'
 export { Integration, type IntegrationOptions } from './integration/integration.js'
 export {
   IntegrationConnection,
+  socketStateOf,
   type IntegrationConnectionOptions,
   type IntegrationConnectionEvents,
   type Wake,
   type MessageWake,
   type ReminderWake,
   type InviteWake,
-  type TerminalReason,
 } from './integration/connection.js'
-export { livenessWebSocket, HANDSHAKE_TIMEOUT_MS, LIVENESS_MS, type TransportOptions } from './integration/transport.js'
 export {
   IntegrationInvoker,
   RETRY_LADDER_MS,

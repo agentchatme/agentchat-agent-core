@@ -1,20 +1,28 @@
 import { EventEmitter } from 'node:events'
-import { RealtimeClient, type WakeFrame, type WsMessage } from 'agentchatme'
+import { RealtimeClient, type BlockedInfo, type RealtimeState, type WakeFrame, type WsMessage } from 'agentchatme'
 import { log } from '../util/log.js'
 import { clientIdentityOf, type IntegrationClient } from '../client-identity.js'
 import { normalizeHandle } from '../skill/identity-line.js'
-import { livenessWebSocket } from './transport.js'
 import type { SocketState } from './status.js'
 
 // ─── The connection: the SDK's socket, read as wakes ────────────────────────
 //
 // The socket is the SDK's `RealtimeClient` — hello, capabilities, acks,
-// reconnect backoff, frame validation all live there, once, for every
-// AgentChat integration. With `ackOnReceipt` it acknowledges every
-// `message.new` the moment the frame is parsed: DELIVERED means this machine
-// received the message. Whether the agent has looked is read state, which only
-// the agent's own verdict inside its run changes; an early ack never empties
-// the tray (docs/architecture.md, rule 5).
+// reconnect backoff, the handshake and liveness watchdogs, frame validation
+// all live there, once, for every AgentChat integration. With `ackOnReceipt`
+// it acknowledges every `message.new` the moment the frame is parsed:
+// DELIVERED means this machine received the message. Whether the agent has
+// looked is read state, which only the agent's own verdict inside its run
+// changes; an early ack never empties the tray (docs/architecture.md, rule 5).
+//
+// One client, for as long as this connection lives. The SDK's client never
+// dies on its own: every close leads to a backoff and a fresh attempt (capped
+// at 30 s, five minutes once an outage is 60 attempts long), a refused
+// credential leads to `blocked` — a fresh hello every 10–15 minutes until one
+// is accepted — and only `disconnect()` (our `stop()`) ends it. Nothing here
+// classifies a close or replaces the client; the credential's fate is the
+// supervisor's only through the identity file (a new key is a new
+// connection).
 //
 // What this class adds is the integration's reading of the SDK's events:
 //
@@ -30,39 +38,16 @@ import type { SocketState } from './status.js'
 //                      it, and the server re-offers unacked envelopes right
 //                      after it. Whether any of that deserves a run is the
 //                      invoker's tray count, never this class's call.
+//   * `state`        → the status file's `socket` word (`socketStateOf`): the
+//                      SDK's `backoff` is `reconnecting`, its `blocked` is
+//                      `terminal` (the word `status` already uses for a
+//                      refused key; the refusal itself travels as the `blocked`
+//                      event's detail, for `last error`).
 //
-// A refused credential, the way the server refuses one: the upgrade
-// completes, the hello is answered with close 1008 'Invalid token', no
-// `hello.ok`. The SDK stops reconnecting on 1008/4401/4403 — the right call
-// for a bad key, but it also stops on a 1008 that is not one (the server's own
-// 'HELLO frame required' racing a slow handshake). So a close with one of
-// those codes is read here by the server's reason: a refused or revoked
-// credential is `terminal` (the supervisor sits the key out until it
-// changes); anything else gets a fresh client after a backoff. Everything
-// below those codes the SDK reconnects on its own.
-//
-// Liveness is the transport's job (`transport.ts`): a dead pipe is terminated
-// there, and the SDK reconnects as on any close.
-
-/** Close codes the SDK treats as terminal (it stops reconnecting). */
-const SDK_TERMINAL_CLOSE_CODES: ReadonlySet<number> = new Set([1008, 4401, 4403])
-/** The reason the SDK puts on its own transient 1008 (hello.ok did not arrive in time). */
-const SDK_HELLO_TIMEOUT_REASON = 'HELLO ack timeout'
-/**
- * The server's reasons for closing 1008 on a credential that will not work
- * again: refused before hello.ok, or evicted after it. Anything else on 1008
- * is a handshake-timing close, not a verdict on the key.
- */
-const CREDENTIAL_CLOSE_REASONS: ReadonlySet<string> = new Set([
-  'Invalid token',
-  'API key rotated',
-  'Account suspended',
-  'Account deleted',
-])
-const REOPEN_BASE_MS = 5_000
-const REOPEN_MAX_MS = 60_000
-const SDK_RECONNECT_INTERVAL_MS = 1_000
-const SDK_MAX_RECONNECT_INTERVAL_MS = 60_000
+// `ws` stays a dependency of this package although nothing here imports it:
+// the SDK prefers it on Node, and only on `ws` are the server's 45 s pings
+// visible to the SDK's idle deadline (100 s) — a quiet but healthy socket
+// stays up, a dead one is reopened.
 
 export interface MessageWake {
   readonly source: 'message'
@@ -88,9 +73,6 @@ export interface InviteWake {
   readonly inviterHandle: string | null
 }
 
-/** Why the connection gave up: the server refused or revoked the credential — sit out until it changes. */
-export type TerminalReason = 'auth'
-
 export interface IntegrationConnectionEvents {
   wake: (wake: Wake) => void
   invite: (invite: InviteWake) => void
@@ -99,8 +81,14 @@ export interface IntegrationConnectionEvents {
   state: (state: SocketState, previous: SocketState) => void
   /** `hello.ok` arrived: the connection is live. Once per (re)connection, after `state` → `ready`. */
   ready: () => void
-  /** The connection gave up and stays stopped. The holder decides what happens next. */
-  terminal: (reason: TerminalReason, detail: string) => void
+  /**
+   * The server refused the credential on the hello (the SDK is `blocked`,
+   * read here as `terminal`). Once per rejected attempt — the first one in a
+   * run and every 10–15 minutes after it, until a hello is accepted and
+   * `state` → `ready` lifts it. `detail` is the line `status` shows as the
+   * last error.
+   */
+  blocked: (detail: string, info: BlockedInfo) => void
 }
 
 export interface IntegrationConnectionOptions {
@@ -110,12 +98,40 @@ export interface IntegrationConnectionOptions {
   /** This agent's handle, to recognise its own echo. Bare, any case. */
   readonly selfHandle: string
   readonly client: IntegrationClient
-  /** Test seam: the WebSocket constructor. Defaults to the liveness-bounded `ws` transport. */
-  readonly webSocket?: typeof globalThis.WebSocket
+  /** Test seams for the SDK's backoff; its defaults (500 ms → 30 s) otherwise. */
   readonly reconnectIntervalMs?: number
   readonly maxReconnectIntervalMs?: number
-  readonly reopenBaseMs?: number
-  readonly reopenMaxMs?: number
+}
+
+/**
+ * The SDK's connection state in the status file's vocabulary. Pure. `previous`
+ * is the status word in effect, which decides two things the SDK's state alone
+ * does not say: a `connecting` after a close is `reconnecting`, and the slow
+ * retry out of `blocked` (`connecting` again) does not lift `terminal` — only
+ * an accepted hello (`ready`) does. `stop()` on a refused key keeps `terminal`
+ * so the refusal is not dressed up as a clean close.
+ */
+export function socketStateOf(next: RealtimeState, previous: SocketState): SocketState {
+  switch (next) {
+    case 'idle':
+      return 'idle'
+    case 'connecting':
+      if (previous === 'terminal') return 'terminal'
+      return previous === 'idle' || previous === 'connecting' ? 'connecting' : 'reconnecting'
+    case 'ready':
+      return 'ready'
+    case 'backoff':
+      return 'reconnecting'
+    case 'blocked':
+      return 'terminal'
+    case 'stopped':
+      return previous === 'terminal' ? 'terminal' : 'closed'
+  }
+}
+
+/** The `last error` line for a refused credential: the server's close, what to do, and that the SDK keeps trying. */
+export function blockedDetail(info: BlockedInfo): string {
+  return `auth rejected (close ${info.code}${info.reason ? ` ${info.reason}` : ''}) — check the agent's API key; a fresh hello is tried every 10–15 min until one is accepted`
 }
 
 function stringField(record: Record<string, unknown>, keys: readonly string[]): string | null {
@@ -136,9 +152,8 @@ export class IntegrationConnection extends EventEmitter {
   private rt: RealtimeClient | null = null
   private _state: SocketState = 'idle'
   private stopped = false
-  private readyOnThisConnection = false
-  private reopenTimer: ReturnType<typeof setTimeout> | null = null
-  private reopens = 0
+  /** Rejected hellos since the last accepted one: the first is an error line, the rest are info. */
+  private refusals = 0
   private readonly selfHandle: string
 
   constructor(private readonly options: IntegrationConnectionOptions) {
@@ -159,33 +174,9 @@ export class IntegrationConnection extends EventEmitter {
     return super.on(event, listener as (...args: unknown[]) => void)
   }
 
+  /** Open the SDK's client. Once: it lives until `stop()`, reconnecting on its own. */
   start(): void {
-    this.stopped = false
-    this.open()
-  }
-
-  stop(): void {
-    this.stopped = true
-    this.clearReopen()
-    // A connection that gave up stays `terminal`: stopping it afterwards (the
-    // holder does, on `terminal`) must not dress a refused key up as a clean
-    // close in `status`.
-    if (this._state !== 'terminal') this.setState('closed')
-    this.disposeClient()
-  }
-
-  private setState(next: SocketState): void {
-    const prev = this._state
-    if (prev === next) return
-    this._state = next
-    this.emit('state', next, prev)
-  }
-
-  private open(): void {
-    if (this.stopped) return
-    this.setState(this.reopens === 0 ? 'connecting' : 'reconnecting')
-    log.info(`socket ${this._state}${this.reopens > 0 ? ` (fresh client ${this.reopens + 1})` : ''}`)
-
+    if (this.rt !== null || this.stopped) return
     const rt = new RealtimeClient({
       apiKey: this.options.apiKey,
       baseUrl: this.options.wsBase,
@@ -194,74 +185,85 @@ export class IntegrationConnection extends EventEmitter {
       // anything here runs; read state is the agent's verdict, separately.
       ackOnReceipt: true,
       reconnect: true,
-      reconnectInterval: this.options.reconnectIntervalMs ?? SDK_RECONNECT_INTERVAL_MS,
-      maxReconnectInterval: this.options.maxReconnectIntervalMs ?? SDK_MAX_RECONNECT_INTERVAL_MS,
-      webSocket: this.options.webSocket ?? livenessWebSocket(),
+      ...(this.options.reconnectIntervalMs !== undefined ? { reconnectInterval: this.options.reconnectIntervalMs } : {}),
+      ...(this.options.maxReconnectIntervalMs !== undefined ? { maxReconnectInterval: this.options.maxReconnectIntervalMs } : {}),
     })
     this.rt = rt
-    this.readyOnThisConnection = false
+    this.setState('connecting')
 
-    // Every handler checks that it still speaks for the current client. A
-    // disposed client's late `close` must not flip state or schedule a reopen.
-    const current = (): boolean => this.rt === rt
-
+    rt.on('state', (next) => this.setState(socketStateOf(next, this._state)))
+    rt.on('blocked', (info) => this.onBlocked(info))
     rt.onConnect(() => {
-      if (!current()) return
-      this.readyOnThisConnection = true
-      this.reopens = 0
-      this.setState('ready')
-      log.info('socket ready (hello.ok) — acks on receipt')
+      this.refusals = 0
+      log.info(`socket ready (hello.ok) — acks ${rt.ackNegotiated ? 'on receipt' : 'not negotiated by this server'}`)
       this.emit('ready')
     })
-    rt.onDisconnect(({ code, reason }) => {
-      if (!current()) return
-      const wasReady = this.readyOnThisConnection
-      this.readyOnThisConnection = false
+    rt.onDisconnect(({ code, reason, initiator }) => {
       if (this.stopped) return
-      this.onClose(code, reason, wasReady)
+      log.warn(`socket closed (${code}${reason ? ` ${reason}` : ''}${initiator === 'client' ? ', by this client' : ''})`)
     })
     rt.onError((err) => {
-      if (!current() || this.stopped) return
+      if (this.stopped) return
       log.warn(`socket: ${err.message}`)
     })
     rt.on('message.new', (message) => {
-      if (current()) this.onMessageFrame(message)
+      if (!this.stopped) this.onMessageFrame(message)
     })
     rt.on('wake', (frame) => {
-      if (current()) this.onWakeFrame(frame)
+      if (!this.stopped) this.onWakeFrame(frame)
     })
     rt.on('group.invite.received', (message) => {
-      if (current()) this.onInviteFrame(message)
+      if (!this.stopped) this.onInviteFrame(message)
     })
 
     rt.connect().catch((err: unknown) => {
-      // The SDK rejects only when no WebSocket could be constructed; it does
-      // not retry that itself when the constructor is injected.
-      if (!current() || this.stopped) return
-      log.warn(`socket could not be opened (${err instanceof Error ? err.message : String(err)}) — fresh client after a backoff`)
-      this.reopenAfterBackoff()
+      // A failed attempt the SDK retries was already announced through
+      // onError. The one it does not retry — no WebSocket implementation at
+      // all — leaves the client idle, and is said once.
+      if (this.stopped || rt.state !== 'idle') return
+      log.error(`socket cannot be opened (${err instanceof Error ? err.message : String(err)}) — no WebSocket implementation; holding no socket`)
     })
   }
 
-  private onClose(code: number, reason: string, wasReady: boolean): void {
-    if (SDK_TERMINAL_CLOSE_CODES.has(code) && reason !== SDK_HELLO_TIMEOUT_REASON) {
-      // The SDK has stopped reconnecting. Whether that is right is the
-      // server's reason to say.
-      if (code !== 1008 || CREDENTIAL_CLOSE_REASONS.has(reason)) {
-        this.enterTerminal(
-          'auth',
-          `auth rejected (close ${code}${reason ? ` ${reason}` : ''}${wasReady ? ', after hello.ok' : ''}) — check the agent's API key`,
-        )
-        return
-      }
-      log.warn(
-        `socket closed ${code}${reason ? ` ${reason}` : ''} ${wasReady ? 'after' : 'before'} hello.ok — not a refused key; fresh client after a backoff`,
-      )
-      this.reopenAfterBackoff()
-      return
+  /** End the SDK's client. Final: a stopped connection is not restarted. */
+  stop(): void {
+    if (this.stopped) return
+    this.stopped = true
+    const rt = this.rt
+    this.rt = null
+    try {
+      rt?.disconnect() // fires `state` → `stopped`, mapped below; a late frame flushed here is ignored
+    } catch {
+      /* already closed */
     }
-    log.warn(`socket closed (${code}${reason ? ` ${reason}` : ''}) — the SDK reconnects with backoff`)
-    this.setState('reconnecting')
+    // A refused key must not read as a clean close in `status`.
+    if (this._state !== 'terminal') this.setState('closed')
+  }
+
+  private setState(next: SocketState): void {
+    const prev = this._state
+    if (prev === next) return
+    this._state = next
+    // `ready` is logged with the ack note on hello.ok, `terminal` with the
+    // refusal on the blocked event.
+    if (next === 'connecting') log.info('socket connecting')
+    else if (next === 'reconnecting') log.info('socket reconnecting — the SDK backs off and retries; it never gives up')
+    else if (next === 'closed') log.info('socket closed')
+    this.emit('state', next, prev)
+  }
+
+  /** The SDK is `blocked`: the server refused the credential on the hello. Fires per rejected attempt. */
+  private onBlocked(info: BlockedInfo): void {
+    if (this.stopped) return
+    const detail = blockedDetail(info)
+    this.refusals += 1
+    if (this.refusals === 1) {
+      log.error(`socket terminal (auth): ${detail}`)
+    } else {
+      const next = info.retryInMs === null ? 'no retry' : `next hello in about ${Math.max(1, Math.round(info.retryInMs / 60_000))} min`
+      log.info(`socket still terminal (auth): close ${info.code}${info.reason ? ` ${info.reason}` : ''} — ${next}`)
+    }
+    this.emit('blocked', detail, info)
   }
 
   /**
@@ -319,48 +321,5 @@ export class IntegrationConnection extends EventEmitter {
     }
     log.info(`wake — group invite ${invite.inviteId} to ${invite.groupId ?? '?'} from=@${invite.inviterHandle ?? '?'}`)
     this.emit('invite', invite)
-  }
-
-  /** Give up. The connection stays stopped; the holder decides what happens next. */
-  private enterTerminal(reason: TerminalReason, detail: string): void {
-    this.clearReopen()
-    this.disposeClient()
-    this.setState('terminal')
-    log.error(`socket terminal (${reason}): ${detail}`)
-    this.emit('terminal', reason, detail)
-  }
-
-  /** Replace the SDK client after a backoff: it stopped on a close that was not a verdict on the key. */
-  private reopenAfterBackoff(): void {
-    if (this.stopped || this.reopenTimer !== null) return
-    this.setState('reconnecting')
-    this.disposeClient()
-    const base = this.options.reopenBaseMs ?? REOPEN_BASE_MS
-    const max = this.options.reopenMaxMs ?? REOPEN_MAX_MS
-    const backoff = Math.min(base * 2 ** Math.min(this.reopens, 6), max)
-    const jitter = backoff * (0.5 + Math.random() * 0.5)
-    this.reopens += 1
-    this.reopenTimer = setTimeout(() => {
-      this.reopenTimer = null
-      this.open()
-    }, jitter)
-  }
-
-  private clearReopen(): void {
-    if (this.reopenTimer !== null) {
-      clearTimeout(this.reopenTimer)
-      this.reopenTimer = null
-    }
-  }
-
-  private disposeClient(): void {
-    const rt = this.rt
-    this.rt = null
-    if (rt === null) return
-    try {
-      rt.disconnect()
-    } catch {
-      /* already closed */
-    }
   }
 }

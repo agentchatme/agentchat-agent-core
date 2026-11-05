@@ -3,7 +3,7 @@ import { log } from '../util/log.js'
 import type { DaemonConfig } from '../daemon/config.js'
 import { beat, idle } from '../daemon/health.js'
 import { clientIdentityOf, type IntegrationClient } from '../client-identity.js'
-import { IntegrationConnection, type InviteWake, type TerminalReason } from './connection.js'
+import { IntegrationConnection, type InviteWake } from './connection.js'
 import { IntegrationInvoker } from './invoker.js'
 import { OfferedInvites } from './invites.js'
 import { buildRunPrompts, type RunPrompts } from './prompts.js'
@@ -60,12 +60,6 @@ export interface IntegrationOptions {
   readonly api?: AgentChatClient
   /** Injectable for tests; defaults to a store on `api` and the identity home. */
   readonly texts?: TextsStore
-  /**
-   * Called when the connection gives up for good: the server refused or
-   * revoked the credential — sit out until it changes. The supervisor above
-   * decides; this class does not end the process.
-   */
-  readonly onTerminal?: (reason: TerminalReason, detail: string) => void
 }
 
 export class Integration {
@@ -111,18 +105,22 @@ export class Integration {
       void this.catchUp()
     })
     this.connection.on('state', (state) => {
-      if (state === 'ready') beat(cfg.home)
-      else idle(cfg.home)
+      if (state === 'ready') {
+        beat(cfg.home)
+        // An accepted hello lifts a refusal: the key works again.
+        this.lastError = null
+      } else {
+        idle(cfg.home)
+      }
       this.writeStatus()
     })
-    this.connection.on('terminal', (reason, detail) => {
-      // Do NOT end the process: this daemon is resident. A refused key is a
-      // state to sit out, not to die from — the user may sign in again with a
-      // good one.
+    this.connection.on('blocked', (detail) => {
+      // A refused key is a state to show, not to die from: the SDK's client
+      // stays up in `blocked` and tries a fresh hello every 10–15 min; `status`
+      // reads `socket terminal` with this line as the last error until one is
+      // accepted, or the user signs in with another key (a new connection).
       this.lastError = detail
-      log.error(`integration terminal (${reason}): ${detail}`)
-      this.stop()
-      options.onTerminal?.(reason, detail)
+      this.writeStatus()
     })
   }
 
@@ -193,9 +191,9 @@ export class Integration {
 
   snapshot(): IntegrationStatus {
     const c = this.invoker.counters()
-    // A connection that gave up (refused key) stays `terminal` even though
-    // giving up also stops the integration: `closed` would read as a clean
-    // shutdown and hide the refusal from `status` and `doctor`.
+    // A connection whose key stands refused stays `terminal` through a stop:
+    // `closed` would read as a clean shutdown and hide the refusal from
+    // `status` and `doctor`.
     const socket: SocketState =
       this.connection.state === 'terminal' ? 'terminal' : this.stopping ? 'closed' : this.connection.state
     const texts = this.texts.current()

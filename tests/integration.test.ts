@@ -1,13 +1,13 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import { Integration } from '../src/integration/integration.js'
+import { IntegrationConnection } from '../src/integration/connection.js'
 import { readIntegrationStatus } from '../src/integration/status.js'
 import { offeredInvitesPath } from '../src/integration/invites.js'
 import { textsCachePath, writeCachedTexts } from '../src/integration/texts.js'
 import type { RunRequest, RunRunner } from '../src/integration/runner.js'
-import type { TerminalReason } from '../src/integration/connection.js'
 import { startServerDouble, until, pause, type ServerDouble } from './helpers/server-double.js'
 import { textsFor } from './helpers/served-texts.js'
 
@@ -57,12 +57,13 @@ beforeEach(() => {
   integrations = []
 })
 afterEach(async () => {
+  vi.useRealTimers()
   for (const i of integrations) i.stop()
   await double.close()
   fs.rmSync(home, { recursive: true, force: true })
 })
 
-async function integration(runner: RunRunner, onTerminal?: (reason: TerminalReason, detail: string) => void): Promise<Integration> {
+async function integration(runner: RunRunner, connection?: IntegrationConnection): Promise<Integration> {
   const i = new Integration({
     cfg: { apiKey: KEY, handle: 'me', apiBase: double.apiBase, wsBase: double.wsBase, home, workdir: path.join(home, 'w') },
     runner,
@@ -70,7 +71,7 @@ async function integration(runner: RunRunner, onTerminal?: (reason: TerminalReas
     manualPointer: POINTER,
     profile: 'answer',
     budgetMs: 60_000,
-    ...(onTerminal ? { onTerminal } : {}),
+    ...(connection ? { connection } : {}),
   })
   integrations.push(i)
   await i.start()
@@ -169,22 +170,47 @@ describe('Integration — connect-time catch-up', () => {
     expect(JSON.stringify(i.snapshot())).not.toContain('PREVIEW')
   }, 10_000)
 
-  it('a refused key is terminal with reason auth, starts no run, does not reconnect, and status says terminal', async () => {
+  it('a refused key reads socket terminal with the refusal as the last error, starts no run, and is not retried in a storm (the SDK tries a fresh hello every 10–15 min)', async () => {
     double = await startServerDouble({ upgrade: 'refuse', tray: { waiting: 5 } })
     const runner = new FakeRunner(() => double)
-    const terminal: Array<{ reason: TerminalReason; detail: string }> = []
-    const i = await integration(runner, (reason, detail) => terminal.push({ reason, detail }))
-    await until(() => terminal.length === 1)
-    expect(terminal[0]!.reason).toBe('auth')
+    const i = await integration(runner)
+    await until(() => i.snapshot().last_error !== null)
     await pause(1_500)
     expect(double.upgrades).toBe(1)
     expect(double.requests.filter((r) => !r.startsWith('/v1/texts'))).toEqual([]) // no catch-up without hello.ok
     expect(runner.requests).toHaveLength(0)
-    // `closed` would read as a clean shutdown and hide the refusal.
     expect(i.snapshot().socket).toBe('terminal')
-    expect(i.snapshot().last_error).toMatch(/auth rejected/)
+    expect(i.snapshot().last_error).toMatch(/^auth rejected \(close 1008 Invalid token\) — check the agent's API key/)
+    expect(readIntegrationStatus(home)).toMatchObject({ socket: 'terminal', last_error: expect.stringMatching(/auth rejected/) })
+    // The integration stays up for the SDK's retry; `closed` after a stop
+    // would read as a clean shutdown and hide the refusal.
+    i.stop()
+    expect(i.snapshot().socket).toBe('terminal')
     expect(readIntegrationStatus(home)?.socket).toBe('terminal')
   })
+
+  it('a key refused now and accepted later: the SDK’s next hello makes the socket ready, clears the last error, and the connect wake runs the backlog', async () => {
+    // The retry is the SDK's own timer (10–15 min): faked setTimeout drives
+    // it, real sockets carry the hello (see the same case in connection.test.ts).
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'], shouldAdvanceTime: true })
+    double = await startServerDouble({ upgrade: 'refuse', tray: { waiting: 1 } })
+    const runner = new FakeRunner(() => double)
+    const connection = new IntegrationConnection({ apiKey: KEY, wsBase: double.wsBase, selfHandle: 'me', client: CLIENT })
+    let retryInMs: number | null = null
+    connection.on('blocked', (_detail, info) => {
+      retryInMs = info.retryInMs
+    })
+    const i = await integration(runner, connection)
+    await until(() => i.snapshot().socket === 'terminal' && i.snapshot().last_error !== null && retryInMs !== null)
+    double.setUpgrade('hello')
+    await vi.advanceTimersByTimeAsync(retryInMs! + 1) // the SDK's blocked retry, and no further
+    await until(() => i.snapshot().socket === 'ready', 5_000)
+    expect(i.snapshot().last_error).toBeNull()
+    expect(readIntegrationStatus(home)).toMatchObject({ socket: 'ready', last_error: null })
+    await until(() => runner.requests.length === 1, 5_000)
+    expect(runner.requests[0]).toMatchObject({ kind: 'wake' })
+    expect(double.upgrades).toBe(2)
+  }, 15_000)
 
   it('stopAndWait interrupts the run in flight and resolves once it has ended', async () => {
     double = await startServerDouble({ tray: { waiting: 1 } })

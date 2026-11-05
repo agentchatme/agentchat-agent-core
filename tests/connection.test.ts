@@ -1,16 +1,22 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { IntegrationConnection, type InviteWake, type TerminalReason, type Wake } from '../src/integration/connection.js'
-import { livenessWebSocket } from '../src/integration/transport.js'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import type { BlockedInfo, RealtimeState } from 'agentchatme'
+import { IntegrationConnection, socketStateOf, type InviteWake, type Wake } from '../src/integration/connection.js'
+import type { SocketState } from '../src/integration/status.js'
 import { startServerDouble, until, pause, type ServerDouble } from './helpers/server-double.js'
 
-// ─── The SDK's socket, read as wakes; acked on receipt ──────────────────────
+// ─── The SDK's socket, read as wakes; acked on receipt; its states as status ─
 //
 // Run against a real server double on localhost (tests/helpers/server-double.ts)
 // that behaves like apps/api-server/src/ws/agent-socket.ts on the HELLO path:
 // a bad key is closed 1008 'Invalid token' without a hello.ok; a good one gets
 // hello.ok first. The double records every frame the client sends after its
-// hello — and what the tests look for there now is the ACK the SDK sends the
+// hello — and what the tests look for there is the ACK the SDK sends the
 // moment a `message.new` is parsed: delivered means this machine received it.
+//
+// The connection lifecycle is the SDK's (one `RealtimeClient`, never replaced,
+// never giving up): what is pinned here is how the daemon READS it — which SDK
+// state becomes which status word, and that a refused key is `terminal` with
+// the refusal as its detail while the SDK keeps trying.
 
 const CLIENT = { runtime: 'generic' as const, version: '0.0.0-test' }
 const KEY = 'ac_' + 'k'.repeat(32)
@@ -24,6 +30,7 @@ beforeEach(async () => {
 })
 
 afterEach(async () => {
+  vi.useRealTimers()
   for (const c of connections) c.stop()
   await double.close()
 })
@@ -34,39 +41,33 @@ interface Connected {
   invites: InviteWake[]
   echoes: number
   readies: number
-  terminal: Array<{ reason: TerminalReason; detail: string }>
+  blocked: Array<{ detail: string; info: BlockedInfo }>
+  /** Every status word in order, from `connecting` on. */
+  states: SocketState[]
 }
 
-function connect(selfHandle = 'me', extra: Partial<ConstructorParameters<typeof IntegrationConnection>[0]> = {}): Connected {
-  const state: Connected = {
-    connection: new IntegrationConnection({
-      apiKey: KEY,
-      wsBase: double.wsBase,
-      selfHandle,
-      client: CLIENT,
-      reconnectIntervalMs: 100,
-      maxReconnectIntervalMs: 500,
-      reopenBaseMs: 100,
-      reopenMaxMs: 500,
-      ...extra,
-    }),
-    wakes: [],
-    invites: [],
-    echoes: 0,
-    readies: 0,
-    terminal: [],
-  }
-  state.connection.on('wake', (w) => state.wakes.push(w))
-  state.connection.on('invite', (i) => state.invites.push(i))
-  state.connection.on('echo', () => {
+function connect(selfHandle = 'me'): Connected {
+  const connection = new IntegrationConnection({
+    apiKey: KEY,
+    wsBase: double.wsBase,
+    selfHandle,
+    client: CLIENT,
+    reconnectIntervalMs: 100,
+    maxReconnectIntervalMs: 500,
+  })
+  const state: Connected = { connection, wakes: [], invites: [], echoes: 0, readies: 0, blocked: [], states: [] }
+  connection.on('wake', (w) => state.wakes.push(w))
+  connection.on('invite', (i) => state.invites.push(i))
+  connection.on('echo', () => {
     state.echoes += 1
   })
-  state.connection.on('ready', () => {
+  connection.on('ready', () => {
     state.readies += 1
   })
-  state.connection.on('terminal', (reason, detail) => state.terminal.push({ reason, detail }))
-  connections.push(state.connection)
-  state.connection.start()
+  connection.on('blocked', (detail, info) => state.blocked.push({ detail, info }))
+  connection.on('state', (s) => state.states.push(s))
+  connections.push(connection)
+  connection.start()
   return state
 }
 
@@ -85,6 +86,7 @@ describe('IntegrationConnection', () => {
     const c = connect()
     await until(() => c.connection.connected)
     expect(c.readies).toBe(1)
+    expect(c.states).toEqual(['connecting', 'ready'])
     await pause(100)
     expect(c.wakes).toEqual([]) // whether anything is waiting is the holder's question, answered by counts
   })
@@ -176,49 +178,87 @@ describe('IntegrationConnection', () => {
 
   // ─── a refused credential, the way the server actually refuses it ───────
 
-  it('a refused key (hello answered with close 1008 Invalid token) is terminal auth: zero wakes, no reconnect', async () => {
+  it('a refused key (hello answered with close 1008 Invalid token) reads terminal with the refusal as the detail: zero wakes, no reconnect storm', async () => {
     double.setUpgrade('refuse')
     const c = connect()
-    await until(() => c.terminal.length === 1)
-    expect(c.terminal[0]!.reason).toBe('auth')
-    expect(c.terminal[0]!.detail).toMatch(/close 1008 Invalid token/)
-    expect(c.connection.state).toBe('terminal')
+    await until(() => c.connection.state === 'terminal')
+    expect(c.states).toEqual(['connecting', 'terminal'])
     expect(c.connection.connected).toBe(false)
-    await pause(800) // longer than the first backoff: a storm would have reconnected by now
+    await until(() => c.blocked.length === 1)
+    expect(c.blocked[0]!.detail).toMatch(/^auth rejected \(close 1008 Invalid token\) — check the agent's API key/)
+    expect(c.blocked[0]!.detail).toMatch(/every 10–15 min/)
+    expect(c.blocked[0]!.info).toMatchObject({ code: 1008, reason: 'Invalid token' })
+    // The SDK's next hello is 10–15 min out, not on the backoff ladder.
+    expect(c.blocked[0]!.info.retryInMs).toBeGreaterThanOrEqual(10 * 60_000)
+    expect(c.blocked[0]!.info.retryInMs).toBeLessThanOrEqual(15 * 60_000)
+    await pause(800) // several backoff steps: a storm would have reconnected by now
     expect(double.upgrades).toBe(1)
     expect(c.wakes).toEqual([])
     expect(c.readies).toBe(0)
   })
 
-  it('a 1008 AFTER hello.ok with a credential reason (key rotated) is terminal auth as well', async () => {
+  it('a key refused now and accepted later: the SDK’s slow retry makes it ready — terminal → ready, with the ready event', async () => {
+    // The retry timer is the SDK's (10–15 min); fake timers drive it, real
+    // sockets carry the hello. Only setTimeout is faked, and it keeps pace
+    // with real time so the polling helpers still run. The advance stops
+    // right past the retry: further and the SDK's 15 s handshake deadline
+    // would trip before the real handshake could complete.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'], shouldAdvanceTime: true })
+    double.setUpgrade('refuse')
+    const c = connect()
+    await until(() => c.blocked.length === 1)
+    double.setUpgrade('hello')
+    await vi.advanceTimersByTimeAsync(c.blocked[0]!.info.retryInMs! + 1)
+    await until(() => c.connection.connected, 4_000)
+    expect(c.readies).toBe(1)
+    expect(c.states).toEqual(['connecting', 'terminal', 'ready'])
+    expect(double.upgrades).toBe(2)
+    expect(c.blocked).toHaveLength(1)
+  }, 10_000)
+
+  it('a 1008 AFTER hello.ok (key rotated) is an eviction, not a verdict: reconnecting, and the next hello decides — accepted → ready', async () => {
     const c = connect()
     await until(() => c.connection.connected)
     double.served[0]!.socket.close(1008, 'API key rotated')
-    await until(() => c.terminal.length === 1)
-    expect(c.terminal[0]!.reason).toBe('auth')
-    expect(c.terminal[0]!.detail).toMatch(/API key rotated/)
-    await pause(500)
-    expect(double.upgrades).toBe(1)
+    await until(() => c.readies === 2, 4_000)
+    expect(c.states).toEqual(['connecting', 'ready', 'reconnecting', 'ready'])
+    expect(c.blocked).toEqual([])
+    expect(c.wakes).toEqual([])
   })
 
-  it('a 1008 that is NOT a verdict on the key (the server’s HELLO timer) gets a fresh client, not a sit-out', async () => {
-    // The SDK stops reconnecting on any 1008; a slow handshake must not read
-    // as a refused credential (OpenClaw quick fix #14 found exactly this).
+  it('a 1008 AFTER hello.ok (key rotated) when the next hello is refused: reconnecting, then terminal', async () => {
+    const c = connect()
+    await until(() => c.connection.connected)
+    double.setUpgrade('refuse')
+    double.served[0]!.socket.close(1008, 'API key rotated')
+    await until(() => c.connection.state === 'terminal', 4_000)
+    expect(c.states).toEqual(['connecting', 'ready', 'reconnecting', 'terminal'])
+    expect(c.blocked).toHaveLength(1)
+    expect(c.blocked[0]!.detail).toMatch(/close 1008 Invalid token/)
+    expect(double.upgrades).toBe(2)
+  })
+
+  it('a 1008 that is NOT a verdict on the key (the server’s HELLO timer) is the normal backoff, never terminal', async () => {
+    // A slow handshake must not read as a refused credential (OpenClaw quick
+    // fix #14 found exactly this); the SDK reads 1008 by the server's reason.
     double.setUpgrade('hello-required')
     const c = connect()
     await until(() => double.upgrades >= 2, 4_000)
-    expect(c.terminal).toEqual([])
+    expect(c.blocked).toEqual([])
+    expect(c.connection.state).toBe('reconnecting')
     double.setUpgrade('hello')
     await until(() => c.connection.connected, 4_000)
+    expect(c.states).not.toContain('terminal')
     expect(c.wakes).toEqual([])
   }, 10_000)
 
   it('stop() after terminal keeps the state terminal — a refused key must not read as a clean close', async () => {
     double.setUpgrade('refuse')
     const c = connect()
-    await until(() => c.terminal.length === 1)
+    await until(() => c.connection.state === 'terminal')
     c.connection.stop()
     expect(c.connection.state).toBe('terminal')
+    expect(c.states).toEqual(['connecting', 'terminal'])
   })
 
   // ─── transient failures ─────────────────────────────────────────────────
@@ -227,10 +267,11 @@ describe('IntegrationConnection', () => {
     double.setUpgrade(503)
     const c = connect()
     await until(() => double.upgrades >= 2, 4_000)
-    expect(c.terminal).toEqual([])
-    expect(['reconnecting', 'connecting']).toContain(c.connection.state)
+    expect(c.blocked).toEqual([])
+    expect(c.connection.state).toBe('reconnecting')
     double.setUpgrade('hello')
     await until(() => c.connection.connected, 6_000)
+    expect(c.states).toEqual(['connecting', 'reconnecting', 'ready'])
     expect(c.wakes).toEqual([])
   }, 12_000)
 
@@ -241,6 +282,7 @@ describe('IntegrationConnection', () => {
     await until(() => c.connection.state === 'reconnecting')
     await until(() => double.served.length === 2 && c.connection.connected, 6_000)
     expect(c.readies).toBe(2)
+    expect(c.states).toEqual(['connecting', 'ready', 'reconnecting', 'ready'])
     expect(c.wakes).toEqual([])
   }, 10_000)
 
@@ -249,47 +291,35 @@ describe('IntegrationConnection', () => {
     await until(() => c.connection.connected)
     c.connection.stop()
     expect(c.connection.state).toBe('closed')
+    expect(c.states).toEqual(['connecting', 'ready', 'closed'])
     await pause(100)
     expect(c.connection.connected).toBe(false)
+    expect(double.upgrades).toBe(1) // stopped means stopped: no reconnect
   })
 })
 
-describe('the liveness transport', () => {
-  it('one missed server ping does NOT trip the watchdog; two in a row do (scaled: ping every 450 ms, window 1000 ms)', async () => {
-    // Production: the server pings every 45 s, the window is 100 s — one
-    // missed ping (the next lands at 90 s) must be tolerated, two must not.
-    const c = connect('me', { webSocket: livenessWebSocket({ livenessMs: 1_000 }) })
-    await until(() => c.connection.connected)
-    expect(double.served).toHaveLength(1)
-    await pause(450)
-    double.ping() // t≈450
-    await pause(900) // the t≈900 ping is missed; the next lands at t≈1350, 900 ms after the last
-    double.ping()
-    await pause(300) // t≈1650: well past where a tripped watchdog (at t≈1450) would have reconnected
-    expect(double.served).toHaveLength(1)
-    expect(c.connection.connected).toBe(true)
-    // Now two pings are missed: nothing for 1000 ms after the last one.
-    await until(() => double.served.length === 2, 3_000)
-    expect(c.terminal).toEqual([])
-  }, 10_000)
-
-  it('terminates a socket that goes silent so the SDK reconnects; server pings keep it alive', async () => {
-    // Silent server: nothing after hello.ok. With a 300 ms liveness window the
-    // transport terminates and the SDK reconnects — a second upgrade arrives.
-    const c = connect('me', { webSocket: livenessWebSocket({ livenessMs: 300 }) })
-    await until(() => c.connection.connected)
-    await until(() => double.served.length >= 2, 3_000)
-    expect(c.terminal).toEqual([])
-    for (const conn of connections) conn.stop()
-    connections = []
-    await double.close()
-
-    // A server that pings inside the window: one connection, held.
-    double = await startServerDouble({ pingEveryMs: 100 })
-    const kept = connect('me', { webSocket: livenessWebSocket({ livenessMs: 300 }) })
-    await until(() => kept.connection.connected)
-    await pause(900)
-    expect(double.served).toHaveLength(1)
-    expect(kept.connection.connected).toBe(true)
-  }, 10_000)
+describe('socketStateOf — the SDK’s states in the status vocabulary', () => {
+  it.each<[RealtimeState, SocketState, SocketState]>([
+    ['idle', 'idle', 'idle'],
+    ['connecting', 'idle', 'connecting'],
+    ['connecting', 'connecting', 'connecting'],
+    ['ready', 'connecting', 'ready'],
+    ['backoff', 'ready', 'reconnecting'],
+    ['backoff', 'connecting', 'reconnecting'],
+    ['connecting', 'reconnecting', 'reconnecting'],
+    ['ready', 'reconnecting', 'ready'],
+    ['blocked', 'connecting', 'terminal'],
+    ['blocked', 'reconnecting', 'terminal'],
+    // The SDK's slow retry out of blocked does not lift the verdict…
+    ['connecting', 'terminal', 'terminal'],
+    // …an accepted hello does; a server that stopped answering is the normal backoff.
+    ['ready', 'terminal', 'ready'],
+    ['backoff', 'terminal', 'reconnecting'],
+    ['stopped', 'ready', 'closed'],
+    ['stopped', 'reconnecting', 'closed'],
+    ['stopped', 'connecting', 'closed'],
+    ['stopped', 'terminal', 'terminal'],
+  ])('SDK %s after status %s → %s', (next, previous, expected) => {
+    expect(socketStateOf(next, previous)).toBe(expected)
+  })
 })

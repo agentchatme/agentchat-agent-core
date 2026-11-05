@@ -19,7 +19,7 @@ export interface RunRequest {
   readonly budgetMs: number
   /**
    * Aborted when the integration is stopping (daemon shutdown, identity
-   * change, refused key). A runner passes it to `spawnRun`, which SIGTERMs the
+   * change). A runner passes it to `spawnRun`, which SIGTERMs the
    * run's process group and SIGKILLs after a grace; the outcome is `failed`
    * with an "interrupted" detail. Optional so a runner that cannot interrupt
    * still satisfies the contract.

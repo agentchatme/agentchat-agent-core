@@ -7,7 +7,6 @@ import { resolveDaemonConfig } from '../daemon/config.js'
 import { idle } from '../daemon/health.js'
 import type { IntegrationClient } from '../client-identity.js'
 import { Integration } from './integration.js'
-import type { TerminalReason } from './connection.js'
 import { integrationDisabledBy, resolveRunBudgetMs, resolveRunProfile, type RunProfile } from './profile.js'
 import type { RunRunner } from './runner.js'
 import { writeIntegrationStatus } from './status.js'
@@ -24,6 +23,11 @@ import { writeIntegrationStatus } from './status.js'
 //   credentials                 → connect and wake.
 //   credentials change          → follow them.
 //   AGENTCHAT_INTEGRATION=off   → stay resident, hold nothing, wake nothing.
+//
+// A refused key is not this loop's case: the SDK's client stays up in
+// `blocked` and tries a fresh hello every 10–15 minutes (`status` reads
+// `socket terminal` meanwhile), so a rotated-back key or a reinstated account
+// reconnects on its own, and a different key is simply a credential change.
 //
 // The only thing that removes this process is an explicit `daemon disable`.
 //
@@ -132,8 +136,6 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
   let live: Integration | null = null
   let liveFingerprint: string | null = null
   let observedFingerprint: string | null = null
-  /** A credential the server refused. Sit out until it CHANGES. */
-  let refused: string | null = null
   /** Consecutive start failures, for backoff. Reset on success or on a new credential. */
   let failures = 0
   let lastFailure: string | null = null
@@ -223,64 +225,44 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
       observedFingerprint = fp
       failures = 0
       lastFailure = null
-      // A refusal applies only to the exact rejected credential.
-      if (fp !== refused) refused = null
       if (fp === null || disabled) offStatus(fp === null ? null : resolveIdentity(home)?.handle ?? null)
     }
 
     if (fp === null) {
-      // Signed out, or never signed in. Idle — and forget any refusal, since
-      // the next credential to appear deserves a fresh attempt.
-      if (refused !== null) refused = null
+      // Signed out, or never signed in. Idle.
     } else if (disabled) {
       // Signed in, switched off. Resident, silent.
     } else if (fp !== liveFingerprint) {
-      if (fp === refused) {
-        // Same key the server already rejected; wait for a different one
-        // rather than hammering the endpoint.
-      } else {
-        try {
-          const cfg = await resolveDaemonConfig({ home, workdir, client: opts.client })
-          const candidate = new Integration({
-            cfg,
-            runner: opts.runner,
-            client: opts.client,
-            manualPointer: opts.manualPointer,
-            profile,
-            budgetMs,
-            onTerminal: (reason: TerminalReason, detail: string) => {
-              live = null
-              liveFingerprint = null
-              lastFailure = detail
-              idle(home)
-              // The server refused or revoked this exact key. Sit out until it
-              // changes; retrying would start a paid run per attempt against a
-              // key every hosted tool rejects.
-              log.warn(`credential refused (${reason}: ${detail}) — idling until it changes`)
-              refused = fp
-            },
-          })
-          await candidate.start()
-          live = candidate
-          liveFingerprint = fp
-          failures = 0
-          lastFailure = null
-        } catch (err) {
-          // Runtime not ready (host CLI missing or not signed in), network
-          // down, whatever. Stay resident and try again later — exiting would
-          // just make the service manager restart us in a loop. Backed off and
-          // de-duplicated so a condition that lasts days does not fill the log.
-          const msg = String(err instanceof Error ? err.message : err)
-          if (msg !== lastFailure) {
-            log.warn(`not connecting yet: ${msg}`)
-            lastFailure = msg
-            offStatus(resolveIdentity(home)?.handle ?? null)
-          }
-          failures += 1
-          live = null
-          liveFingerprint = null
-          idle(home)
+      try {
+        const cfg = await resolveDaemonConfig({ home, workdir, client: opts.client })
+        const candidate = new Integration({
+          cfg,
+          runner: opts.runner,
+          client: opts.client,
+          manualPointer: opts.manualPointer,
+          profile,
+          budgetMs,
+        })
+        await candidate.start()
+        live = candidate
+        liveFingerprint = fp
+        failures = 0
+        lastFailure = null
+      } catch (err) {
+        // Runtime not ready (host CLI missing or not signed in), network
+        // down, whatever. Stay resident and try again later — exiting would
+        // just make the service manager restart us in a loop. Backed off and
+        // de-duplicated so a condition that lasts days does not fill the log.
+        const msg = String(err instanceof Error ? err.message : err)
+        if (msg !== lastFailure) {
+          log.warn(`not connecting yet: ${msg}`)
+          lastFailure = msg
+          offStatus(resolveIdentity(home)?.handle ?? null)
         }
+        failures += 1
+        live = null
+        liveFingerprint = null
+        idle(home)
       }
     }
 

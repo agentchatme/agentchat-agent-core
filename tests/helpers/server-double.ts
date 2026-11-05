@@ -19,8 +19,7 @@ import { textsFor } from './served-texts.js'
 //   * a number        — the upgrade is answered with that HTTP status (what a
 //                       load balancer does mid-deploy: 502/503).
 // After `hello.ok` the double can replay `drain` frames on every connection,
-// the way the server re-offers unacked envelopes right after the hello, and
-// can ping on an interval like the production server does every 45 s.
+// the way the server re-offers unacked envelopes right after the hello.
 // Every frame a client sends after the hello is recorded (`clientFrames`) —
 // the acks the SDK sends on receipt are what the tests look for there.
 //
@@ -48,8 +47,6 @@ export interface ServerDoubleOptions {
   invites?: ReadonlyArray<{ id: string; group_id?: string; group_name?: string; inviter_handle?: string }>
   /** HTTP status for GET /v1/texts; 200 serves the texts. */
   textsStatus?: number
-  /** Ping every live socket on this interval (the production server pings every 45 s). */
-  pingEveryMs?: number
 }
 
 export interface Served {
@@ -76,8 +73,6 @@ export interface ServerDouble {
   setTextsStatus(status: number): void
   /** Push a frame to the most recent live socket. */
   send(frame: unknown): void
-  /** Ping the most recent live socket once (a control frame, like the production server's 45 s ping). */
-  ping(): void
   /** Acks recorded across every connection. */
   acks(): string[]
   close(): Promise<void>
@@ -92,7 +87,6 @@ export async function startServerDouble(options: ServerDoubleOptions = {}): Prom
   const caps = options.helloCapabilities ?? ['ack']
   const served: Served[] = []
   const requests: string[] = []
-  const pingers: Array<ReturnType<typeof setInterval>> = []
 
   const server = http.createServer((req, res) => {
     const url = new URL(req.url ?? '/', 'http://127.0.0.1')
@@ -168,15 +162,9 @@ export async function startServerDouble(options: ServerDoubleOptions = {}): Prom
       if (!last) throw new Error('no live socket to send on')
       last.socket.send(JSON.stringify(frame))
     },
-    ping: () => {
-      const last = served[served.length - 1]
-      if (!last) throw new Error('no live socket to ping')
-      last.socket.ping()
-    },
     acks: () =>
       served.flatMap((s) => s.clientFrames.filter((f) => f['type'] === 'ack').map((f) => String(f['message_id']))),
     close: async () => {
-      for (const timer of pingers) clearInterval(timer)
       for (const entry of served) entry.socket.terminate()
       await new Promise<void>((resolve) => wss.close(() => resolve()))
       await new Promise<void>((resolve) => server.close(() => resolve()))
@@ -221,13 +209,6 @@ export async function startServerDouble(options: ServerDoubleOptions = {}): Prom
           const accepted = caps.filter((c) => asked.includes(c))
           ws.send(JSON.stringify({ type: 'hello.ok', capabilities: accepted }))
           for (const d of drain) ws.send(JSON.stringify(d))
-          if (options.pingEveryMs !== undefined) {
-            const timer = setInterval(() => {
-              if (ws.readyState === ws.OPEN) ws.ping()
-            }, options.pingEveryMs)
-            pingers.push(timer)
-            ws.on('close', () => clearInterval(timer))
-          }
           return
         }
         entry.clientFrames.push(frame)
