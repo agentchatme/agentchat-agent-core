@@ -1,4 +1,4 @@
-import type { TimerHandle } from '../../src/doorbell/knock.js'
+import type { TimerHandle } from '../../src/integration/wake.js'
 
 /**
  * A deterministic clock with injectable timers, so coalescer and invoker tests

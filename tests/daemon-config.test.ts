@@ -2,7 +2,9 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
-import { resolveDaemonConfig, wsUrlFor } from '../src/daemon/config.js'
+import { resolveDaemonConfig, wsBaseFor, wsUrlFor } from '../src/daemon/config.js'
+
+const CLIENT = { runtime: 'generic' as const, version: '0.0.0-test' }
 import {
   launchdPlist,
   planForTest,
@@ -35,13 +37,16 @@ afterEach(() => {
   fs.rmSync(root, { recursive: true, force: true })
 })
 
-describe('wsUrlFor', () => {
-  it('derives the socket URL from the API base', () => {
+describe('wsBaseFor / wsUrlFor', () => {
+  it('derives the socket base (what the SDK takes) and the socket URL from the API base', () => {
+    expect(wsBaseFor('https://api.agentchat.me')).toBe('wss://api.agentchat.me')
+    expect(wsBaseFor('http://localhost:3000')).toBe('ws://localhost:3000')
     expect(wsUrlFor('https://api.agentchat.me')).toBe('wss://api.agentchat.me/v1/ws')
     expect(wsUrlFor('http://localhost:3000')).toBe('ws://localhost:3000/v1/ws')
   })
 
   it('tolerates a trailing slash rather than producing a double slash', () => {
+    expect(wsBaseFor('https://api.agentchat.me/')).toBe('wss://api.agentchat.me')
     expect(wsUrlFor('https://api.agentchat.me/')).toBe('wss://api.agentchat.me/v1/ws')
   })
 })
@@ -51,29 +56,25 @@ describe('resolveDaemonConfig reads the home it is GIVEN', () => {
     fs.writeFileSync(path.join(homeA, 'credentials'), creds('agent-a'))
     fs.writeFileSync(path.join(homeB, 'credentials'), creds('agent-b'))
 
-    const a = await resolveDaemonConfig({ home: homeA })
-    const b = await resolveDaemonConfig({ home: homeB })
+    const a = await resolveDaemonConfig({ home: homeA, workdir: path.join(homeA, 'w'), client: CLIENT })
+    const b = await resolveDaemonConfig({ home: homeB, workdir: path.join(homeB, 'w'), client: CLIENT })
 
     expect(a.handle).toBe('agent-a')
     expect(b.handle).toBe('agent-b')
     expect(a.home).toBe(path.resolve(homeA))
   })
 
-  it('defaults the workdir inside its own home, so two daemons never share scratch', async () => {
+  it('uses the workdir it is GIVEN — it never derives one (the old `<home>/daemon-workdir` default is gone)', async () => {
     fs.writeFileSync(path.join(homeA, 'credentials'), creds('agent-a'))
-    fs.writeFileSync(path.join(homeB, 'credentials'), creds('agent-b'))
-
-    const a = await resolveDaemonConfig({ home: homeA })
-    const b = await resolveDaemonConfig({ home: homeB })
-
-    expect(a.workdir).toBe(path.join(path.resolve(homeA), 'daemon-workdir'))
-    expect(a.workdir).not.toBe(b.workdir)
+    const a = await resolveDaemonConfig({ home: homeA, workdir: path.join(root, 'scratch', 'a'), client: CLIENT })
+    expect(a.workdir).toBe(path.resolve(root, 'scratch', 'a'))
+    expect(a.workdir).not.toContain('daemon-workdir')
   })
 
-  it('honours a per-agent api_base when deriving the socket URL', async () => {
+  it('honours a per-agent api_base when deriving the socket base', async () => {
     fs.writeFileSync(path.join(homeA, 'credentials'), creds('agent-a', 'http://localhost:3000'))
-    const a = await resolveDaemonConfig({ home: homeA })
-    expect(a.wsUrl).toBe('ws://localhost:3000/v1/ws')
+    const a = await resolveDaemonConfig({ home: homeA, workdir: path.join(homeA, 'w'), client: CLIENT })
+    expect(a.wsBase).toBe('ws://localhost:3000')
   })
 
   it('resolves an environment key handle authoritatively instead of borrowing the file handle', async () => {
@@ -86,12 +87,12 @@ describe('resolveDaemonConfig reads the home it is GIVEN', () => {
       }),
     ))
 
-    const config = await resolveDaemonConfig({ home: homeA })
+    const config = await resolveDaemonConfig({ home: homeA, workdir: path.join(homeA, 'w'), client: CLIENT })
     expect(config.handle).toBe('environment-agent')
   })
 
   it('refuses to start against a home with no identity', async () => {
-    await expect(resolveDaemonConfig({ home: homeB })).rejects.toThrow(/no AgentChat identity/)
+    await expect(resolveDaemonConfig({ home: homeB, workdir: path.join(homeB, 'w'), client: CLIENT })).rejects.toThrow(/no AgentChat identity/)
   })
 })
 

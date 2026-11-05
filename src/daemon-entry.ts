@@ -1,6 +1,6 @@
 // ─── @agentchatme/agent-core/daemon ─────────────────────────────────────────
 //
-// The doorbell daemon's runtime half, kept OUT of the main entry on purpose.
+// The integration daemon's runtime half, kept OUT of the main entry on purpose.
 //
 // `ws` is CommonJS and uses dynamic require, so anything that bundles it must
 // be built as a daemon binary rather than a CLI. Splitting the entry points
@@ -9,29 +9,32 @@
 // is not supported" at startup) simply cannot occur there.
 //
 // The RUNNER — how to start one headless run of a given coding agent — is
-// deliberately NOT here. That is the one part of the doorbell that genuinely
-// differs per host, so each integration implements `RunRunner` itself.
+// deliberately NOT here. That is the one part of the integration that
+// genuinely differs per host, so each integration implements `RunRunner` itself.
 
-export { runDoorbell, type RunDoorbellOpts } from './doorbell/run.js'
-export { Doorbell, type DoorbellOptions } from './doorbell/doorbell.js'
+export { runIntegration, type RunIntegrationOpts } from './integration/run.js'
+export { Integration, type IntegrationOptions } from './integration/integration.js'
 export {
-  DoorbellSocket,
-  type DoorbellSocketOptions,
-  type DoorbellSocketEvents,
-  type Knock,
-  type MessageKnock,
-  type InviteKnock,
+  IntegrationConnection,
+  type IntegrationConnectionOptions,
+  type IntegrationConnectionEvents,
+  type Wake,
+  type MessageWake,
+  type ReminderWake,
+  type InviteWake,
   type TerminalReason,
-} from './doorbell/socket.js'
+} from './integration/connection.js'
+export { livenessWebSocket, HANDSHAKE_TIMEOUT_MS, LIVENESS_MS, type TransportOptions } from './integration/transport.js'
 export {
-  DoorbellInvoker,
+  IntegrationInvoker,
   RETRY_LADDER_MS,
   PREFLIGHT_WATCH_MS,
-  type DoorbellInvokerOptions,
+  type IntegrationInvokerOptions,
   type InvokerCounters,
-} from './doorbell/invoker.js'
-export { KnockCoalescer, DEFAULT_KNOCK_DEBOUNCE_MS, type KnockCoalescerOptions } from './doorbell/knock.js'
-export { spawnRun, redactDiagnostic, type SpawnRunSpec } from './doorbell/spawn-run.js'
+} from './integration/invoker.js'
+export { WakeCoalescer, DEFAULT_WAKE_DEBOUNCE_MS, type WakeCoalescerOptions } from './integration/wake.js'
+export { OfferedInvites, OFFERED_INVITES_FILE, offeredInvitesPath, type OfferedInviteStore } from './integration/invites.js'
+export { spawnRun, redactDiagnostic, type SpawnRunSpec } from './integration/spawn-run.js'
 export type {
   RunRunner,
   RunRequest,
@@ -39,5 +42,5 @@ export type {
   RunOutcomeState,
   RunKind,
   RunPreflight,
-} from './doorbell/runner.js'
-export { resolveDaemonConfig, wsUrlFor, type DaemonConfig, type ResolveDaemonOpts } from './daemon/config.js'
+} from './integration/runner.js'
+export { resolveDaemonConfig, wsBaseFor, wsUrlFor, type DaemonConfig, type ResolveDaemonOpts } from './daemon/config.js'

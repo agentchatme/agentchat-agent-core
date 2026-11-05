@@ -7,7 +7,7 @@ import { clearCredentials, readCredentials, writeCredentials, writePending, read
 import { recordOfferDeclined, offerDeclined, clearOfferDeclined } from '../src/identity/state.js'
 import { writeAnchor, removeAnchorAt, renderAnchorBlock } from '../src/anchor/block.js'
 import { markAlwaysOnWanted, clearAlwaysOnWanted, beat, idle, markAlwaysOnOptOut } from '../src/daemon/health.js'
-import { writeDoorbellStatus, clearDoorbellStatus } from '../src/doorbell/status.js'
+import { writeIntegrationStatus, clearIntegrationStatus } from '../src/integration/status.js'
 
 // ─── Every operation acts on the home it is GIVEN and nowhere else ──────────
 //
@@ -30,10 +30,12 @@ function snapshot(dir: string): Record<string, string> {
   return out
 }
 
+const line = (handle: string): string => `I am @${handle} on AgentChat (api.agentchat.me). Served line, test copy.`
+
 function populate(home: string, handle: string): void {
   fs.mkdirSync(home, { recursive: true })
   writeCredentials(home, { api_key: 'ac_' + handle.padEnd(40, 'x'), handle })
-  writeAnchor(path.join(home, 'ANCHOR.md'), renderAnchorBlock(handle), handle)
+  writeAnchor(path.join(home, 'ANCHOR.md'), renderAnchorBlock(line(handle)), handle)
   markAlwaysOnWanted(home)
   beat(home)
 }
@@ -62,7 +64,7 @@ describe('operations on home A leave home B byte-identical', () => {
       clearOfferDeclined(h)
     }],
     ['writeAnchor/removeAnchorAt', (h) => {
-      writeAnchor(path.join(h, 'ANCHOR.md'), renderAnchorBlock('renamed-agent'), 'renamed-agent')
+      writeAnchor(path.join(h, 'ANCHOR.md'), renderAnchorBlock(line('renamed-agent')), 'renamed-agent')
       removeAnchorAt(path.join(h, 'ANCHOR.md'))
     }],
     ['always-on markers', (h) => {
@@ -70,13 +72,13 @@ describe('operations on home A leave home B byte-identical', () => {
       markAlwaysOnOptOut(h)
       idle(h)
     }],
-    ['doorbell status', (h) => {
-      writeDoorbellStatus(h, {
-        version: 1, updated_at: new Date().toISOString(), pid: 1, runtime: 'r', handle: 'agent-a', profile: 'answer', socket: 'ready',
-        ack_negotiated: true, knocks: 1, knocks_absorbed: 0, invites: 0, runs_started: 0, runs_ok: 0, runs_failed: 0, runs_timed_out: 0,
-        runs_not_started: 0, last_run: null, retry_rung: 0, retry_due_at: null, last_error: null,
+    ['integration status', (h) => {
+      writeIntegrationStatus(h, {
+        version: 2, updated_at: new Date().toISOString(), pid: 1, runtime: 'r', handle: 'agent-a', profile: 'answer', socket: 'ready',
+        wakes: 1, wakes_absorbed: 0, invites: 0, runs_started: 0, runs_ok: 0, runs_failed: 0, runs_timed_out: 0,
+        runs_not_started: 0, runs_skipped_empty: 0, last_run: null, retry_rung: 0, retry_due_at: null, last_error: null, texts: null,
       })
-      clearDoorbellStatus(h)
+      clearIntegrationStatus(h)
     }],
   ]
 

@@ -1,3 +1,4 @@
+import type { IntegrationClient } from '../client-identity.js'
 import type { ResolvedIdentity } from './credentials.js'
 
 export type Verdict = 'PASS' | 'WARN' | 'FAIL'
@@ -6,6 +7,13 @@ export interface DoctorCheck {
   name: string
   verdict: Verdict
   detail: string
+}
+
+/** What the shared doctor hands a host's extra checks. */
+export interface DoctorContext {
+  fix?: boolean
+  /** The served identity line for this agent, or null when the server could not be reached and nothing is cached. */
+  identityLine: string | null
 }
 
 /**
@@ -30,14 +38,16 @@ export interface HostProfile {
   label: string
   /** Stable machine identifier for `--json`, e.g. `claude-code`. */
   id: string
+  /** How this integration names itself to the server: the texts runtime and its own version. */
+  client: IntegrationClient
   /** THE identity home for this agent. */
   home(): string
   /** This host's always-loaded instruction file. */
   anchorFile(): string
   /** Exactly what a user types to reach this integration. */
   invocation(): string
-  /** Render the anchor block body this host wants (normally the identity block). */
-  renderAnchor(handle: string): string
+  /** Render the anchor block body this host wants from the served identity line (normally `renderAnchorBlock`). */
+  renderAnchor(identityLine: string): string
   /**
    * What to call the anchor in output. Defaults to the instruction file's own
    * basename (`CLAUDE.md`, `AGENTS.md`), which is what a user actually looks
@@ -51,13 +61,16 @@ export interface HostProfile {
    */
   isWired?(): boolean
   /**
-   * Place the doorbell's four texts for a freshly established identity: the
+   * Place the integration's texts for a freshly established identity: the
    * identity line, the manual, the hosted tool server with the key, and
    * whatever the key's home is on this runtime. Called after register, login
-   * and recover (every time the key changes), and by `doctor --fix`. Returns
-   * report lines for the user. When absent, only the anchor is written.
+   * and recover (every time the key changes), and by `doctor --fix`.
+   * `identityLine` is the served line for this agent (fetched just before,
+   * or the cached one), or null when neither could be had — the host then
+   * leaves the anchor for `doctor --fix` and says so. Returns report lines.
+   * When absent, only the anchor is written.
    */
-  place?(handle: string, apiKey: string): string[]
+  place?(handle: string, apiKey: string, identityLine: string | null): string[]
   /**
    * Undo `place` for the identity being signed out: remove the key from the
    * tool server registration and anything else that would still authenticate
@@ -72,7 +85,7 @@ export interface HostProfile {
    */
   unplace?(identity: ResolvedIdentity | null): string[]
   /** Host-specific doctor checks, appended after the shared ones. */
-  extraDoctorChecks?(opts: { fix?: boolean }): DoctorCheck[]
+  extraDoctorChecks?(context: DoctorContext): DoctorCheck[]
   /** Extra lines printed after a successful logout. */
   logoutHints?(): string[]
 }

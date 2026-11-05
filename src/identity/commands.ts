@@ -12,12 +12,13 @@ import {
   clearPending,
 } from './credentials.js'
 import { clearOfferDeclined } from './state.js'
-import { startRecovery } from './recover-request.js'
 import { writeAnchor, removeAnchorAt, readAnchorHandleAt, hasAnchorAt, anchorIsCurrentAt } from '../anchor/block.js'
-import { traySummary } from '../wire/index.js'
+import { traySummary } from '../integration/tray.js'
+import { loadTexts } from '../integration/texts.js'
+import { identityLineOf } from '../skill/identity-line.js'
 import { anchorLabelOf, type DoctorCheck, type HostProfile, type Verdict } from './host-profile.js'
-import { CODING_AGENTS_CLIENT_IDENTITY } from '../client-identity.js'
-import { formatDoorbellStatus, readDoorbellStatus } from '../doorbell/status.js'
+import { clientIdentityOf } from '../client-identity.js'
+import { formatIntegrationStatus, readIntegrationStatus } from '../integration/status.js'
 
 // ─── Identity commands, for exactly one agent ───────────────────────────────
 //
@@ -36,6 +37,10 @@ import { formatDoorbellStatus, readDoorbellStatus } from '../doorbell/status.js'
 // host argument to get wrong, and no branch that could reach another agent's
 // files. Every time the key changes (register, login, recover) the profile's
 // `place` runs, so the hosted tool server always carries the current key.
+//
+// The identity line the anchor carries is the server's (`GET /v1/texts`,
+// fetched for this agent just before placing; the identity-home cache when
+// the server cannot be reached). No copy of it lives here.
 
 // Canonical handle rule, mirrored from the server so obviously-bad input fails
 // locally with a helpful message instead of a round-trip.
@@ -145,7 +150,7 @@ function describeApiError(err: unknown, invocation: string): string {
 }
 
 const NEXT_HINT =
-  'Open a new session for the hosted AgentChat tools to pick up the key; the doorbell daemon follows the credential on its own.'
+  'Open a new session for the hosted AgentChat tools to pick up the key; the integration daemon follows the credential on its own.'
 
 export interface RegisterOpts {
   email?: string
@@ -188,33 +193,53 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
   const invocation = (): string => profile.invocation()
   const apiErr = (err: unknown): string => describeApiError(err, invocation())
   const LABEL = profile.label
+  const clientIdentity = clientIdentityOf(profile.client)
+
+  const apiClient = (apiKey: string, apiBase: string): AgentChatClient =>
+    new AgentChatClient({ apiKey, baseUrl: apiBase, clientIdentity, timeoutMs: 15_000 })
 
   /**
-   * Place the doorbell for THIS agent's new key: the identity line, the manual,
-   * the hosted tool server with the key. A profile without `place` gets the
-   * anchor alone (the identity line in its instruction file).
+   * The served identity line for this agent: fetched now, else the cached
+   * one, else null (offline and never fetched). The CLI never writes an
+   * identity line it did not get from the server.
    */
-  function placeIdentity(handle: string, apiKey: string): string[] {
+  async function servedIdentityLine(apiKey: string, apiBase: string): Promise<string | null> {
+    const loaded = await loadTexts({ home: profile.home(), runtime: profile.client.runtime, client: apiClient(apiKey, apiBase) })
+    return loaded === null ? null : identityLineOf(loaded.texts)
+  }
+
+  /**
+   * Place the integration for THIS agent's new key: the identity line, the
+   * manual, the hosted tool server with the key. A profile without `place`
+   * gets the anchor alone (the identity line in its instruction file).
+   */
+  async function placeIdentity(handle: string, apiKey: string, apiBase: string): Promise<string[]> {
+    const identityLine = await servedIdentityLine(apiKey, apiBase)
     if (profile.place !== undefined) {
       try {
-        return profile.place(handle, apiKey)
+        return profile.place(handle, apiKey, identityLine)
       } catch (err) {
         return [`  placement FAILED — ${String(err)}; repair with \`${invocation()} doctor --fix\``]
       }
     }
-    return writeOurAnchor(handle)
+    return writeOurAnchor(handle, identityLine)
   }
 
   /** Write THIS agent's anchor. Only ever touches `profile.anchorFile()`. */
-  function writeOurAnchor(handle: string): string[] {
+  function writeOurAnchor(handle: string, identityLine: string | null): string[] {
     const file = profile.anchorFile()
     const label = anchorLabelOf(profile)
     // A host that wires itself separately must not be handed an identity block
     // before that wiring exists — it would announce a handle with nothing
     // listening. Once an anchor is already there, keep it current regardless.
     if (profile.isWired !== undefined && !profile.isWired() && !hasAnchorAt(file)) return []
+    if (identityLine === null) {
+      return [
+        `  ${label}: identity line not written — GET /v1/texts could not be reached and nothing is cached; run \`${invocation()} doctor --fix\` once online`,
+      ]
+    }
     try {
-      writeAnchor(file, profile.renderAnchor(handle), handle)
+      writeAnchor(file, profile.renderAnchor(identityLine), handle)
       return [`  ${label}: @${handle} → ${file}`]
     } catch (err) {
       return [`  ${label}: FAILED — ${String(err)}`]
@@ -254,7 +279,7 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
       try {
         const result = await AgentChatClient.verify(pending.pending_id, code, {
           baseUrl: pending.api_base ?? apiBase,
-          clientIdentity: CODING_AGENTS_CLIENT_IDENTITY,
+          clientIdentity,
         })
         writeCredentials(home, {
           api_key: result.apiKey,
@@ -270,7 +295,7 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
           [
             `Registered: @${pendingHandle} for ${LABEL}.`,
             `API key stored at ${credentialsPath(home)} (never commit this file).`,
-            ...placeIdentity(pendingHandle, result.apiKey),
+            ...(await placeIdentity(pendingHandle, result.apiKey, pending.api_base ?? apiBase)),
             '',
             `This handle belongs to your ${LABEL} agent. Another coding agent on this machine is a separate peer with its own handle — you can DM each other.`,
             `Other agents can DM you at @${pendingHandle}. Check \`${invocation()} status\` any time.`,
@@ -337,7 +362,7 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
         ...(opts.displayName ? { display_name: opts.displayName } : {}),
         ...(opts.description ? { description: opts.description } : {}),
         baseUrl: apiBase,
-        clientIdentity: CODING_AGENTS_CLIENT_IDENTITY,
+        clientIdentity,
       })
       writePending(home, {
         kind: 'register',
@@ -390,11 +415,7 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
     }
 
     try {
-      const client = new AgentChatClient({
-        apiKey,
-        baseUrl: apiBase,
-        clientIdentity: CODING_AGENTS_CLIENT_IDENTITY,
-      })
+      const client = apiClient(apiKey, apiBase)
       const me = await client.getMe()
       writeCredentials(home, {
         api_key: apiKey,
@@ -407,7 +428,7 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
         [
           `Signed in as @${me.handle} for ${LABEL}.`,
           `API key stored at ${credentialsPath(home)} (never commit this file).`,
-          ...placeIdentity(me.handle, apiKey),
+          ...(await placeIdentity(me.handle, apiKey, apiBase)),
           NEXT_HINT,
         ].join('\n'),
       )
@@ -443,7 +464,7 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
       try {
         const result = await AgentChatClient.recoverVerify(pending.pending_id, code, {
           baseUrl: pending.api_base ?? apiBase,
-          clientIdentity: CODING_AGENTS_CLIENT_IDENTITY,
+          clientIdentity,
         })
         writeCredentials(home, {
           api_key: result.apiKey,
@@ -457,7 +478,7 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
           [
             `Recovered: @${result.handle} for ${LABEL}.`,
             `New API key stored at ${credentialsPath(home)} (the old key is now revoked; never commit this file).`,
-            ...placeIdentity(result.handle, result.apiKey),
+            ...(await placeIdentity(result.handle, result.apiKey, pending.api_base ?? apiBase)),
             NEXT_HINT,
           ].join('\n'),
         )
@@ -510,7 +531,9 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
     }
 
     try {
-      const result = await startRecovery({ email, handle, apiBase })
+      // The handle rides along: one email can back several agents, and an
+      // email-only request is only unambiguous while it backs exactly one.
+      const result = await AgentChatClient.recover(email, { handle, baseUrl: apiBase, clientIdentity })
       if (!result.pending_id) {
         console.log(result.message || 'If an agent is registered with that email, a recovery code was sent to it.')
         return 0
@@ -542,7 +565,7 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
     const anchorFile = profile.anchorFile()
     const identity = resolveIdentity(home)
     const pending = readPending(home)
-    const doorbell = readDoorbellStatus(home)
+    const integration = readIntegrationStatus(home)
 
     if (identity === null) {
       if (opts.json) {
@@ -552,7 +575,9 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
             host: profile.id,
             pending: pending !== null,
             pending_kind: pending?.kind ?? null,
-            doorbell,
+            integration,
+            // The previous key, kept one release for scripts that read it.
+            doorbell: integration,
           }),
         )
       } else if (pending?.kind === 'recover') {
@@ -571,17 +596,13 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
     }
 
     let me: Awaited<ReturnType<AgentChatClient['getMe']>>
+    const client = apiClient(identity.apiKey, identity.apiBase)
     try {
-      const client = new AgentChatClient({
-        apiKey: identity.apiKey,
-        baseUrl: identity.apiBase,
-        clientIdentity: CODING_AGENTS_CLIENT_IDENTITY,
-      })
       me = await client.getMe()
     } catch (err) {
       // A refused key is not an unreachable server, and neither hides the
-      // doorbell: its socket state and last error (`terminal`, `auth rejected
-      // (close 1008 …)`) are exactly what explains the failure.
+      // integration: its socket state and last error (`terminal`, `auth
+      // rejected (close 1008 …)`) are exactly what explains the failure.
       const status = httpStatusOf(err)
       const refused = status === 401 || status === 403
       const detail = apiErr(err)
@@ -596,7 +617,8 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
             api_base: identity.apiBase,
             home,
             anchor: hasAnchorAt(anchorFile),
-            doorbell,
+            integration,
+            doorbell: integration,
           }),
         )
       } else {
@@ -610,14 +632,16 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
             `${identity.handle !== null ? `@${identity.handle}` : 'This agent'} — ${refused ? `key refused (HTTP ${status})` : 'AgentChat unreachable'}  (${LABEL})`,
             `Key source: ${identity.source} (${identity.source === 'file' ? credentialsPath(home) : 'AGENTCHAT_API_KEY'})`,
             `API: ${identity.apiBase}`,
-            ...formatDoorbellStatus(doorbell),
+            ...formatIntegrationStatus(integration),
           ].join('\n'),
         )
       }
       return 1
     }
 
-    const tray = await traySummary({ apiKey: identity.apiKey, apiBase: identity.apiBase }).catch(() => null)
+    const tray = await traySummary(client).catch(() => null)
+    const identityLine = await servedIdentityLine(identity.apiKey, identity.apiBase)
+    const anchorCurrent = identityLine === null ? null : anchorIsCurrentAt(anchorFile, identityLine)
 
     if (opts.json) {
       console.log(
@@ -631,8 +655,10 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
           api_base: identity.apiBase,
           home,
           anchor: hasAnchorAt(anchorFile),
-          anchor_current: anchorIsCurrentAt(anchorFile, me.handle),
-          doorbell,
+          /** null: the served texts were unavailable, so currency could not be checked. */
+          anchor_current: anchorCurrent,
+          integration,
+          doorbell: integration,
         }),
       )
     } else {
@@ -646,8 +672,8 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
           trayLine,
           `Key source: ${identity.source} (${identity.source === 'file' ? credentialsPath(home) : 'AGENTCHAT_API_KEY'})`,
           `API: ${identity.apiBase}`,
-          `Identity line: ${hasAnchorAt(anchorFile) ? (anchorIsCurrentAt(anchorFile, me.handle) ? 'current' : 'present (older text — `doctor --fix` refreshes it)') : 'missing'} (${anchorFile})`,
-          ...formatDoorbellStatus(doorbell),
+          `Identity line: ${hasAnchorAt(anchorFile) ? (anchorCurrent === null ? 'present (served texts unavailable — not checked)' : anchorCurrent ? 'current' : 'present (older text — `doctor --fix` refreshes it)') : 'missing'} (${anchorFile})`,
+          ...formatIntegrationStatus(integration),
         ].join('\n'),
       )
     }
@@ -708,6 +734,7 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
     const home = profile.home()
     const anchorFile = profile.anchorFile()
     const checks: DoctorCheck[] = []
+    let identityLine: string | null = null
 
     checks.push({ name: 'node', verdict: 'PASS', detail: process.version })
     checks.push({ name: 'home', verdict: 'PASS', detail: home })
@@ -724,11 +751,7 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
       const identity = resolveIdentity(home)
       if (identity !== null) {
         try {
-          const client = new AgentChatClient({
-            apiKey: identity.apiKey,
-            baseUrl: identity.apiBase,
-            clientIdentity: CODING_AGENTS_CLIENT_IDENTITY,
-          })
+          const client = apiClient(identity.apiKey, identity.apiBase)
           const started = Date.now()
           const me = await client.getMe()
           const verdict: Verdict = (me.status ?? 'active') === 'active' ? 'PASS' : 'WARN'
@@ -749,14 +772,23 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
         }
       }
 
-      // The identity line must name THIS agent, in the current published text.
-      // Releases of the old shared CLI wrote the anchor for every host on the
-      // machine whenever any one registered, so a two-agent box could end up
-      // with an instruction file announcing the OTHER agent's handle.
+      // The identity line must name THIS agent, in the text the server serves
+      // today. Releases of the old shared CLI wrote the anchor for every host
+      // on the machine whenever any one registered, so a two-agent box could
+      // end up with an instruction file announcing the OTHER agent's handle.
+      const apiBase = identity?.apiBase ?? creds.api_base ?? DEFAULT_API_BASE
+      identityLine = await servedIdentityLine(creds.api_key, apiBase)
       const claimed = readAnchorHandleAt(anchorFile)
-      const current = anchorIsCurrentAt(anchorFile, creds.handle)
-      if (claimed === creds.handle && current) {
+      const current = identityLine === null ? null : anchorIsCurrentAt(anchorFile, identityLine)
+      checks.push(
+        identityLine === null
+          ? { name: 'texts', verdict: 'WARN', detail: 'GET /v1/texts could not be reached and nothing is cached — the identity line cannot be checked or placed until it can' }
+          : { name: 'texts', verdict: 'PASS', detail: 'served texts in hand' },
+      )
+      if (claimed === creds.handle && current === true) {
         checks.push({ name: 'identity-line', verdict: 'PASS', detail: `@${claimed} in ${anchorFile}` })
+      } else if (claimed === creds.handle && current === null) {
+        checks.push({ name: 'identity-line', verdict: 'WARN', detail: `@${claimed} in ${anchorFile} (currency not checked: served texts unavailable)` })
       } else {
         const why =
           claimed === null
@@ -765,8 +797,8 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
               ? `${anchorFile} says @${claimed} but this agent is @${creds.handle}`
               : `${anchorFile} carries an older identity text for @${claimed}`
         if (opts.fix === true) {
-          const report = placeIdentity(creds.handle, creds.api_key)
-          const failed = report.some((l) => l.includes('FAILED'))
+          const report = await placeIdentity(creds.handle, creds.api_key, apiBase)
+          const failed = report.some((l) => l.includes('FAILED') || l.includes('not written'))
           checks.push({
             name: 'identity-line',
             verdict: failed ? 'FAIL' : 'PASS',
@@ -782,7 +814,7 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
       }
     }
 
-    if (profile.extraDoctorChecks !== undefined) checks.push(...profile.extraDoctorChecks(opts))
+    if (profile.extraDoctorChecks !== undefined) checks.push(...profile.extraDoctorChecks({ ...opts, identityLine }))
 
     console.log(checks.map((c) => `${c.verdict.padEnd(4)} ${c.name}: ${c.detail}`).join('\n'))
     return checks.some((c) => c.verdict === 'FAIL') ? 1 : 0

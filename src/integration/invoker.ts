@@ -1,87 +1,98 @@
 import * as crypto from 'node:crypto'
 import { log } from '../util/log.js'
-import { KnockCoalescer, DEFAULT_KNOCK_DEBOUNCE_MS, type TimerHandle } from './knock.js'
-import type { DoorbellPrompts } from './prompt.js'
+import { WakeCoalescer, DEFAULT_WAKE_DEBOUNCE_MS, type TimerHandle } from './wake.js'
+import type { RunPrompts } from './prompts.js'
 import type { RunKind, RunOutcome, RunRunner } from './runner.js'
-import type { InviteKnock } from './socket.js'
-import type { DoorbellLastRun } from './status.js'
+import type { InviteWake } from './connection.js'
+import { OfferedInvites, type OfferedInviteStore } from './invites.js'
+import type { IntegrationLastRun } from './status.js'
 
-// ─── Knock → one run. The only path from the socket to the agent ────────────
+// ─── Wake → one run. The only path from the socket to the agent ─────────────
 //
-// 1. Coalesce. Knocks inside a short window become one (`KnockCoalescer`).
+// 1. Coalesce. Wakes inside a short window become one (`WakeCoalescer`).
 // 2. Count. Ask the tray whether anything is waiting (`trayHasWaiting`: one
-//    `GET /v1/inbox?wait_ms=0&limit=1` — a count, never a card; marks nothing
-//    delivered). Empty → no run: nothing is owed, so the retry ladder resets
-//    too. A count that cannot be read (network, 5xx) is not evidence of an
-//    empty tray and the knock was real: the run starts anyway.
-// 3. Run. Start ONE headless run of the resident coding agent with the fixed
-//    knock prompt. The agent reads the tray with the hosted inbox tool, judges
+//    `GET /v1/inbox?limit=1` through the SDK — a count, never a card; marks
+//    nothing read). Empty → no run: nothing is owed, so the retry ladder
+//    resets too. A count that cannot be read (network, 5xx) is not evidence
+//    of an empty tray and the wake was real: the run starts anyway.
+// 3. Run. Start ONE headless run of the resident coding agent with the served
+//    wake text. The agent reads the tray with the hosted inbox tool, judges
 //    every card with the tray's own question, decides or sends through the
 //    hosted tools. The run's output is discarded.
 //
-// The count guards EVERY knock run — a frame, the connect-time catch-up, a
-// ladder re-knock, the preflight re-knock, the follow-on after a busy run — so
-// no source needs its own "is this worth a run?" logic. It is what keeps a
-// deferred conversation from costing a run per reconnect: `defer` leaves the
-// envelope stored, the server re-offers it as a plain `message.new` on every
-// (re)connect, and the tray (which hides the deferred card until its time or
-// a newer message) says nothing is waiting.
+// The count guards EVERY wake run — a frame, a reminder, the connect-time
+// catch-up, a ladder re-wake, the preflight re-wake, the follow-on after a
+// busy run — so no source needs its own "is this worth a run?" logic.
+// Sleep/wake, Wi-Fi roaming and every server deploy reconnect the whole
+// fleet; a reconnect with nothing waiting costs a count, not a run.
 //
-// One run at a time per agent, ever. A knock that lands while a run is in
+// One run at a time per agent, ever. A wake that lands while a run is in
 // flight earns exactly one more cycle after it (counted first, so a burst the
-// first run already answered costs a count, not a run); ten knocks during a
+// first run already answered costs a count, not a run); ten wakes during a
 // run still earn one.
 //
 // A run that fails to start (runtime missing, auth expired, non-zero exit with
-// nothing on stdout), fails, or exceeds its budget schedules a re-knock on a
+// nothing on stdout), fails, or exceeds its budget schedules a re-wake on a
 // local ladder (60 s, 5 min, 30 min), because a connected socket gets no
 // re-ring from the server. One outage climbs one rung: a retry already on its
-// way is never replaced by a later one. A successful knock run, or a count
-// that finds the tray empty, resets the ladder and cancels a pending re-knock:
+// way is never replaced by a later one. A successful wake run, or a count that
+// finds the tray empty, resets the ladder and cancels a pending re-wake:
 // nothing is owed any more.
 //
 // When the ladder is exhausted the invoker does not go deaf. It asks the
 // runner's `preflight()` every PREFLIGHT_WATCH_MS; if the runtime was found
 // unusable (signed out, binary gone) and later answers ok, that flip earns ONE
-// re-knock — a day's backlog behind a signed-out CLI is read when the user
+// re-wake — a day's backlog behind a signed-out CLI is read when the user
 // signs back in, not when the next new peer happens to write. If the first
 // probe already says ok, the failures are not the runtime's readiness and the
-// watch stops: the backlog waits for the next knock, as it always did. A knock
+// watch stops: the backlog waits for the next wake, as it always did. A wake
 // from any source while watching is served as usual and, if it succeeds, ends
 // the watch.
 //
 // `stop()` interrupts a run in flight: the run's `AbortSignal` fires, the
 // runner SIGTERMs the run's process group, and `settled()` resolves when it
-// has ended. A doorbell that stops without doing this leaves a model call
+// has ended. An integration that stops without doing this leaves a model call
 // running that nobody will read and that the next connect would run again.
 //
-// Group invites are the second knock kind: not on the tray, one run each with
-// the fixed invite prompt, serialized on the same worker, deduplicated by
-// invite id for the life of the process.
+// Group invites are the second wake kind: not on the tray, one run each with
+// the served invite prompt, serialized on the same worker. An invite is
+// OFFERED once per machine — the id is remembered in the identity home the
+// moment its run has started (`OfferedInvites`), so a daemon restart does not
+// start one paid run per still-pending invite. An invite whose run did not
+// start (runtime missing, signed out, the daemon stopping) is not recorded:
+// it is offered again on the next wake, and the next connect's listing finds
+// it still pending.
 //
-// The doorbell reads NO tray and makes NO verdicts. That is the run's job.
+// The prompts arrive lazily: the served texts may not have been fetched yet
+// when the first wake lands. A run with no texts in hand does not start — it
+// counts as `not_started`, and the wake retries on the ladder.
+//
+// The integration reads NO tray and makes NO verdicts. That is the run's job.
 
 export const RETRY_LADDER_MS: readonly number[] = [60_000, 300_000, 1_800_000]
 
 /** After the ladder is exhausted: how often the runtime is asked whether it is usable again. */
 export const PREFLIGHT_WATCH_MS = 5 * 60_000
 
-const MAX_SEEN_INVITES = 1_000
+const MAX_TAKEN = 1_000
 
-export interface DoorbellInvokerOptions {
+export interface IntegrationInvokerOptions {
   readonly runner: RunRunner
-  readonly prompts: DoorbellPrompts
+  /** The run prompts, resolved per run; null when the served texts are not available yet. */
+  readonly prompts: () => Promise<RunPrompts | null>
   /** A run is killed past this and counts as failed. */
   readonly budgetMs: number
   readonly debounceMs?: number
   readonly retryLadderMs?: readonly number[]
   readonly preflightWatchMs?: number
   /**
-   * Is anything waiting on the tray? Asked before every knock run (never
+   * Is anything waiting on the tray? Asked before every wake run (never
    * before an invite run). Resolves the answer; rejects when the count could
-   * not be read, and then the run starts anyway. Absent: every knock runs.
+   * not be read, and then the run starts anyway. Absent: every wake runs.
    */
   readonly trayHasWaiting?: () => Promise<boolean>
+  /** Invites already offered to a run from this machine. Defaults to an in-memory set. */
+  readonly offeredInvites?: OfferedInviteStore
   /** Called after every state change (a status writer hangs off this). */
   readonly onChange?: () => void
   readonly now?: () => number
@@ -91,7 +102,7 @@ export interface DoorbellInvokerOptions {
 }
 
 export interface InvokerCounters {
-  readonly knocks: number
+  readonly wakes: number
   readonly absorbed: number
   readonly invites: number
   readonly runsStarted: number
@@ -99,17 +110,17 @@ export interface InvokerCounters {
   readonly runsFailed: number
   readonly runsTimedOut: number
   readonly runsNotStarted: number
-  /** Knock cycles that found the tray empty and started no run. */
+  /** Wake cycles that found the tray empty and started no run. */
   readonly runsSkippedEmpty: number
   readonly retryRung: number
   readonly retryDueAt: number | null
-  readonly lastRun: DoorbellLastRun | null
+  readonly lastRun: IntegrationLastRun | null
   readonly running: boolean
 }
 
-export class DoorbellInvoker {
+export class IntegrationInvoker {
   private readonly runner: RunRunner
-  private readonly prompts: DoorbellPrompts
+  private readonly prompts: () => Promise<RunPrompts | null>
   private readonly budgetMs: number
   private readonly ladder: readonly number[]
   private readonly preflightWatchMs: number
@@ -119,14 +130,24 @@ export class DoorbellInvoker {
   private readonly onChange: () => void
   private readonly newRunId: () => string
   private readonly trayHasWaiting: (() => Promise<boolean>) | null
-  private readonly coalescer: KnockCoalescer
+  private readonly offered: OfferedInviteStore
+  private readonly coalescer: WakeCoalescer
 
   private cycleDue = false
   private running: Promise<void> | null = null
   private inFlight: AbortController | null = null
   private stopped = false
-  private readonly invites: InviteKnock[] = []
-  private readonly seenInvites: string[] = []
+  /** Invites queued for a run, in arrival order. */
+  private readonly invites: InviteWake[] = []
+  /** Invites whose run did not start; offered again on the next wake. */
+  private readonly invitesAwaitingRetry: InviteWake[] = []
+  /**
+   * Invite ids this process has taken, offered or not. The on-disk store says
+   * what was OFFERED; this says what is already in hand here — queued, in
+   * flight, or awaiting its retry — so the connect-time listing and a live
+   * frame for the same invite cannot queue it twice.
+   */
+  private readonly taken = new Set<string>()
   private retryRung = 0
   private preflightWatch: TimerHandle | null = null
   private preflightWasDown = false
@@ -138,9 +159,9 @@ export class DoorbellInvoker {
   private runsTimedOut = 0
   private runsNotStarted = 0
   private runsSkippedEmpty = 0
-  private lastRun: DoorbellLastRun | null = null
+  private lastRun: IntegrationLastRun | null = null
 
-  constructor(options: DoorbellInvokerOptions) {
+  constructor(options: IntegrationInvokerOptions) {
     this.runner = options.runner
     this.prompts = options.prompts
     this.budgetMs = options.budgetMs
@@ -152,34 +173,39 @@ export class DoorbellInvoker {
     this.onChange = options.onChange ?? (() => undefined)
     this.newRunId = options.runId ?? (() => crypto.randomUUID())
     this.trayHasWaiting = options.trayHasWaiting ?? null
-    this.coalescer = new KnockCoalescer({
-      onFire: () => this.onKnockFired(),
-      debounceMs: options.debounceMs ?? DEFAULT_KNOCK_DEBOUNCE_MS,
+    this.offered = options.offeredInvites ?? new OfferedInvites(null)
+    this.coalescer = new WakeCoalescer({
+      onFire: () => this.onWakeFired(),
+      debounceMs: options.debounceMs ?? DEFAULT_WAKE_DEBOUNCE_MS,
       now: this.now,
       ...(options.setTimeout ? { setTimeout: options.setTimeout } : {}),
       ...(options.clearTimeout ? { clearTimeout: options.clearTimeout } : {}),
     })
   }
 
-  // ─── knocks ─────────────────────────────────────────────────────────────
+  // ─── wakes ──────────────────────────────────────────────────────────────
 
-  /** A knock from the socket (a frame), the connect-time catch-up, or any other source. Coalesced, then run. */
-  knock(source: string): void {
+  /** A wake from the socket (a frame), the connect-time catch-up, or any other source. Coalesced, then run. */
+  wake(source: string): void {
     if (this.stopped) return
-    log.debug(`knock (${source})`)
-    this.coalescer.knock()
+    log.debug(`wake (${source})`)
+    this.coalescer.wake()
     this.onChange()
   }
 
   /**
-   * The second knock kind. Deduplicated by invite id for the life of the
-   * process. Returns true when newly queued.
+   * The second wake kind. Offered once per machine: an invite already offered
+   * to a run, already queued, or awaiting its retry is not queued again.
+   * Returns true when newly queued.
    */
-  invite(invite: InviteKnock): boolean {
+  invite(invite: InviteWake): boolean {
     if (this.stopped) return false
-    if (this.seenInvites.includes(invite.inviteId)) return false
-    this.seenInvites.push(invite.inviteId)
-    if (this.seenInvites.length > MAX_SEEN_INVITES) this.seenInvites.shift()
+    if (this.offered.has(invite.inviteId) || this.taken.has(invite.inviteId)) return false
+    this.taken.add(invite.inviteId)
+    if (this.taken.size > MAX_TAKEN) {
+      const oldest = this.taken.values().next().value
+      if (oldest !== undefined) this.taken.delete(oldest)
+    }
     this.invitesSeen += 1
     this.invites.push(invite)
     this.onChange()
@@ -206,7 +232,7 @@ export class DoorbellInvoker {
 
   counters(): InvokerCounters {
     return {
-      knocks: this.coalescer.knocks,
+      wakes: this.coalescer.wakes,
       absorbed: this.coalescer.absorbed,
       invites: this.invitesSeen,
       runsStarted: this.runsStarted,
@@ -224,8 +250,15 @@ export class DoorbellInvoker {
 
   // ─── worker ─────────────────────────────────────────────────────────────
 
-  private onKnockFired(): void {
+  private onWakeFired(): void {
     this.cycleDue = true
+    // An invite whose run did not start gets its next chance on the next
+    // wake, whatever woke us.
+    if (this.invitesAwaitingRetry.length > 0) {
+      const retry = this.invitesAwaitingRetry.splice(0)
+      log.info(`${retry.length} group invite(s) whose run did not start are offered again`)
+      this.invites.push(...retry)
+    }
     this.schedule()
   }
 
@@ -243,15 +276,15 @@ export class DoorbellInvoker {
     while (!this.stopped) {
       const invite = this.invites.shift()
       if (invite) {
-        await this.run('invite', this.prompts.invite)
+        await this.run('invite', invite)
         continue
       }
       if (this.cycleDue) {
-        // Clear BEFORE the count and the run: a knock landing during either
+        // Clear BEFORE the count and the run: a wake landing during either
         // sets it again and earns exactly one more cycle afterwards.
         this.cycleDue = false
         if (!(await this.trayOwesRun())) continue
-        await this.run('knock', this.prompts.knock)
+        await this.run('wake')
         continue
       }
       return
@@ -259,7 +292,7 @@ export class DoorbellInvoker {
   }
 
   /**
-   * The count before a knock run. True: start the run (something waits, or
+   * The count before a wake run. True: start the run (something waits, or
    * the count could not be read). False: the tray is empty — no run, nothing
    * owed — or the invoker stopped while counting.
    */
@@ -278,24 +311,24 @@ export class DoorbellInvoker {
     if (this.stopped) return false
     if (waiting) return true
     this.runsSkippedEmpty += 1
-    log.info(`knock: the tray is empty — no run (nothing is owed; ${this.runsSkippedEmpty} skipped so far)`)
+    log.info(`wake: the tray is empty — no run (nothing is owed; ${this.runsSkippedEmpty} skipped so far)`)
     this.settleLadder()
     this.onChange()
     return false
   }
 
   /**
-   * Nothing is owed any more — a knock run read the whole tray, or a count
-   * found it empty: back to the first rung, drop a pending re-knock (it would
+   * Nothing is owed any more — a wake run read the whole tray, or a count
+   * found it empty: back to the first rung, drop a pending re-wake (it would
    * only ring for a backlog that is already handled), end the preflight watch.
    */
   private settleLadder(): void {
     this.retryRung = 0
-    if (this.coalescer.cancelDelayed()) log.info('pending re-knock cancelled — nothing is owed any more')
+    if (this.coalescer.cancelDelayed()) log.info('pending re-wake cancelled — nothing is owed any more')
     this.clearPreflightWatch()
   }
 
-  private async run(kind: RunKind, prompt: string): Promise<void> {
+  private async run(kind: RunKind, invite?: InviteWake): Promise<void> {
     const runId = this.newRunId()
     const startedAt = this.now()
     this.runsStarted += 1
@@ -306,10 +339,23 @@ export class DoorbellInvoker {
     this.inFlight = controller
     let outcome: RunOutcome
     try {
-      outcome = await this.runner.start({ kind, prompt, runId, budgetMs: this.budgetMs, signal: controller.signal })
+      const prompts = await this.prompts()
+      if (prompts === null) {
+        outcome = {
+          state: 'not_started',
+          exitCode: null,
+          durationMs: this.now() - startedAt,
+          detail: 'no served texts in hand: GET /v1/texts has not answered yet and nothing is cached in the identity home',
+        }
+      } else if (this.stopped) {
+        outcome = { state: 'not_started', exitCode: null, durationMs: this.now() - startedAt, detail: 'interrupted before the runtime was started' }
+      } else {
+        const prompt = kind === 'invite' ? prompts.invite : prompts.wake
+        outcome = await this.runner.start({ kind, prompt, runId, budgetMs: this.budgetMs, signal: controller.signal })
+      }
     } catch (err) {
       // The runner contract is "never throws"; a throw is a bug in the runner,
-      // not a reason to drop the knock.
+      // not a reason to drop the wake.
       outcome = {
         state: 'not_started',
         exitCode: null,
@@ -333,9 +379,9 @@ export class DoorbellInvoker {
     switch (outcome.state) {
       case 'ok':
         this.runsOk += 1
-        // A knock run read the whole tray. An invite run did not, so it leaves
-        // a pending knock retry alone.
-        if (kind === 'knock') this.settleLadder()
+        // A wake run read the whole tray. An invite run did not, so it leaves
+        // a pending wake retry alone.
+        if (kind === 'wake') this.settleLadder()
         log.info(`run ok kind=${kind} id=${runId} ${Math.round(outcome.durationMs / 1000)}s (output discarded; any send was the agent's own hosted-tool call)`)
         break
       case 'failed':
@@ -349,43 +395,58 @@ export class DoorbellInvoker {
         break
     }
 
+    if (invite !== undefined) this.settleInvite(invite, outcome)
+
     if (outcome.state !== 'ok') {
       log.warn(`run ${outcome.state} kind=${kind} id=${runId}${outcome.detail ? `: ${outcome.detail}` : ''}`)
       if (this.stopped) {
-        // Interrupted by stop(): nothing to schedule, the tray stays stored
+        // Interrupted by stop(): nothing to schedule, the tray stays unread
         // and the next connect's catch-up finds it.
-      } else if (kind === 'knock') {
+      } else if (kind === 'wake') {
         // The agent never saw the tray, or did not finish: the cards are still
-        // stored. Look again on the ladder instead of waiting for the next peer.
+        // unread. Look again on the ladder instead of waiting for the next peer.
         this.scheduleRetry(`run ${outcome.state}`)
-      } else {
-        // An invite stays pending server-side and is reachable through the
-        // hosted invite tools in any later run.
-        log.info(`group-invite run ${outcome.state} — the invite stays pending server-side`)
       }
     }
     this.onChange()
   }
 
+  /**
+   * An invite counts as offered once its run has actually started: the agent
+   * had its chance, and the invite stays reachable through the hosted invite
+   * tools in any later run. A run that never started — or that this
+   * integration interrupted — is no offer; the invite is held for the next
+   * wake.
+   */
+  private settleInvite(invite: InviteWake, outcome: RunOutcome): void {
+    if (outcome.state === 'not_started' || this.stopped) {
+      if (!this.invitesAwaitingRetry.some((i) => i.inviteId === invite.inviteId)) this.invitesAwaitingRetry.push(invite)
+      log.info(`group-invite run did not start — invite ${invite.inviteId} is offered again on the next wake`)
+      return
+    }
+    this.offered.add(invite.inviteId)
+    if (outcome.state !== 'ok') log.info(`group-invite run ${outcome.state} — the invite stays pending server-side, reachable through the hosted tools`)
+  }
+
   private scheduleRetry(reason: string): void {
     if (this.coalescer.delayedPending) {
-      // A retry is already on its way (a knock landed mid-outage and failed
+      // A retry is already on its way (a wake landed mid-outage and failed
       // again). One outage climbs the ladder once; climbing per failed run
       // would replace the sooner retry with a later one.
-      log.info(`${reason} — a re-knock is already scheduled; not climbing the ladder`)
+      log.info(`${reason} — a re-wake is already scheduled; not climbing the ladder`)
       return
     }
     if (this.retryRung >= this.ladder.length) {
       log.warn(
-        `${reason} — retry ladder exhausted; the backlog stays stored. Watching the runtime's preflight every ${Math.round(this.preflightWatchMs / 1000)}s: if it comes back, one re-knock; any knock also re-runs`,
+        `${reason} — retry ladder exhausted; the backlog stays unread. Watching the runtime's preflight every ${Math.round(this.preflightWatchMs / 1000)}s: if it comes back, one re-wake; any wake also re-runs`,
       )
       this.armPreflightWatch()
       return
     }
     const delay = this.ladder[this.retryRung] ?? this.ladder[this.ladder.length - 1] ?? 60_000
     this.retryRung += 1
-    log.warn(`${reason} — re-knocking in ${Math.round(delay / 1000)}s (rung ${this.retryRung}/${this.ladder.length})`)
-    this.coalescer.knockAfter(delay)
+    log.warn(`${reason} — re-waking in ${Math.round(delay / 1000)}s (rung ${this.retryRung}/${this.ladder.length})`)
+    this.coalescer.wakeAfter(delay)
   }
 
   // ─── preflight watch, after an exhausted ladder ─────────────────────────
@@ -424,10 +485,10 @@ export class DoorbellInvoker {
     }
     if (this.preflightWasDown) {
       this.preflightWasDown = false
-      log.info('runtime preflight is ok again after an exhausted ladder — re-knocking once')
-      this.knock('preflight')
+      log.info('runtime preflight is ok again after an exhausted ladder — waking once')
+      this.wake('preflight')
       return
     }
-    log.info('runtime preflight was already ok — the failures are not its readiness; the backlog waits for the next knock')
+    log.info('runtime preflight was already ok — the failures are not its readiness; the backlog waits for the next wake')
   }
 }

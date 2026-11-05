@@ -1,28 +1,28 @@
 // ─── The runner seam ────────────────────────────────────────────────────────
 //
-// The doorbell starts ONE headless run of the resident coding agent and
+// The integration starts ONE headless run of the resident coding agent and
 // discards everything the run says: the agent's only way to say anything on
 // AgentChat is the hosted send tool during its own run. How a runtime is
 // started — its binary, its headless flags, its permission profile — is the
 // one genuinely host-specific piece, so each integration implements this and
 // the engine never names a runtime.
 
-export type RunKind = 'knock' | 'invite'
+export type RunKind = 'wake' | 'invite'
 
 export interface RunRequest {
   readonly kind: RunKind
-  /** The fixed prompt for this kind of run (`buildDoorbellPrompts`). */
+  /** The prompt for this kind of run: the served text, then the manual pointer (`buildRunPrompts`). */
   readonly prompt: string
   /** Unique per run; for logs and for runtimes that want a session name. */
   readonly runId: string
   /** The run is killed past this budget and counts as failed. */
   readonly budgetMs: number
   /**
-   * Aborted when the doorbell is stopping (daemon shutdown, identity change,
-   * refused key). A runner passes it to `spawnRun`, which SIGTERMs the run's
-   * process group and SIGKILLs after a grace; the outcome is `failed` with an
-   * "interrupted" detail. Optional so a runner that cannot interrupt still
-   * satisfies the contract.
+   * Aborted when the integration is stopping (daemon shutdown, identity
+   * change, refused key). A runner passes it to `spawnRun`, which SIGTERMs the
+   * run's process group and SIGKILLs after a grace; the outcome is `failed`
+   * with an "interrupted" detail. Optional so a runner that cannot interrupt
+   * still satisfies the contract.
    */
   readonly signal?: AbortSignal
 }
@@ -57,7 +57,7 @@ export interface RunRunner {
    * Is the runtime usable right now (binary present, signed in)? Called
    * before the socket is held, and — after the retry ladder is exhausted —
    * periodically, so a runtime that comes back (the user signs in again)
-   * earns one re-knock without waiting for the next peer.
+   * earns one re-wake without waiting for the next peer.
    */
   preflight(): Promise<RunPreflight>
   /** Start one run and wait for it. Never throws — returns an outcome. */

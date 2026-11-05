@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
-import { redactDiagnostic, spawnRun } from '../src/doorbell/spawn-run.js'
+import { redactDiagnostic, spawnRun } from '../src/integration/spawn-run.js'
 import { until } from './helpers/server-double.js'
 
 // ─── One headless run: bounded, classified, output discarded ────────────────

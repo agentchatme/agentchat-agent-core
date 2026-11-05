@@ -3,14 +3,15 @@ import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import {
-  clearDoorbellStatus,
-  doorbellStatusPath,
-  formatDoorbellStatus,
-  readDoorbellStatus,
-  writeDoorbellStatus,
-  type DoorbellStatus,
-} from '../src/doorbell/status.js'
-import { resolveRunBudgetMs, resolveRunProfile, doorbellDisabled } from '../src/doorbell/profile.js'
+  clearIntegrationStatus,
+  formatIntegrationStatus,
+  integrationStatusPath,
+  legacyStatusPath,
+  readIntegrationStatus,
+  writeIntegrationStatus,
+  type IntegrationStatus,
+} from '../src/integration/status.js'
+import { integrationDisabled, integrationDisabledBy, resolveRunBudgetMs, resolveRunProfile } from '../src/integration/profile.js'
 
 let home: string
 beforeEach(() => {
@@ -18,17 +19,16 @@ beforeEach(() => {
 })
 afterEach(() => fs.rmSync(home, { recursive: true, force: true }))
 
-const sample = (over: Partial<DoorbellStatus> = {}): DoorbellStatus => ({
-  version: 1,
+const sample = (over: Partial<IntegrationStatus> = {}): IntegrationStatus => ({
+  version: 2,
   updated_at: new Date().toISOString(),
   pid: 123,
   runtime: 'fake',
   handle: 'me',
   profile: 'answer',
   socket: 'ready',
-  ack_negotiated: true,
-  knocks: 4,
-  knocks_absorbed: 2,
+  wakes: 4,
+  wakes_absorbed: 2,
   invites: 1,
   runs_started: 2,
   runs_ok: 1,
@@ -36,61 +36,118 @@ const sample = (over: Partial<DoorbellStatus> = {}): DoorbellStatus => ({
   runs_timed_out: 0,
   runs_not_started: 0,
   runs_skipped_empty: 3,
-  last_run: { kind: 'knock', started_at: new Date().toISOString(), ended_at: new Date().toISOString(), state: 'ok', exit_code: 0, duration_ms: 4_000, detail: null },
+  last_run: { kind: 'wake', started_at: new Date().toISOString(), ended_at: new Date().toISOString(), state: 'ok', exit_code: 0, duration_ms: 4_000, detail: null },
   retry_rung: 1,
   retry_due_at: new Date(Date.now() + 60_000).toISOString(),
   last_error: null,
+  texts: { source: 'server', fetched_at: new Date(Date.now() - 2 * 3_600_000).toISOString(), version: '1', manual_version: '2.1.2' },
   ...over,
 })
 
-describe('doorbell status file', () => {
-  it('round-trips, private to the user', () => {
-    writeDoorbellStatus(home, sample())
-    expect(readDoorbellStatus(home)).toMatchObject({ socket: 'ready', knocks: 4 })
+/** What a daemon from before the rename writes (`doorbell.status.json`, version 1, `knocks`). */
+const legacySample = () => ({
+  version: 1,
+  updated_at: new Date().toISOString(),
+  pid: 99,
+  runtime: 'fake',
+  handle: 'me',
+  profile: 'answer',
+  socket: 'ready',
+  ack_negotiated: true,
+  knocks: 7,
+  knocks_absorbed: 3,
+  invites: 0,
+  runs_started: 1,
+  runs_ok: 1,
+  runs_failed: 0,
+  runs_timed_out: 0,
+  runs_not_started: 0,
+  runs_skipped_empty: 2,
+  last_run: { kind: 'knock', started_at: new Date().toISOString(), ended_at: new Date().toISOString(), state: 'ok', exit_code: 0, duration_ms: 1_000, detail: null },
+  retry_rung: 0,
+  retry_due_at: null,
+  last_error: null,
+})
+
+describe('integration status file', () => {
+  it('round-trips under the new name and keys, private to the user', () => {
+    writeIntegrationStatus(home, sample())
+    expect(fs.existsSync(integrationStatusPath(home))).toBe(true)
+    expect(fs.existsSync(legacyStatusPath(home))).toBe(false)
+    const written = JSON.parse(fs.readFileSync(integrationStatusPath(home), 'utf-8')) as Record<string, unknown>
+    expect(written['wakes']).toBe(4)
+    expect(written).not.toHaveProperty('knocks')
+    expect(readIntegrationStatus(home)).toMatchObject({ socket: 'ready', wakes: 4, wakes_absorbed: 2, texts: { source: 'server' } })
     if (process.platform !== 'win32') {
-      expect(fs.statSync(doorbellStatusPath(home)).mode & 0o777).toBe(0o600)
+      expect(fs.statSync(integrationStatusPath(home)).mode & 0o777).toBe(0o600)
     }
-    clearDoorbellStatus(home)
-    expect(readDoorbellStatus(home)).toBeNull()
+    clearIntegrationStatus(home)
+    expect(readIntegrationStatus(home)).toBeNull()
+  })
+
+  it('reads the file a daemon from before the rename writes: knocks → wakes, kind knock → wake, no texts', () => {
+    fs.writeFileSync(legacyStatusPath(home), JSON.stringify(legacySample()))
+    const status = readIntegrationStatus(home)
+    expect(status).toMatchObject({ version: 2, socket: 'ready', wakes: 7, wakes_absorbed: 3, runs_skipped_empty: 2, texts: null })
+    expect(status?.last_run?.kind).toBe('wake')
+    expect(status).not.toHaveProperty('knocks')
+  })
+
+  it('prefers the current file when both exist, and clear removes both', () => {
+    fs.writeFileSync(legacyStatusPath(home), JSON.stringify(legacySample()))
+    writeIntegrationStatus(home, sample({ wakes: 4 }))
+    expect(readIntegrationStatus(home)?.wakes).toBe(4)
+    clearIntegrationStatus(home)
+    expect(fs.existsSync(legacyStatusPath(home))).toBe(false)
+    expect(fs.existsSync(integrationStatusPath(home))).toBe(false)
+  })
+
+  it('reads an older file without runs_skipped_empty or texts', () => {
+    const { runs_skipped_empty: _dropped, texts: _texts, ...older } = sample()
+    fs.writeFileSync(integrationStatusPath(home), JSON.stringify(older))
+    expect(readIntegrationStatus(home)).toMatchObject({ socket: 'ready', runs_skipped_empty: 0, texts: null })
   })
 
   it('rejects a malformed file rather than throwing', () => {
-    fs.writeFileSync(doorbellStatusPath(home), '{"version":2}')
-    expect(readDoorbellStatus(home)).toBeNull()
+    fs.writeFileSync(integrationStatusPath(home), '{"version":3}')
+    expect(readIntegrationStatus(home)).toBeNull()
   })
 
   it('formats every fact status must show', () => {
-    const lines = formatDoorbellStatus(sample()).join('\n')
-    expect(lines).toContain('socket ready')
-    expect(lines).toContain('negotiated')
-    expect(lines).toContain('never acknowledges')
-    expect(lines).toContain('knocks: 4 (2 absorbed')
+    const lines = formatIntegrationStatus(sample()).join('\n')
+    expect(lines).toContain('Integration: socket ready')
+    expect(lines).toContain('acknowledged on receipt')
+    expect(lines).toContain('wakes: 4 (2 absorbed')
     expect(lines).toContain('runs: 2 started, 1 ok, 1 failed')
-    expect(lines).toContain('3 knock(s) found the tray empty (no run)')
+    expect(lines).toContain('3 wake(s) found the tray empty (no run)')
+    expect(lines).toContain('texts: served (v1, manual 2.1.2, fetched 2 hour(s) ago')
     expect(lines).toContain('profile: answer (fake)')
-    expect(lines).toContain('last run: knock, ok (exit 0)')
+    expect(lines).toContain('last run: wake, ok (exit 0)')
     expect(lines).toContain('retry: rung 1')
+    expect(lines).not.toMatch(/doorbell|knock/i)
   })
 
-  it('reads a file from an older daemon without runs_skipped_empty as 0', () => {
-    const { runs_skipped_empty: _dropped, ...older } = sample()
-    fs.writeFileSync(doorbellStatusPath(home), JSON.stringify(older))
-    expect(readDoorbellStatus(home)).toMatchObject({ socket: 'ready', runs_skipped_empty: 0 })
+  it('says where the texts came from when they are cached, or missing', () => {
+    expect(formatIntegrationStatus(sample({ texts: { source: 'cache', fetched_at: new Date(Date.now() - 86_400_000 * 2).toISOString(), version: '1', manual_version: '2.1.2' } })).join('\n')).toContain(
+      'texts: from the identity-home cache (v1, manual 2.1.2, fetched 2 day(s) ago',
+    )
+    expect(formatIntegrationStatus(sample({ texts: { source: 'none', fetched_at: null, version: null, manual_version: null } })).join('\n')).toContain('texts: not fetched yet')
+    expect(formatIntegrationStatus(sample({ texts: null })).join('\n')).toContain('texts: not fetched yet')
   })
 
   it('shows a refused key as socket terminal with the close as the last error', () => {
-    const lines = formatDoorbellStatus(sample({ socket: 'terminal', last_error: "auth rejected (close 1008 Invalid token) — check the agent's API key" })).join('\n')
-    expect(lines).toContain('Doorbell: socket terminal')
+    const lines = formatIntegrationStatus(sample({ socket: 'terminal', last_error: "auth rejected (close 1008 Invalid token) — check the agent's API key" })).join('\n')
+    expect(lines).toContain('Integration: socket terminal')
     expect(lines).toContain('last error: auth rejected (close 1008 Invalid token)')
   })
 
   it('flags a stale file as a daemon that may be down', () => {
-    const lines = formatDoorbellStatus(sample({ updated_at: new Date(Date.now() - 10 * 60_000).toISOString() })).join('\n')
+    const lines = formatIntegrationStatus(sample({ updated_at: new Date(Date.now() - 10 * 60_000).toISOString() })).join('\n')
     expect(lines).toContain('may be down')
   })
 
   it('says so when no status was ever recorded', () => {
-    expect(formatDoorbellStatus(null)[0]).toMatch(/no status recorded yet/)
+    expect(formatIntegrationStatus(null)[0]).toMatch(/no status recorded yet/)
   })
 })
 
@@ -102,10 +159,15 @@ describe('profile and switches', () => {
     expect(resolveRunProfile({ AGENTCHAT_RUN_PROFILE: 'yolo' })).toBe('answer')
   })
 
-  it('AGENTCHAT_DOORBELL=off disables; anything else does not', () => {
-    expect(doorbellDisabled({ AGENTCHAT_DOORBELL: 'off' })).toBe(true)
-    expect(doorbellDisabled({ AGENTCHAT_DOORBELL: 'v3' })).toBe(false)
-    expect(doorbellDisabled({})).toBe(false)
+  it('AGENTCHAT_INTEGRATION=off disables; the old AGENTCHAT_DOORBELL=off still does for one release; anything else does not', () => {
+    expect(integrationDisabled({ AGENTCHAT_INTEGRATION: 'off' })).toBe(true)
+    expect(integrationDisabledBy({ AGENTCHAT_INTEGRATION: 'off' })).toBe('AGENTCHAT_INTEGRATION')
+    expect(integrationDisabled({ AGENTCHAT_DOORBELL: 'off' })).toBe(true)
+    expect(integrationDisabledBy({ AGENTCHAT_DOORBELL: 'off' })).toBe('AGENTCHAT_DOORBELL')
+    // The new spelling wins when both are set.
+    expect(integrationDisabled({ AGENTCHAT_INTEGRATION: 'on', AGENTCHAT_DOORBELL: 'off' })).toBe(false)
+    expect(integrationDisabled({ AGENTCHAT_INTEGRATION: 'v3' })).toBe(false)
+    expect(integrationDisabled({})).toBe(false)
   })
 
   it('the run budget defaults to 10 minutes and is bounded', () => {

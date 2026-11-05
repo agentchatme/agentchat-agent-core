@@ -5,16 +5,17 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { AgentChatClient, ConnectionError, UnauthorizedError } from 'agentchatme'
 import { createIdentityCommands } from '../src/identity/commands.js'
 import { writeCredentials } from '../src/identity/credentials.js'
-import { writeDoorbellStatus, type DoorbellStatus } from '../src/doorbell/status.js'
+import { writeIntegrationStatus, type IntegrationStatus } from '../src/integration/status.js'
 import type { HostProfile } from '../src/identity/host-profile.js'
+import { mockServedTexts } from './helpers/served-texts.js'
 
-// ─── `status` with a refused key still shows the doorbell ───────────────────
+// ─── `status` with a refused key still shows the integration ────────────────
 //
 // Live-fire E4: a getMe failure printed "Could not reach AgentChat:
-// UNAUTHORIZED: Invalid API key" and returned before the doorbell lines — so
+// UNAUTHORIZED: Invalid API key" and returned before the integration lines — so
 // the daemon's `socket terminal` / `auth rejected (close 1008 …)`, the one
 // thing that explains the failure, never appeared. A refused key (401/403) is
-// now said as such, an unreachable server as such, and both print the doorbell.
+// now said as such, an unreachable server as such, and both print the integration.
 
 const homes: string[] = []
 
@@ -24,27 +25,28 @@ function fixture(): { home: string; commands: ReturnType<typeof createIdentityCo
   const profile: HostProfile = {
     label: 'Claude Code',
     id: 'claude-code',
+    client: { runtime: 'generic', version: '0.0.0-test' },
     home: () => home,
     anchorFile: () => path.join(home, 'CLAUDE.md'),
     invocation: () => 'npx -y @agentchatme/claude-code',
-    renderAnchor: (handle) => `@${handle}`,
+    renderAnchor: (line) => line,
   }
   writeCredentials(home, { api_key: `ac_${'s'.repeat(32)}`, handle: 'probe' })
+  mockServedTexts()
   return { home, commands: createIdentityCommands(profile) }
 }
 
-function refusedDoorbell(): DoorbellStatus {
+function refusedIntegration(): IntegrationStatus {
   return {
-    version: 1,
+    version: 2,
     updated_at: new Date().toISOString(),
     pid: 4242,
     runtime: 'claude',
     handle: 'probe',
     profile: 'answer',
     socket: 'terminal',
-    ack_negotiated: null,
-    knocks: 0,
-    knocks_absorbed: 0,
+    wakes: 0,
+    wakes_absorbed: 0,
     invites: 0,
     runs_started: 0,
     runs_ok: 0,
@@ -56,6 +58,7 @@ function refusedDoorbell(): DoorbellStatus {
     retry_rung: 0,
     retry_due_at: null,
     last_error: "auth rejected (close 1008 Invalid token) — check the agent's API key",
+    texts: null,
   }
 }
 
@@ -73,9 +76,9 @@ afterEach(() => {
 })
 
 describe('status when getMe fails', () => {
-  it('a 401 says the key was refused (not "could not reach") and still prints the doorbell state', async () => {
+  it('a 401 says the key was refused (not "could not reach") and still prints the integration state', async () => {
     const { home, commands } = fixture()
-    writeDoorbellStatus(home, refusedDoorbell())
+    writeIntegrationStatus(home, refusedIntegration())
     vi.spyOn(AgentChatClient.prototype, 'getMe').mockRejectedValue(
       new UnauthorizedError({ code: 'UNAUTHORIZED', message: 'Invalid API key' }, 401),
     )
@@ -88,13 +91,13 @@ describe('status when getMe fails', () => {
     expect(err.join('\n')).toContain('npx -y @agentchatme/claude-code login')
     const text = out.join('\n')
     expect(text).toContain('@probe — key refused (HTTP 401)')
-    expect(text).toContain('Doorbell: socket terminal')
+    expect(text).toContain('Integration: socket terminal')
     expect(text).toContain('last error: auth rejected (close 1008 Invalid token)')
   })
 
-  it('an unreachable server says so and still prints the doorbell state', async () => {
+  it('an unreachable server says so and still prints the integration state', async () => {
     const { home, commands } = fixture()
-    writeDoorbellStatus(home, { ...refusedDoorbell(), socket: 'reconnecting', last_error: null })
+    writeIntegrationStatus(home, { ...refusedIntegration(), socket: 'reconnecting', last_error: null })
     vi.spyOn(AgentChatClient.prototype, 'getMe').mockRejectedValue(new ConnectionError('fetch failed'))
     const { out, err } = capture()
 
@@ -103,12 +106,12 @@ describe('status when getMe fails', () => {
     expect(err.join('\n')).toContain('Could not reach AgentChat')
     expect(err.join('\n')).not.toContain('refused')
     expect(out.join('\n')).toContain('AgentChat unreachable')
-    expect(out.join('\n')).toContain('Doorbell: socket reconnecting')
+    expect(out.join('\n')).toContain('Integration: socket reconnecting')
   })
 
-  it('--json carries the failure kind and the doorbell instead of printing nothing parseable', async () => {
+  it('--json carries the failure kind and the integration (and the old `doorbell` key, one release) instead of printing nothing parseable', async () => {
     const { home, commands } = fixture()
-    writeDoorbellStatus(home, refusedDoorbell())
+    writeIntegrationStatus(home, refusedIntegration())
     vi.spyOn(AgentChatClient.prototype, 'getMe').mockRejectedValue(
       new UnauthorizedError({ code: 'UNAUTHORIZED', message: 'Invalid API key' }, 401),
     )
@@ -116,8 +119,9 @@ describe('status when getMe fails', () => {
 
     expect(await commands.runStatus({ json: true })).toBe(1)
 
-    const parsed = JSON.parse(out.join('\n')) as { error: { kind: string; status: number }; doorbell: { socket: string } }
+    const parsed = JSON.parse(out.join('\n')) as { error: { kind: string; status: number }; integration: { socket: string }; doorbell: { socket: string } }
     expect(parsed.error).toMatchObject({ kind: 'key_refused', status: 401 })
+    expect(parsed.integration.socket).toBe('terminal')
     expect(parsed.doorbell.socket).toBe('terminal')
   })
 })

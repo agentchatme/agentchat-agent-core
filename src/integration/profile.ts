@@ -28,12 +28,30 @@ export function resolveRunProfile(env: NodeJS.ProcessEnv = process.env): RunProf
   return isRunProfile(raw) ? raw : DEFAULT_RUN_PROFILE
 }
 
-/** The one switch: `AGENTCHAT_DOORBELL=off` holds no socket and starts no run. Tools and manual stay. */
-export const DOORBELL_ENV = 'AGENTCHAT_DOORBELL'
+/** The one switch: `AGENTCHAT_INTEGRATION=off` holds no socket and starts no run. Tools and manual stay. */
+export const INTEGRATION_ENV = 'AGENTCHAT_INTEGRATION'
+/**
+ * The previous spelling of the switch. Honoured for one release: a service
+ * installed before the rename captured it into its unit file, and that unit
+ * must keep meaning what the operator set.
+ */
+export const INTEGRATION_ENV_LEGACY = 'AGENTCHAT_DOORBELL'
 
-export function doorbellDisabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  const raw = env[DOORBELL_ENV]?.trim().toLowerCase()
-  return raw === 'off' || raw === '0' || raw === 'false'
+function isOff(raw: string | undefined): boolean {
+  const value = raw?.trim().toLowerCase()
+  return value === 'off' || value === '0' || value === 'false'
+}
+
+/** Which switch turned the integration off, or null when it is on. The new spelling wins when both are set. */
+export function integrationDisabledBy(env: NodeJS.ProcessEnv = process.env): string | null {
+  if (env[INTEGRATION_ENV] !== undefined && env[INTEGRATION_ENV].trim().length > 0) {
+    return isOff(env[INTEGRATION_ENV]) ? INTEGRATION_ENV : null
+  }
+  return isOff(env[INTEGRATION_ENV_LEGACY]) ? INTEGRATION_ENV_LEGACY : null
+}
+
+export function integrationDisabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return integrationDisabledBy(env) !== null
 }
 
 /** A run's time budget. Killed past it; that counts as a failed run. */

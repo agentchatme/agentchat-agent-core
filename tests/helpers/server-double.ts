@@ -1,27 +1,36 @@
 import * as http from 'node:http'
 import { WebSocketServer, type WebSocket } from 'ws'
+import { textsFor } from './served-texts.js'
 
 // ─── A server double on localhost, faithful where it matters ────────────────
 //
-// Models `/v1/ws` the way apps/api-server/src/ws/agent-socket.ts behaves:
-//   * `hello`  — a good key: the upgrade completes and `hello.ok` echoing the
-//                accepted capabilities is the first frame.
-//   * `refuse` — a bad key: the upgrade COMPLETES, then the server closes
-//                1008 'Invalid token'. No HTTP 401, no hello.ok. This is the
-//                production path a reconnect storm hides behind.
-//   * a number — the upgrade is answered with that HTTP status (what a load
-//                balancer does mid-deploy: 502/503, or a 401 from a proxy).
+// Models `/v1/ws` the way apps/api-server/src/ws/agent-socket.ts behaves on
+// the HELLO path the SDK's RealtimeClient uses (a browser-shaped socket cannot
+// set headers, so the key rides in the first frame):
+//   * the upgrade completes; the client sends `{type:'hello', api_key,
+//     capabilities, client, client_version}`;
+//   * `hello`         — a good key: `hello.ok` echoing the accepted
+//                       capabilities is the first server frame;
+//   * `refuse`        — a bad key: close 1008 'Invalid token', no hello.ok.
+//                       This is the production path a reconnect storm hides
+//                       behind;
+//   * `hello-required`— the server's handshake timer won the race: close 1008
+//                       'HELLO frame required' (NOT a verdict on the key);
+//   * a number        — the upgrade is answered with that HTTP status (what a
+//                       load balancer does mid-deploy: 502/503).
 // After `hello.ok` the double can replay `drain` frames on every connection,
-// the way `ws/handler.ts` `drainUndelivered` re-offers every stored envelope
-// (deferred ones included) as a plain `message.new`.
-// And the two reads the doorbell makes over HTTP:
-//   * GET /v1/inbox?wait_ms=0&limit=N  → a tray with `waiting` cards (and a
-//                                        `deferred` count the cards exclude)
-//   * GET /v1/groups/invites           → the configured pending invites
-// Every frame a client sends after the upgrade is recorded, so a test can
-// assert the list stays EMPTY.
+// the way the server re-offers unacked envelopes right after the hello, and
+// can ping on an interval like the production server does every 45 s.
+// Every frame a client sends after the hello is recorded (`clientFrames`) —
+// the acks the SDK sends on receipt are what the tests look for there.
+//
+// And the reads the integration makes over HTTP, through the SDK:
+//   * GET /v1/inbox?limit=N        → a tray with `waiting` cards (and a
+//                                    `deferred` count the cards exclude)
+//   * GET /v1/groups/invites       → the configured pending invites
+//   * GET /v1/texts?runtime=R      → the served texts for R (or `textsStatus`)
 
-export type UpgradeMode = 'hello' | 'refuse' | number
+export type UpgradeMode = 'hello' | 'refuse' | 'hello-required' | number
 
 export interface Tray {
   waiting: number
@@ -34,20 +43,27 @@ export interface ServerDoubleOptions {
   helloCapabilities?: readonly string[]
   /** Cards on the tray; `truncated` when more wait than one page shows; `deferred` hidden from the cards. */
   tray?: Tray
-  /** Frames sent right after `hello.ok` on every connection (the server's connect-time drain). */
+  /** Frames sent right after `hello.ok` on every connection (the server's connect-time re-offer). */
   drain?: readonly unknown[]
   invites?: ReadonlyArray<{ id: string; group_id?: string; group_name?: string; inviter_handle?: string }>
+  /** HTTP status for GET /v1/texts; 200 serves the texts. */
+  textsStatus?: number
+  /** Ping every live socket on this interval (the production server pings every 45 s). */
+  pingEveryMs?: number
 }
 
 export interface Served {
-  headers: http.IncomingHttpHeaders
+  /** The hello frame this connection authenticated with. */
+  hello: Record<string, unknown> | null
   socket: WebSocket
-  clientFrames: string[]
+  /** Every frame the client sent after its hello. */
+  clientFrames: Array<Record<string, unknown>>
 }
 
 export interface ServerDouble {
   readonly apiBase: string
-  readonly wsUrl: string
+  /** `ws://127.0.0.1:<port>` — what the SDK takes as `baseUrl`. */
+  readonly wsBase: string
   /** Every completed upgrade, in order. */
   readonly served: Served[]
   /** Every upgrade attempt, completed or answered with a status. */
@@ -57,19 +73,24 @@ export interface ServerDouble {
   /** Change how the NEXT upgrade is answered. */
   setUpgrade(mode: UpgradeMode): void
   setTray(tray: Tray): void
+  setTextsStatus(status: number): void
   /** Push a frame to the most recent live socket. */
   send(frame: unknown): void
+  /** Acks recorded across every connection. */
+  acks(): string[]
   close(): Promise<void>
 }
 
 export async function startServerDouble(options: ServerDoubleOptions = {}): Promise<ServerDouble> {
   let mode: UpgradeMode = options.upgrade ?? 'hello'
   let tray: Tray = options.tray ?? { waiting: 0 }
+  let textsStatus = options.textsStatus ?? 200
   const drain = options.drain ?? []
   const invites = options.invites ?? []
   const caps = options.helloCapabilities ?? ['ack']
   const served: Served[] = []
   const requests: string[] = []
+  const pingers: Array<ReturnType<typeof setInterval>> = []
 
   const server = http.createServer((req, res) => {
     const url = new URL(req.url ?? '/', 'http://127.0.0.1')
@@ -79,7 +100,7 @@ export async function startServerDouble(options: ServerDoubleOptions = {}): Prom
       const limit = Number(url.searchParams.get('limit') ?? '20')
       const cards = Array.from({ length: Math.min(tray.waiting, limit) }, (_, i) => ({
         conversation_id: `conv_${i}`,
-        preview: 'A PREVIEW THAT MUST NEVER BE LOGGED',
+        preview: { message_id: `msg_${i}`, sender: '@peer', text: 'A PREVIEW THAT MUST NEVER BE LOGGED', at: new Date().toISOString() },
       }))
       res.end(
         JSON.stringify({
@@ -95,7 +116,29 @@ export async function startServerDouble(options: ServerDoubleOptions = {}): Prom
       return
     }
     if (url.pathname === '/v1/groups/invites') {
-      res.end(JSON.stringify(invites.map((i) => ({ group_id: null, group_name: null, inviter_handle: null, ...i }))))
+      res.end(
+        JSON.stringify(
+          invites.map((i) => ({
+            group_id: null,
+            group_name: null,
+            group_description: null,
+            group_avatar_url: null,
+            group_member_count: 1,
+            inviter_handle: null,
+            created_at: new Date().toISOString(),
+            ...i,
+          })),
+        ),
+      )
+      return
+    }
+    if (url.pathname === '/v1/texts') {
+      if (textsStatus !== 200) {
+        res.statusCode = textsStatus
+        res.end(JSON.stringify({ code: 'UNAVAILABLE', message: `texts ${textsStatus}` }))
+        return
+      }
+      res.end(JSON.stringify({ runtime: url.searchParams.get('runtime'), ...textsFor('me', url.searchParams.get('runtime') ?? 'generic') }))
       return
     }
     res.statusCode = 404
@@ -105,7 +148,7 @@ export async function startServerDouble(options: ServerDoubleOptions = {}): Prom
   const wss = new WebSocketServer({ noServer: true })
   const double: ServerDouble = {
     apiBase: '',
-    wsUrl: '',
+    wsBase: '',
     served,
     upgrades: 0,
     requests,
@@ -115,12 +158,18 @@ export async function startServerDouble(options: ServerDoubleOptions = {}): Prom
     setTray: (next) => {
       tray = next
     },
+    setTextsStatus: (next) => {
+      textsStatus = next
+    },
     send: (frame) => {
       const last = served[served.length - 1]
       if (!last) throw new Error('no live socket to send on')
       last.socket.send(JSON.stringify(frame))
     },
+    acks: () =>
+      served.flatMap((s) => s.clientFrames.filter((f) => f['type'] === 'ack').map((f) => String(f['message_id']))),
     close: async () => {
+      for (const timer of pingers) clearInterval(timer)
       for (const entry of served) entry.socket.terminate()
       await new Promise<void>((resolve) => wss.close(() => resolve()))
       await new Promise<void>((resolve) => server.close(() => resolve()))
@@ -137,23 +186,52 @@ export async function startServerDouble(options: ServerDoubleOptions = {}): Prom
     }
     const decided = mode
     wss.handleUpgrade(req, socket, head, (ws) => {
-      const entry: Served = { headers: req.headers, socket: ws, clientFrames: [] }
-      ws.on('message', (data) => entry.clientFrames.push(data.toString()))
+      const entry: Served = { hello: null, socket: ws, clientFrames: [] }
       served.push(entry)
-      if (decided === 'refuse') {
-        // agent-socket.ts: bad bearer → onOpen closes 1008; nothing else is sent.
-        ws.close(1008, 'Invalid token')
-        return
-      }
-      ws.send(JSON.stringify({ type: 'hello.ok', capabilities: caps }))
-      for (const frame of drain) ws.send(JSON.stringify(frame))
+      ws.on('message', (data) => {
+        let frame: Record<string, unknown>
+        try {
+          frame = JSON.parse(data.toString()) as Record<string, unknown>
+        } catch {
+          return
+        }
+        if (entry.hello === null) {
+          // agent-socket.ts HELLO path: authenticate the first frame.
+          if (frame['type'] !== 'hello' || typeof frame['api_key'] !== 'string') {
+            ws.close(1008, 'HELLO frame required first')
+            return
+          }
+          entry.hello = frame
+          if (decided === 'refuse') {
+            ws.close(1008, 'Invalid token')
+            return
+          }
+          if (decided === 'hello-required') {
+            ws.close(1008, 'HELLO frame required')
+            return
+          }
+          const asked = Array.isArray(frame['capabilities']) ? (frame['capabilities'] as unknown[]) : []
+          const accepted = caps.filter((c) => asked.includes(c))
+          ws.send(JSON.stringify({ type: 'hello.ok', capabilities: accepted }))
+          for (const d of drain) ws.send(JSON.stringify(d))
+          if (options.pingEveryMs !== undefined) {
+            const timer = setInterval(() => {
+              if (ws.readyState === ws.OPEN) ws.ping()
+            }, options.pingEveryMs)
+            pingers.push(timer)
+            ws.on('close', () => clearInterval(timer))
+          }
+          return
+        }
+        entry.clientFrames.push(frame)
+      })
     })
   })
 
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()))
   const address = server.address()
   if (typeof address === 'string' || address === null) throw new Error('no address')
-  Object.assign(double, { apiBase: `http://127.0.0.1:${address.port}`, wsUrl: `ws://127.0.0.1:${address.port}/v1/ws` })
+  Object.assign(double, { apiBase: `http://127.0.0.1:${address.port}`, wsBase: `ws://127.0.0.1:${address.port}` })
   return double
 }
 

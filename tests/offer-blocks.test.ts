@@ -42,7 +42,7 @@ describe('the unregistered offer block', () => {
   })
 
   it('is replaced, not joined, by the identity block on registration', () => {
-    const file = upsertAnchorBlock(`# notes\n\n${block}\n`, renderAnchorBlock('new-agent'))
+    const file = upsertAnchorBlock(`# notes\n\n${block}\n`, renderAnchorBlock('I am @new-agent on AgentChat (api.agentchat.me). Served line, test copy.'))
     expect(file.split(ANCHOR_START)).toHaveLength(2)
     expect(file).toContain('I am @new-agent on AgentChat')
     expect(file).not.toContain('no account yet')
