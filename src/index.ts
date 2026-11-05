@@ -165,6 +165,7 @@ export {
   type HostProfile,
   type DoctorCheck,
   type DoctorContext,
+  type StatusContext,
   type Verdict,
 } from './identity/host-profile.js'
 
