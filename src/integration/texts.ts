@@ -1,8 +1,9 @@
 import * as path from 'node:path'
 import { z } from 'zod'
-import type { AgentChatClient, Texts, TextsRuntime } from 'agentchatme'
+import { AgentChatClient, type Texts, type TextsRuntime } from 'agentchatme'
 import { atomicWriteFile, readJsonFile } from '../util/fsutil.js'
 import { log } from '../util/log.js'
+import { clientIdentityOf, type IntegrationClient } from '../client-identity.js'
 import type { TimerHandle } from './wake.js'
 
 // ─── The served texts ───────────────────────────────────────────────────────
@@ -107,6 +108,32 @@ export async function loadTexts(options: LoadTextsOptions): Promise<LoadedTexts 
     log.debug(`GET /v1/texts failed (${describe(err)}) — ${cached ? 'using the cached texts' : 'nothing cached'}`)
     return cached === null ? null : { texts: cached.texts, source: 'cache', fetched_at: cached.fetched_at }
   }
+}
+
+export interface FetchIdentityLineOptions {
+  readonly home: string
+  readonly apiKey: string
+  readonly apiBase: string
+  readonly client: IntegrationClient
+  readonly timeoutMs?: number
+}
+
+/**
+ * The served identity line for this agent, for an integration's own install
+ * and placement paths: one fetch through an SDK client built here, the cache
+ * as fallback, null when neither answers. The identity commands do the same
+ * before `place`; this is the same read for callers that have no client.
+ */
+export async function fetchIdentityLine(options: FetchIdentityLineOptions): Promise<string | null> {
+  const client = new AgentChatClient({
+    apiKey: options.apiKey,
+    baseUrl: options.apiBase,
+    clientIdentity: clientIdentityOf(options.client),
+    timeoutMs: options.timeoutMs ?? FETCH_TIMEOUT_MS,
+    retry: { maxRetries: 0, baseDelayMs: 0, maxDelayMs: 0 },
+  })
+  const loaded = await loadTexts({ home: options.home, runtime: options.client.runtime, client, ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}) })
+  return loaded === null ? null : loaded.texts.identity_line
 }
 
 async function fetchTexts(client: TextsClient, runtime: TextsRuntime, timeoutMs = FETCH_TIMEOUT_MS): Promise<Texts> {

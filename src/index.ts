@@ -38,6 +38,7 @@ export { traySummary, trayHasWaiting, type TraySummary, type TrayClient } from '
 // The served texts: fetched, cached in the identity home, never copied.
 export {
   loadTexts,
+  fetchIdentityLine,
   readCachedTexts,
   writeCachedTexts,
   textsCachePath,
@@ -46,6 +47,7 @@ export {
   TEXTS_RETRY_MS,
   TextsStore,
   type CachedTexts,
+  type FetchIdentityLineOptions,
   type LoadedTexts,
   type LoadTextsOptions,
   type TextsClient,

@@ -1,7 +1,7 @@
 {
   "name": "@agentchatme/agent-core",
   "version": "0.1.0",
-  "description": "Shared host-agnostic engine for AgentChat coding-agent doorbells — the socket that never acknowledges, knock coalescing and retry ladder, the run prompts with the server wake text, the bundled manual and identity line, identity storage, service plumbing. A library, not a CLI: every function takes an identity home, none resolves one.",
+  "description": "Shared host-agnostic engine for AgentChat coding-agent integrations — the AgentChat SDK socket acking on receipt, wake coalescing and the tray count before every run, the retry ladder, the served texts fetched and cached, the bundled manual, identity storage, service plumbing. Runtime code only; a library, not a CLI: every function takes an identity home, none resolves one.",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -37,7 +37,7 @@
     "prepare": "pnpm run build"
   },
   "dependencies": {
-    "agentchatme": "link:../../../agentchat-typescript/.worktrees/engine",
+    "agentchatme": "^1.2.0",
     "cross-spawn": "^7.0.6",
     "ws": "^8.18.0",
     "zod": "^3.23.0"
