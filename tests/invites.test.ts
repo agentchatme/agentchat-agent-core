@@ -17,8 +17,10 @@ import { FakeClock, flush } from './helpers/fake-clock.js'
 class FakeRunner implements RunRunner {
   readonly name = 'fake-runtime'
   readonly requests: RunRequest[] = []
-  constructor(private script: (request: RunRequest) => RunOutcome = () => ({ state: 'ok', exitCode: 0, durationMs: 1 })) {}
-  set outcome(script: (request: RunRequest) => RunOutcome) {
+  /** Whether this runner signals `onStarted` (a spawn-based runner does; a runner that cannot tell does not). */
+  signalsStart = true
+  constructor(private script: (request: RunRequest) => RunOutcome | Promise<RunOutcome> = () => ({ state: 'ok', exitCode: 0, durationMs: 1 })) {}
+  set outcome(script: (request: RunRequest) => RunOutcome | Promise<RunOutcome>) {
     this.script = script
   }
   async preflight() {
@@ -26,6 +28,7 @@ class FakeRunner implements RunRunner {
   }
   async start(request: RunRequest): Promise<RunOutcome> {
     this.requests.push(request)
+    if (this.signalsStart) request.onStarted?.()
     return this.script(request)
   }
 }
@@ -64,6 +67,8 @@ describe('OfferedInvites', () => {
     const b = OfferedInvites.load(home)
     expect(b.has('gri_1')).toBe(true)
     expect(b.has('gri_2')).toBe(false)
+    b.remove('gri_1')
+    expect(OfferedInvites.load(home).has('gri_1')).toBe(false)
   })
 
   it('a malformed file is an empty set, never a crash', () => {
@@ -112,7 +117,39 @@ describe('IntegrationInvoker — invites across restarts', () => {
     expect(a.counters().retryRung).toBe(0) // the wake ladder is not for invites
   })
 
-  it('an invite whose run did not START is not recorded and is offered again on the next wake', async () => {
+  it('the offer is on disk the moment the run has STARTED — a crash mid-run cannot re-offer it', async () => {
+    const clock = new FakeClock()
+    let release: (o: RunOutcome) => void = () => undefined
+    const runner = new FakeRunner(() => new Promise<RunOutcome>((resolve) => (release = resolve)))
+    const a = invoker(clock, runner)
+    a.invite(invite('gri_crash'))
+    await flush()
+    // The run is in flight (never ends in this test: that is the crash).
+    expect(runner.requests).toHaveLength(1)
+    expect(OfferedInvites.load(home).has('gri_crash')).toBe(true)
+    // A restarted daemon reads the record and does not run it again.
+    const second = new FakeRunner()
+    const b = invoker(clock, second)
+    expect(b.invite(invite('gri_crash'))).toBe(false)
+    release({ state: 'ok', exitCode: 0, durationMs: 1 })
+    await a.settled()
+  })
+
+  it('a run interrupted by stop() after it started still counts as the offer — the paid call was made', async () => {
+    const clock = new FakeClock()
+    const runner = new FakeRunner()
+    runner.outcome = (request) => {
+      a.stop() // the integration stops mid-run (SIGTERM)
+      return { state: 'failed', exitCode: null, durationMs: 1, detail: `interrupted ${request.runId}` }
+    }
+    const a = invoker(clock, runner)
+    a.invite(invite('gri_s'))
+    await flush()
+    await a.settled()
+    expect(OfferedInvites.load(home).has('gri_s')).toBe(true)
+  })
+
+  it('a run that started but never got going (signed-out CLI: exit with nothing on stdout) is taken back out and offered again on the next wake', async () => {
     const clock = new FakeClock()
     const runner = new FakeRunner(notStarted)
     const a = invoker(clock, runner)
@@ -133,19 +170,22 @@ describe('IntegrationInvoker — invites across restarts', () => {
     expect(OfferedInvites.load(home).has('gri_n')).toBe(true)
   })
 
-  it('an invite run interrupted by stop() is not recorded: the restarted daemon offers it again', async () => {
+  it('a runner that cannot signal the start is recorded when its run ends (unless it never got going)', async () => {
     const clock = new FakeClock()
     const runner = new FakeRunner()
-    runner.outcome = (request) => {
-      // Simulate the integration stopping mid-run.
-      a.stop()
-      return { state: 'failed', exitCode: null, durationMs: 1, detail: `interrupted ${request.runId}` }
-    }
+    runner.signalsStart = false
     const a = invoker(clock, runner)
-    a.invite(invite('gri_s'))
+    a.invite(invite('gri_late'))
     await flush()
     await a.settled()
-    expect(OfferedInvites.load(home).has('gri_s')).toBe(false)
+    expect(OfferedInvites.load(home).has('gri_late')).toBe(true)
+    const broken = new FakeRunner(notStarted)
+    broken.signalsStart = false
+    const b = invoker(clock, broken)
+    b.invite(invite('gri_never'))
+    await flush()
+    await b.settled()
+    expect(OfferedInvites.load(home).has('gri_never')).toBe(false)
   })
 
   it('a run with no served texts in hand does not start and the invite is kept for the next wake', async () => {

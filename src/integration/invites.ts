@@ -10,10 +10,12 @@ import { log } from '../util/log.js'
 // a run. "Offered" used to live in process memory, which meant a daemon
 // restart offered every still-pending invite again — one paid run per invite,
 // per restart, for as long as the agent left them pending. The set now lives
-// in the identity home: an invite id is recorded once its run has actually
-// started, and never offered again from this machine. An invite whose run did
-// not start is deliberately NOT recorded, so the next wake (and the next
-// connect's listing) offers it again instead of losing it.
+// in the identity home: an invite id is recorded the moment its run has
+// started (the runner's `onStarted`, i.e. the process spawned), so a run cut
+// short by a shutdown or a crash still counts as the one offer — the paid
+// model call was made. An invite whose run never got going (`not_started`:
+// binary missing, signed out, exited with nothing on stdout) is taken back
+// out, so the next wake (and the next connect's listing) offers it again.
 //
 // Bounded and private to the user: ids and timestamps only.
 
@@ -29,6 +31,8 @@ const Schema = z.object({
 export interface OfferedInviteStore {
   has(inviteId: string): boolean
   add(inviteId: string): void
+  /** Forget an offer: the run recorded at start turned out never to have got going. */
+  remove(inviteId: string): void
 }
 
 export function offeredInvitesPath(home: string): string {
@@ -65,6 +69,13 @@ export class OfferedInvites implements OfferedInviteStore {
     if (this.has(inviteId)) return
     this.entries.push({ id: inviteId, at: this.now().toISOString() })
     while (this.entries.length > MAX_REMEMBERED) this.entries.shift()
+    this.persist()
+  }
+
+  remove(inviteId: string): void {
+    const index = this.entries.findIndex((entry) => entry.id === inviteId)
+    if (index === -1) return
+    this.entries.splice(index, 1)
     this.persist()
   }
 

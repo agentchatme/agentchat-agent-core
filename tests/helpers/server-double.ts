@@ -76,6 +76,8 @@ export interface ServerDouble {
   setTextsStatus(status: number): void
   /** Push a frame to the most recent live socket. */
   send(frame: unknown): void
+  /** Ping the most recent live socket once (a control frame, like the production server's 45 s ping). */
+  ping(): void
   /** Acks recorded across every connection. */
   acks(): string[]
   close(): Promise<void>
@@ -165,6 +167,11 @@ export async function startServerDouble(options: ServerDoubleOptions = {}): Prom
       const last = served[served.length - 1]
       if (!last) throw new Error('no live socket to send on')
       last.socket.send(JSON.stringify(frame))
+    },
+    ping: () => {
+      const last = served[served.length - 1]
+      if (!last) throw new Error('no live socket to ping')
+      last.socket.ping()
     },
     acks: () =>
       served.flatMap((s) => s.clientFrames.filter((f) => f['type'] === 'ack').map((f) => String(f['message_id']))),

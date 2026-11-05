@@ -193,6 +193,8 @@ export {
   serviceLabelFor,
   parseServiceHome,
   setServiceCommandRunnerForTests,
+  setServiceHostOsForTests,
+  type ServiceHostOs,
   serviceStatus,
   serviceInstalled,
   serviceDefinitionCurrent,

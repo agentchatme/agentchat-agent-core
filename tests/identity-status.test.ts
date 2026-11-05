@@ -75,6 +75,39 @@ afterEach(() => {
   for (const home of homes.splice(0)) fs.rmSync(home, { recursive: true, force: true })
 })
 
+describe('status fetches the served texts once per command', () => {
+  it('hands the line to the host’s extraStatus instead of letting it fetch again, with a 5 s one-attempt budget', async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'agentchat-status-once-'))
+    homes.push(home)
+    const seen: Array<string | null> = []
+    const profile: HostProfile = {
+      label: 'Example',
+      id: 'example',
+      client: { runtime: 'generic', version: '0.0.0-test' },
+      home: () => home,
+      anchorFile: () => path.join(home, 'ANCHOR.md'),
+      invocation: () => 'npx -y @agentchatme/example',
+      renderAnchor: (line) => line,
+      extraStatus: ({ identityLine }) => {
+        seen.push(identityLine)
+        return ['  placement: fine']
+      },
+    }
+    writeCredentials(home, { api_key: `ac_${'s'.repeat(32)}`, handle: 'probe' })
+    const request = mockServedTexts('probe')
+    vi.spyOn(AgentChatClient.prototype, 'getMe').mockResolvedValue({ handle: 'probe', status: 'active' } as never)
+    const { out } = capture()
+
+    expect(await createIdentityCommands(profile).runStatus({})).toBe(0)
+
+    const textsCalls = request.mock.calls.filter(([, p]) => String(p).startsWith('/v1/texts'))
+    expect(textsCalls).toHaveLength(1)
+    expect(textsCalls[0]?.[2]).toMatchObject({ timeoutMs: 5_000 })
+    expect(seen).toEqual(['I am @probe on AgentChat (api.agentchat.me). Served identity line for generic.'])
+    expect(out.join('\n')).toContain('  placement: fine')
+  })
+})
+
 describe('status when getMe fails', () => {
   it('a 401 says the key was refused (not "could not reach") and still prints the integration state', async () => {
     const { home, commands } = fixture()

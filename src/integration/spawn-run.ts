@@ -42,6 +42,8 @@ export interface SpawnRunSpec {
    * the outcome is `failed` with an "interrupted" detail.
    */
   readonly signal?: AbortSignal
+  /** Called once when the child process has been spawned (`RunRequest.onStarted`). */
+  readonly onStarted?: () => void
 }
 
 /** Strip anything key-shaped or terminal-styled from a diagnostic, and bound it. */
@@ -118,6 +120,17 @@ export function spawnRun(spec: SpawnRunSpec): Promise<RunOutcome> {
     } catch (err) {
       finish({ state: 'not_started', exitCode: null, detail: redactDiagnostic(String(err)) })
       return
+    }
+
+    if (spec.onStarted) {
+      const onStarted = spec.onStarted
+      child.once('spawn', () => {
+        try {
+          onStarted()
+        } catch {
+          /* the callback belongs to the invoker; a failure there is not the run's */
+        }
+      })
     }
 
     child.stdout?.on('data', (chunk: Buffer | string) => {

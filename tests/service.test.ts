@@ -10,6 +10,7 @@ import {
   serviceLabelFor,
   serviceStatus,
   setServiceCommandRunnerForTests,
+  setServiceHostOsForTests,
   systemdUnit,
   uninstallService,
   type ServiceCommandRunner,
@@ -43,6 +44,9 @@ beforeEach(() => {
 
 afterEach(() => {
   setServiceCommandRunnerForTests(null)
+  setServiceHostOsForTests(null)
+  delete process.env['AGENTCHATD_SERVICE_NO_START']
+  delete process.env['WSL_DISTRO_NAME']
   for (const [k, v] of [['HOME', saved.HOME], ['USERPROFILE', saved.USERPROFILE], ['AGENTCHAT_SERVICE_DRY_RUN', saved.DRY]] as const) {
     if (v === undefined) delete process.env[k]
     else process.env[k] = v
@@ -205,5 +209,88 @@ describe.skipIf(!posixServiceOs)('the ownership guard', () => {
     const foreign = writeDefinition(BASE, theirs)
     installService({ label: relocated, home: ours(), entry: path.join(ours(), 'bin', 'd.mjs'), supersedes: [BASE] })
     expect(fs.existsSync(foreign)).toBe(true)
+  })
+})
+
+
+// ─── An upgrade restarts the running daemon ─────────────────────────────────
+//
+// This release changes the daemon, so every upgrade hits this. `systemctl
+// --user enable --now` leaves an already-running unit on the OLD bundle until
+// the next boot, and a second Windows Startup launcher starts a second daemon
+// that loses the leader lock and loops. Pinned here as command sequences
+// against a fake service manager, on any CI runner (platform seam).
+
+describe('install (re)starts the daemon it just wrote', () => {
+  /** Records every command; answers nothing loaded (an upgrade from a unit that serves this home, or a fresh install). */
+  function recorder(answers: Record<string, string> = {}): { calls: string[]; runner: ServiceCommandRunner } {
+    const calls: string[] = []
+    const runner: ServiceCommandRunner = (cmd, args) => {
+      const line = `${cmd} ${args.join(' ')}`
+      calls.push(line)
+      for (const [prefix, out] of Object.entries(answers)) if (line.startsWith(prefix)) return { ok: true, out }
+      return { ok: true, out: '' }
+    }
+    return { calls, runner }
+  }
+  const home = (): string => path.join(tmp, 'home', '.example', 'agentchat')
+  const entry = (): string => path.join(home(), 'bin', 'd.mjs')
+
+  it('Linux: enables the unit, then RESTARTS it — never `enable --now`, which keeps a running unit on the old bundle', () => {
+    setServiceHostOsForTests('linux')
+    const fake = recorder()
+    setServiceCommandRunnerForTests(fake.runner)
+    delete process.env['AGENTCHAT_SERVICE_DRY_RUN']
+    installService({ label: BASE, home: home(), entry: entry() })
+    const systemctl = fake.calls.filter((c) => c.startsWith('systemctl'))
+    expect(systemctl.at(-2)).toBe(`systemctl --user enable ${BASE}`)
+    expect(systemctl.at(-1)).toBe(`systemctl --user restart ${BASE}`)
+    expect(fake.calls.some((c) => c.includes('enable --now'))).toBe(false)
+    expect(fake.calls.indexOf('systemctl --user daemon-reload')).toBeLessThan(fake.calls.indexOf(`systemctl --user enable ${BASE}`))
+    expect(fs.existsSync(path.join(tmp, 'home', '.config', 'systemd', 'user', `${BASE}.service`))).toBe(true)
+  })
+
+  it('Windows: stops the running launcher and the daemon in the leader lock BEFORE the new launcher starts', () => {
+    setServiceHostOsForTests('win32')
+    process.env['AGENTCHATD_SERVICE_NO_START'] = '1' // never spawn wscript from a test
+    const fake = recorder()
+    setServiceCommandRunnerForTests(fake.runner)
+    delete process.env['AGENTCHAT_SERVICE_DRY_RUN']
+    fs.mkdirSync(home(), { recursive: true })
+    fs.writeFileSync(path.join(home(), 'daemon.lock'), '4242')
+    installService({ label: BASE, home: home(), entry: entry() })
+    const launcherKill = fake.calls.findIndex((c) => c.startsWith('powershell ') && c.includes(`${BASE}.vbs`) && c.includes('Stop-Process'))
+    const daemonKill = fake.calls.indexOf('taskkill /PID 4242 /T /F')
+    expect(launcherKill).toBeGreaterThanOrEqual(0)
+    expect(daemonKill).toBeGreaterThan(launcherKill)
+    expect(fs.existsSync(path.join(tmp, 'home', 'AppData', 'Roaming', 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', `${BASE}.vbs`))).toBe(true)
+  })
+
+  it('Windows, fresh install (no leader lock): stops no daemon', () => {
+    setServiceHostOsForTests('win32')
+    process.env['AGENTCHATD_SERVICE_NO_START'] = '1'
+    const fake = recorder()
+    setServiceCommandRunnerForTests(fake.runner)
+    delete process.env['AGENTCHAT_SERVICE_DRY_RUN']
+    installService({ label: BASE, home: home(), entry: entry() })
+    expect(fake.calls.some((c) => c.startsWith('taskkill'))).toBe(false)
+  })
+
+  it('WSL: the same, with the daemon in the leader lock signalled from the Linux side', () => {
+    setServiceHostOsForTests('wsl')
+    process.env['AGENTCHATD_SERVICE_NO_START'] = '1'
+    process.env['WSL_DISTRO_NAME'] = 'Ubuntu'
+    const startup = path.join(tmp, 'mnt-appdata')
+    const fake = recorder({ 'cmd.exe /c echo %APPDATA%': 'C:\\Users\\me\\AppData\\Roaming\r\n', 'wslpath -u': `${startup}\n` })
+    setServiceCommandRunnerForTests(fake.runner)
+    delete process.env['AGENTCHAT_SERVICE_DRY_RUN']
+    fs.mkdirSync(home(), { recursive: true })
+    fs.writeFileSync(path.join(home(), 'daemon.lock'), '777')
+    installService({ label: BASE, home: home(), entry: entry() })
+    const launcherKill = fake.calls.findIndex((c) => c.startsWith('powershell.exe ') && c.includes('Stop-Process'))
+    const daemonKill = fake.calls.indexOf('kill -TERM 777')
+    expect(launcherKill).toBeGreaterThanOrEqual(0)
+    expect(daemonKill).toBeGreaterThan(launcherKill)
+    expect(fs.existsSync(path.join(startup, 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', `${BASE}.vbs`))).toBe(true)
   })
 })

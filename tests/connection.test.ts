@@ -255,6 +255,24 @@ describe('IntegrationConnection', () => {
 })
 
 describe('the liveness transport', () => {
+  it('one missed server ping does NOT trip the watchdog; two in a row do (scaled: ping every 450 ms, window 1000 ms)', async () => {
+    // Production: the server pings every 45 s, the window is 100 s — one
+    // missed ping (the next lands at 90 s) must be tolerated, two must not.
+    const c = connect('me', { webSocket: livenessWebSocket({ livenessMs: 1_000 }) })
+    await until(() => c.connection.connected)
+    expect(double.served).toHaveLength(1)
+    await pause(450)
+    double.ping() // t≈450
+    await pause(900) // the t≈900 ping is missed; the next lands at t≈1350, 900 ms after the last
+    double.ping()
+    await pause(300) // t≈1650: well past where a tripped watchdog (at t≈1450) would have reconnected
+    expect(double.served).toHaveLength(1)
+    expect(c.connection.connected).toBe(true)
+    // Now two pings are missed: nothing for 1000 ms after the last one.
+    await until(() => double.served.length === 2, 3_000)
+    expect(c.terminal).toEqual([])
+  }, 10_000)
+
   it('terminates a socket that goes silent so the SDK reconnects; server pings keep it alive', async () => {
     // Silent server: nothing after hello.ok. With a 300 ms liveness window the
     // transport terminates and the SDK reconnects — a second upgrade arrives.

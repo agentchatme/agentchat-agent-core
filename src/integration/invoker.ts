@@ -56,12 +56,13 @@ import type { IntegrationLastRun } from './status.js'
 //
 // Group invites are the second wake kind: not on the tray, one run each with
 // the served invite prompt, serialized on the same worker. An invite is
-// OFFERED once per machine — the id is remembered in the identity home the
-// moment its run has started (`OfferedInvites`), so a daemon restart does not
-// start one paid run per still-pending invite. An invite whose run did not
-// start (runtime missing, signed out, the daemon stopping) is not recorded:
-// it is offered again on the next wake, and the next connect's listing finds
-// it still pending.
+// OFFERED once per machine — the id is written to the identity home the
+// moment its run has started (the runner's `onStarted`, `OfferedInvites`), so
+// a daemon restart does not start one paid run per still-pending invite, and
+// neither does a run cut short by a shutdown or a crash: the model call was
+// made. An invite whose run never got going (`not_started`: runtime missing,
+// signed out, nothing on stdout) is taken back out and offered again on the
+// next wake; the next connect's listing finds it still pending.
 //
 // The prompts arrive lazily: the served texts may not have been fetched yet
 // when the first wake lands. A run with no texts in hand does not start — it
@@ -337,6 +338,14 @@ export class IntegrationInvoker {
 
     const controller = new AbortController()
     this.inFlight = controller
+    // An invite is recorded as offered the moment the runtime has started —
+    // the paid call is made from then on, whatever ends the run.
+    let offerRecorded = false
+    const onStarted = (): void => {
+      if (invite === undefined || offerRecorded) return
+      offerRecorded = true
+      this.offered.add(invite.inviteId)
+    }
     let outcome: RunOutcome
     try {
       const prompts = await this.prompts()
@@ -351,7 +360,14 @@ export class IntegrationInvoker {
         outcome = { state: 'not_started', exitCode: null, durationMs: this.now() - startedAt, detail: 'interrupted before the runtime was started' }
       } else {
         const prompt = kind === 'invite' ? prompts.invite : prompts.wake
-        outcome = await this.runner.start({ kind, prompt, runId, budgetMs: this.budgetMs, signal: controller.signal })
+        outcome = await this.runner.start({
+          kind,
+          prompt,
+          runId,
+          budgetMs: this.budgetMs,
+          signal: controller.signal,
+          ...(invite !== undefined ? { onStarted } : {}),
+        })
       }
     } catch (err) {
       // The runner contract is "never throws"; a throw is a bug in the runner,
@@ -395,7 +411,7 @@ export class IntegrationInvoker {
         break
     }
 
-    if (invite !== undefined) this.settleInvite(invite, outcome)
+    if (invite !== undefined) this.settleInvite(invite, outcome, offerRecorded)
 
     if (outcome.state !== 'ok') {
       log.warn(`run ${outcome.state} kind=${kind} id=${runId}${outcome.detail ? `: ${outcome.detail}` : ''}`)
@@ -412,19 +428,21 @@ export class IntegrationInvoker {
   }
 
   /**
-   * An invite counts as offered once its run has actually started: the agent
-   * had its chance, and the invite stays reachable through the hosted invite
-   * tools in any later run. A run that never started — or that this
-   * integration interrupted — is no offer; the invite is held for the next
-   * wake.
+   * An invite counts as offered once its run has started (recorded at
+   * `onStarted`; a runner that never signals it is recorded here, when the
+   * run ends): the agent had its chance, and the invite stays reachable
+   * through the hosted invite tools in any later run — including a run this
+   * integration interrupted. A run that never got going is no offer: the
+   * record is taken back and the invite is held for the next wake.
    */
-  private settleInvite(invite: InviteWake, outcome: RunOutcome): void {
-    if (outcome.state === 'not_started' || this.stopped) {
+  private settleInvite(invite: InviteWake, outcome: RunOutcome, offerRecorded: boolean): void {
+    if (outcome.state === 'not_started') {
+      if (offerRecorded) this.offered.remove(invite.inviteId)
       if (!this.invitesAwaitingRetry.some((i) => i.inviteId === invite.inviteId)) this.invitesAwaitingRetry.push(invite)
       log.info(`group-invite run did not start — invite ${invite.inviteId} is offered again on the next wake`)
       return
     }
-    this.offered.add(invite.inviteId)
+    if (!offerRecorded) this.offered.add(invite.inviteId)
     if (outcome.state !== 'ok') log.info(`group-invite run ${outcome.state} — the invite stays pending server-side, reachable through the hosted tools`)
   }
 

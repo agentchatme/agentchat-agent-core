@@ -163,3 +163,36 @@ describe('redactDiagnostic', () => {
     expect(redactDiagnostic('key ac_' + 'b'.repeat(32))).toBe('key [redacted AgentChat key]')
   })
 })
+
+
+describe('spawnRun — onStarted', () => {
+  it('fires once the process has spawned, before it ends', async () => {
+    const events: string[] = []
+    const outcome = await spawnRun({
+      command: process.execPath,
+      args: ['-e', 'process.stdout.write("x")'],
+      cwd: process.cwd(),
+      env: process.env,
+      stdin: null,
+      budgetMs: 10_000,
+      onStarted: () => events.push('started'),
+    })
+    expect(outcome.state).toBe('ok')
+    expect(events).toEqual(['started'])
+  })
+
+  it('never fires when the binary does not exist (not_started, nothing to record)', async () => {
+    const events: string[] = []
+    const outcome = await spawnRun({
+      command: 'agentchat-no-such-binary-' + process.pid,
+      args: [],
+      cwd: process.cwd(),
+      env: process.env,
+      stdin: null,
+      budgetMs: 10_000,
+      onStarted: () => events.push('started'),
+    })
+    expect(outcome.state).toBe('not_started')
+    expect(events).toEqual([])
+  })
+})

@@ -195,17 +195,37 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
   const LABEL = profile.label
   const clientIdentity = clientIdentityOf(profile.client)
 
-  const apiClient = (apiKey: string, apiBase: string): AgentChatClient =>
-    new AgentChatClient({ apiKey, baseUrl: apiBase, clientIdentity, timeoutMs: 15_000 })
+  /**
+   * `quick`: one attempt, 5 s — for `status`, `doctor` and the texts fetch,
+   * which must answer in seconds on a black-holed network (the SDK's default
+   * ramp is 4 attempts of up to 15 s). `patient`: the SDK's defaults, for a
+   * sign-in the user is waiting on.
+   */
+  const apiClient = (apiKey: string, apiBase: string, budget: 'quick' | 'patient' = 'quick'): AgentChatClient =>
+    budget === 'quick'
+      ? new AgentChatClient({ apiKey, baseUrl: apiBase, clientIdentity, timeoutMs: 5_000, retry: { maxRetries: 0, baseDelayMs: 0, maxDelayMs: 0 } })
+      : new AgentChatClient({ apiKey, baseUrl: apiBase, clientIdentity, timeoutMs: 15_000 })
 
   /**
-   * The served identity line for this agent: fetched now, else the cached
-   * one, else null (offline and never fetched). The CLI never writes an
-   * identity line it did not get from the server.
+   * The served identity line for this agent: fetched now (one attempt, 5 s),
+   * else the cached one, else null (offline and never fetched). Fetched ONCE
+   * per command: the result is handed to the host's `place`, `extraStatus`
+   * and `extraDoctorChecks`, which must not fetch again. The CLI never writes
+   * an identity line it did not get from the server.
    */
   async function servedIdentityLine(apiKey: string, apiBase: string): Promise<string | null> {
-    const loaded = await loadTexts({ home: profile.home(), runtime: profile.client.runtime, client: apiClient(apiKey, apiBase) })
+    const loaded = await loadTexts({ home: profile.home(), runtime: profile.client.runtime, client: apiClient(apiKey, apiBase), timeoutMs: 5_000 })
     return loaded === null ? null : identityLineOf(loaded.texts)
+  }
+
+  /** The host's extra `status` lines, with the line already fetched. */
+  async function printExtraStatus(identityLine: string | null): Promise<void> {
+    if (profile.extraStatus === undefined) return
+    try {
+      for (const line of await profile.extraStatus({ identityLine })) console.log(line)
+    } catch (err) {
+      console.log(`  (host status failed: ${err instanceof Error ? err.message : String(err)})`)
+    }
   }
 
   /**
@@ -415,7 +435,7 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
     }
 
     try {
-      const client = apiClient(apiKey, apiBase)
+      const client = apiClient(apiKey, apiBase, 'patient')
       const me = await client.getMe()
       writeCredentials(home, {
         api_key: apiKey,
@@ -635,6 +655,9 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
             ...formatIntegrationStatus(integration),
           ].join('\n'),
         )
+        // The server did not answer, so no texts fetch either: the host checks
+        // what it can without the line.
+        await printExtraStatus(null)
       }
       return 1
     }
@@ -676,6 +699,7 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
           ...formatIntegrationStatus(integration),
         ].join('\n'),
       )
+      await printExtraStatus(identityLine)
     }
     return 0
   }

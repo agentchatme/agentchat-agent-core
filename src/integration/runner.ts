@@ -25,6 +25,15 @@ export interface RunRequest {
    * still satisfies the contract.
    */
   readonly signal?: AbortSignal
+  /**
+   * Called once, as soon as the runtime's process has been started. The
+   * invoker records a group invite as offered at this moment — not when the
+   * run ends — so a run cut short by a shutdown or a crash still counts as
+   * the invite's one offer from this machine. A runner built on `spawnRun`
+   * passes it through; a runner that cannot tell may leave it uncalled, and
+   * the invoker then records the offer when the run ends instead.
+   */
+  readonly onStarted?: () => void
 }
 
 /**

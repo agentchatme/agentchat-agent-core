@@ -419,8 +419,8 @@ function systemdSightings(label: string): ServiceSighting[] {
 
 function sightings(label: string): ServiceSighting[] {
   if (winMode()) return [] // see assertServesHome
-  if (process.platform === 'linux') return systemdSightings(label)
-  if (process.platform === 'darwin') return launchdSightings(label)
+  if (serviceHostOs() === 'linux') return systemdSightings(label)
+  if (serviceHostOs() === 'darwin') return launchdSightings(label)
   return []
 }
 
@@ -516,9 +516,15 @@ function installSystemd(p: Plan): void {
   if (!linger.ok) {
     log.warn(`could not enable-linger (service won't survive logout until you run: sudo loginctl enable-linger ${os.userInfo().username})`)
   }
-  const enabled = run('systemctl', ['--user', 'enable', '--now', p.label])
+  const enabled = run('systemctl', ['--user', 'enable', p.label])
   if (!enabled.ok) throw new Error(`systemctl enable failed: ${enabled.out}`)
-  log.info(`service ${p.label} enabled + started`)
+  // `enable --now` leaves an already-running unit on the old bundle, so an
+  // upgrade silently kept the previous daemon until the next boot. `restart`
+  // starts a stopped unit and restarts a running one: either way the unit
+  // runs the bundle this install just wrote.
+  const started = run('systemctl', ['--user', 'restart', p.label])
+  if (!started.ok) throw new Error(`systemctl restart failed: ${started.out}`)
+  log.info(`service ${p.label} enabled + (re)started`)
 }
 
 function uninstallSystemd(label: string, home: string): void {
@@ -697,10 +703,32 @@ function isWsl(): boolean {
   }
 }
 type WinMode = 'win32' | 'wsl'
-function winMode(): WinMode | null {
+
+/** The host as service management sees it. `wsl` is Linux under WSL2 (Windows Startup launcher, not systemd). */
+export type ServiceHostOs = 'linux' | 'darwin' | 'win32' | 'wsl' | 'other'
+let hostOsOverride: ServiceHostOs | null = null
+
+/**
+ * Tests only: pretend to be another host so the Linux and Windows command
+ * sequences can be pinned on any CI runner. Paths and the real service
+ * manager are never reached: pair it with a fake command runner and
+ * `AGENTCHATD_SERVICE_NO_START=1`.
+ */
+export function setServiceHostOsForTests(hostOs: ServiceHostOs | null): void {
+  hostOsOverride = hostOs
+}
+
+function serviceHostOs(): ServiceHostOs {
+  if (hostOsOverride !== null) return hostOsOverride
   if (process.platform === 'win32') return 'win32'
-  if (isWsl()) return 'wsl'
-  return null
+  if (process.platform === 'linux') return isWsl() ? 'wsl' : 'linux'
+  if (process.platform === 'darwin') return 'darwin'
+  return 'other'
+}
+
+function winMode(): WinMode | null {
+  const hostOs = serviceHostOs()
+  return hostOs === 'win32' || hostOs === 'wsl' ? hostOs : null
 }
 
 function winMasterDir(): string {
@@ -773,6 +801,35 @@ function killLauncher(label: string, mode: WinMode): { ok: boolean; out: string 
   return run(mode === 'win32' ? 'powershell' : 'powershell.exe', ['-NoProfile', '-Command', ps])
 }
 
+/** The pid in the daemon's leader lock, or null: the daemon the Startup launcher is keeping alive right now. */
+function lockedDaemonPid(home: string): number | null {
+  try {
+    const pid = Number.parseInt(fs.readFileSync(path.join(home, 'daemon.lock'), 'utf-8').trim(), 10)
+    return Number.isInteger(pid) && pid > 0 ? pid : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Before a new launcher starts: stop the one already running and the daemon
+ * it spawned. The Startup launcher restarts its daemon on exit, so a second
+ * launcher started beside it would start a second daemon that loses the
+ * leader lock, exits, and is restarted every five seconds — forever, on the
+ * old bundle. Stop the launcher first (by its .vbs name), then the daemon by
+ * the pid in its leader lock, so the new launcher's daemon takes the lock.
+ * Best effort: a daemon that is not running leaves nothing to stop.
+ */
+function stopRunningWindowsDaemon(label: string, mode: WinMode, home: string): void {
+  const killed = killLauncher(label, mode)
+  if (!killed.ok) log.warn(`could not stop a running ${label} launcher (${killed.out || 'unknown error'}) — continuing`)
+  const pid = lockedDaemonPid(home)
+  if (pid === null) return
+  const stopped = mode === 'win32' ? run('taskkill', ['/PID', String(pid), '/T', '/F']) : run('kill', ['-TERM', String(pid)])
+  if (stopped.ok) log.info(`stopped the running daemon (pid ${pid}) so the new bundle starts`)
+  else log.debug(`no running daemon at pid ${pid} to stop (${stopped.out || 'already gone'})`)
+}
+
 function installWindows(p: Plan, mode: WinMode): void {
   const master = winMasterDir()
   fs.mkdirSync(master, { recursive: true })
@@ -791,10 +848,10 @@ function installWindows(p: Plan, mode: WinMode): void {
     )
   }
   log.info(`wrote ${masterVbs}`)
-  enableWindows(p.label, mode)
+  enableWindows(p.label, mode, p.home)
   log.info(`service ${p.label} installed (starts at login)`)
 }
-function enableWindows(label: string, mode: WinMode): void {
+function enableWindows(label: string, mode: WinMode, home: string): void {
   const masterVbs = path.join(winMasterDir(), `${label}.vbs`)
   if (!fs.existsSync(masterVbs)) throw new Error(`no ${label} daemon installed — run install first`)
   const startup = winStartupDir(mode)
@@ -802,6 +859,7 @@ function enableWindows(label: string, mode: WinMode): void {
   const startupVbs = path.join(startup, `${label}.vbs`)
   fs.copyFileSync(masterVbs, startupVbs)
   if (registrationSkipped()) return
+  stopRunningWindowsDaemon(label, mode, home)
   if (mode === 'win32') startDetached('wscript.exe', [startupVbs])
   else startDetached('cmd.exe', ['/c', 'start', '', '/b', 'wscript.exe', winPathFromWsl(startupVbs)])
 }
@@ -849,8 +907,8 @@ function retireSuperseded(opts: ServiceRef, label: string): void {
     const old = serviceLabel(raw)
     if (old === label || winMode() || !servesHome(old, opts.home)) continue
     log.info(`retiring the service ${old}: this identity home is now served by ${label}`)
-    if (process.platform === 'linux') uninstallSystemd(old, opts.home)
-    else if (process.platform === 'darwin') uninstallLaunchd(old, opts.home)
+    if (serviceHostOs() === 'linux') uninstallSystemd(old, opts.home)
+    else if (serviceHostOs() === 'darwin') uninstallLaunchd(old, opts.home)
   }
 }
 
@@ -860,8 +918,8 @@ export function installService(opts: ServiceOpts): void {
   retireSuperseded(opts, p.label)
   const wm = winMode()
   if (wm) return installWindows(p, wm)
-  if (process.platform === 'linux') return installSystemd(p) // native Linux (not WSL)
-  if (process.platform === 'darwin') return installLaunchd(p)
+  if (serviceHostOs() === 'linux') return installSystemd(p) // native Linux (not WSL)
+  if (serviceHostOs() === 'darwin') return installLaunchd(p)
   throw new Error(`service install is not supported on ${process.platform} — run \`agentchatd start\` under your own supervisor`)
 }
 
@@ -870,12 +928,12 @@ export function uninstallService(opts: ServiceRef): void {
   const home = path.resolve(opts.home)
   const wm = winMode()
   if (wm) return uninstallWindows(label, wm)
-  if (process.platform === 'linux') {
+  if (serviceHostOs() === 'linux') {
     uninstallSystemd(label, home)
     retireSuperseded({ ...opts, home }, label)
     return
   }
-  if (process.platform === 'darwin') {
+  if (serviceHostOs() === 'darwin') {
     uninstallLaunchd(label, home)
     retireSuperseded({ ...opts, home }, label)
     return
@@ -888,8 +946,8 @@ export function serviceStatus(opts: ServiceRef): string {
   const home = path.resolve(opts.home)
   const wm = winMode()
   if (wm) return statusWindows(label, wm)
-  if (process.platform === 'linux') return statusSystemd(label, home)
-  if (process.platform === 'darwin') return statusLaunchd(label, home)
+  if (serviceHostOs() === 'linux') return statusSystemd(label, home)
+  if (serviceHostOs() === 'darwin') return statusLaunchd(label, home)
   return `service management not supported on ${process.platform}`
 }
 
@@ -915,11 +973,11 @@ export function serviceDefinitionCurrent(opts: ServiceOpts): boolean {
           launcherVbs(`wsl.exe -d "${distro}" -e bash "${script}"`, {})
       )
     }
-    if (process.platform === 'linux') {
+    if (serviceHostOs() === 'linux') {
       const file = systemdUnitPath(p.label)
       return fs.existsSync(file) && fs.readFileSync(file, 'utf-8') === systemdUnit(p)
     }
-    if (process.platform === 'darwin') {
+    if (serviceHostOs() === 'darwin') {
       const file = launchdPlistPath(p.label)
       return fs.existsSync(file) && fs.readFileSync(file, 'utf-8') === launchdPlist(p)
     }
@@ -939,8 +997,8 @@ export function serviceDefinitionCurrent(opts: ServiceOpts): boolean {
 
 function unitInstalled(label: string): boolean {
   if (winMode()) return fs.existsSync(path.join(winMasterDir(), `${label}.vbs`))
-  if (process.platform === 'linux') return fs.existsSync(systemdUnitPath(label))
-  if (process.platform === 'darwin') return fs.existsSync(launchdPlistPath(label))
+  if (serviceHostOs() === 'linux') return fs.existsSync(systemdUnitPath(label))
+  if (serviceHostOs() === 'darwin') return fs.existsSync(launchdPlistPath(label))
   return false
 }
 
@@ -956,14 +1014,14 @@ export function disableService(opts: ServiceOpts): void {
   const wm = winMode()
   if (wm) {
     disableWindows(label, wm) // drop the Startup copy, keep the master
-  } else if (process.platform === 'linux') {
+  } else if (serviceHostOs() === 'linux') {
     assertServesHome(label, path.resolve(opts.home), 'stop')
     // Stops it AND removes the start-on-boot link; the unit file stays.
     if (!registrationSkipped()) {
       const disabled = run('systemctl', ['--user', 'disable', '--now', label])
       if (!disabled.ok) throw new Error(`could not disable ${label}: ${disabled.out}`)
     }
-  } else if (process.platform === 'darwin') {
+  } else if (serviceHostOs() === 'darwin') {
     assertServesHome(label, path.resolve(opts.home), 'stop')
     if (!registrationSkipped()) {
       const disabled = run('launchctl', ['unload', launchdPlistPath(label)])
@@ -982,13 +1040,13 @@ export function enableService(opts: ServiceOpts): void {
   }
   const wm = winMode()
   if (wm) {
-    enableWindows(label, wm) // copy the master back into Startup + start now
-  } else if (process.platform === 'linux') {
+    enableWindows(label, wm, path.resolve(opts.home)) // copy the master back into Startup + start now
+  } else if (serviceHostOs() === 'linux') {
     if (!registrationSkipped()) {
       const enabled = run('systemctl', ['--user', 'enable', '--now', label])
       if (!enabled.ok) throw new Error(`could not enable ${label}: ${enabled.out}`)
     }
-  } else if (process.platform === 'darwin') {
+  } else if (serviceHostOs() === 'darwin') {
     if (!registrationSkipped()) {
       const enabled = run('launchctl', ['load', '-w', launchdPlistPath(label)])
       if (!enabled.ok) throw new Error(`could not enable ${label}: ${enabled.out}`)

@@ -23,7 +23,8 @@ export const TEXTS_CACHE_FILE = 'texts.json'
 export const TEXTS_REFRESH_MS = 24 * 3_600_000
 /** After a failed refresh: try again sooner than the daily timer. */
 export const TEXTS_RETRY_MS = 3_600_000
-const FETCH_TIMEOUT_MS = 10_000
+/** One attempt, a few seconds: a CLI command or a run must not wait out a black-holed network. */
+const FETCH_TIMEOUT_MS = 5_000
 
 const TextsSchema = z
   .object({

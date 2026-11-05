@@ -9,6 +9,11 @@ export interface DoctorCheck {
   detail: string
 }
 
+/** What the shared `status` hands a host's extra lines: the served identity line it already fetched (one fetch per command). */
+export interface StatusContext {
+  identityLine: string | null
+}
+
 /** What the shared doctor hands a host's extra checks. */
 export interface DoctorContext {
   fix?: boolean
@@ -86,6 +91,12 @@ export interface HostProfile {
   unplace?(identity: ResolvedIdentity | null): string[]
   /** Host-specific doctor checks, appended after the shared ones. */
   extraDoctorChecks?(context: DoctorContext): DoctorCheck[]
+  /**
+   * Host-specific `status` lines (placement, probes), printed after the shared
+   * ones in text mode. The served identity line comes along so the host does
+   * not fetch `/v1/texts` a second time.
+   */
+  extraStatus?(context: StatusContext): string[] | Promise<string[]>
   /** Extra lines printed after a successful logout. */
   logoutHints?(): string[]
 }

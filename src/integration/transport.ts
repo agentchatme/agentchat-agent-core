@@ -20,6 +20,11 @@ import { log } from '../util/log.js'
 //
 // Injected into the SDK through its `webSocket` option, which exists for
 // exactly this: a host-supplied constructor with the browser shape.
+//
+// TODO(sdk): delete this file once `agentchatme`'s RealtimeClient ships its
+// own liveness watchdog (the follow-up adds a liveness option on
+// `RealtimeOptions`); then `IntegrationConnection` passes that option and no
+// `webSocket` override. Kept for this release so the laptop case is covered.
 
 export const HANDSHAKE_TIMEOUT_MS = 15_000
 /** ~2 missed server ping cycles. */
