@@ -181,7 +181,7 @@ describe('spawnRun — onStarted', () => {
     expect(events).toEqual(['started'])
   })
 
-  it('never fires when the binary does not exist (not_started, nothing to record)', async () => {
+  it('a binary that does not exist is not_started; onStarted stays silent where the spawn itself fails', async () => {
     const events: string[] = []
     const outcome = await spawnRun({
       command: 'agentchat-no-such-binary-' + process.pid,
@@ -193,6 +193,11 @@ describe('spawnRun — onStarted', () => {
       onStarted: () => events.push('started'),
     })
     expect(outcome.state).toBe('not_started')
-    expect(events).toEqual([])
+    // `onStarted` means the child process spawned. On Windows cross-spawn runs
+    // the command through cmd.exe, so the shim spawns and only then reports the
+    // missing binary (exit 1, nothing on stdout): `onStarted` fires there, and
+    // the invoker takes the invite's record back on `not_started`
+    // (`settleInvite`). Elsewhere the spawn fails outright and nothing fires.
+    expect(events).toEqual(process.platform === 'win32' ? ['started'] : [])
   })
 })
