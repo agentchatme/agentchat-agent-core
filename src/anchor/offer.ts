@@ -4,7 +4,7 @@ import { ANCHOR_START, ANCHOR_END } from './block.js'
 //
 // The setup wizard's one piece of agent-facing text: what an installed but
 // unregistered agent is told, in the always-loaded instruction file. This is
-// wizard copy (the doorbell's "small wizard"), not product text — the manual,
+// wizard copy (the integration's "small wizard"), not product text — the manual,
 // the identity line, the wake instruction and the gate question are all the
 // main line's and are only placed by an integration.
 //

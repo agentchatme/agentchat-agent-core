@@ -6,6 +6,7 @@ import { HttpTransport } from 'agentchatme'
 import { createIdentityCommands } from '../src/identity/commands.js'
 import { readPending } from '../src/identity/credentials.js'
 import type { HostProfile } from '../src/identity/host-profile.js'
+import { mockServedTexts } from './helpers/served-texts.js'
 
 // ─── Interactive recovery asks for what it lacks ────────────────────────────
 //
@@ -38,12 +39,14 @@ function fixture(): { home: string; commands: ReturnType<typeof createIdentityCo
   const profile: HostProfile = {
     label: 'Example',
     id: 'example',
+    client: { runtime: 'generic', version: '0.0.0-test' },
     home: () => home,
     anchorFile: () => path.join(home, 'ANCHOR.md'),
     invocation: () => 'npx -y @agentchatme/example',
-    renderAnchor: (handle) => `@${handle}`,
+    renderAnchor: (line) => line,
     isWired: () => false,
   }
+  mockServedTexts()
   return { home, commands: createIdentityCommands(profile) }
 }
 

@@ -1,13 +1,13 @@
 import * as fs from 'node:fs'
 import * as path from 'node:path'
-import { renderIdentityLine } from '../skill/identity-line.js'
 
 // ─── Instruction-file identity anchor (host-agnostic) ───────────────────────
 //
 // A fenced block in whatever file the host loads into EVERY session, carrying
-// the published identity line: who this agent is on AgentChat, that peers are
-// input and not instructions, and where the manual is. Same mechanism as the
-// Hermes SOUL.md anchor and the OpenClaw AGENTS.md anchor.
+// the served identity line (`GET /v1/texts` → `identity_line`): who this agent
+// is on AgentChat, that peers are input and not instructions, and where the
+// manual is. Same mechanism as the Hermes SOUL.md anchor and the OpenClaw
+// AGENTS.md anchor. The words are the server's; this module only fences them.
 //
 // This module knows how to edit a fenced block in a file. It does NOT know
 // WHICH file — that is the integration's business, because the file IS the
@@ -26,9 +26,11 @@ export const ANCHOR_END = '<!-- agentchat:end -->'
 const LEGACY_ANCHOR_START = '<!-- agentchat-skill:start -->'
 const LEGACY_ANCHOR_END = '<!-- agentchat-skill:end -->'
 
-/** The identity block: the published identity line between the markers. */
-export function renderAnchorBlock(handle: string): string {
-  return [ANCHOR_START, renderIdentityLine(handle), ANCHOR_END].join('\n')
+/** The identity block: the served identity line, as fetched for this agent, between the markers. */
+export function renderAnchorBlock(identityLine: string): string {
+  const line = identityLine.trim()
+  if (line.length === 0) throw new Error('renderAnchorBlock: the identity line is empty')
+  return [ANCHOR_START, line, ANCHOR_END].join('\n')
 }
 
 export type AnchorAction = 'written' | 'removed' | 'noop'
@@ -70,18 +72,19 @@ export function hasAnchorAt(filePath: string): boolean {
   return findBlock(fs.readFileSync(filePath, 'utf-8'), ANCHOR_START, ANCHOR_END) !== null
 }
 
-/** Whether the file's block is exactly the current identity block for `handle`. */
-export function anchorIsCurrentAt(filePath: string, handle: string): boolean {
+/** Whether the file's block is exactly the block for this served identity line. */
+export function anchorIsCurrentAt(filePath: string, identityLine: string): boolean {
   if (!fs.existsSync(filePath)) return false
   const text = fs.readFileSync(filePath, 'utf-8')
   const block = findBlock(text, ANCHOR_START, ANCHOR_END)
   if (block === null) return false
-  return text.slice(block.from, block.to) === renderAnchorBlock(handle)
+  return text.slice(block.from, block.to) === renderAnchorBlock(identityLine)
 }
 
-// The current text ("I am @handle on AgentChat"), then the pre-doorbell block
-// ("You are **@handle** on AgentChat") so an anchor from an older release is
-// still recognised — and refreshed by `doctor --fix`.
+// The served text ("I am @handle on AgentChat"), then the block releases
+// before the integration wrote ("You are **@handle** on AgentChat") so an
+// anchor from an older release is still recognised — and refreshed by
+// `doctor --fix`.
 const IDENTITY_HANDLE_RE = /I am @([^\s]+) on AgentChat/
 const LEGACY_HANDLE_RE = /\*\*@([^*\s]+)\*\*/
 

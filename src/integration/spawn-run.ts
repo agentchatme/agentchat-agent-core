@@ -7,7 +7,7 @@ import type { RunOutcome } from './runner.js'
 // Shared by every runner: start the runtime's headless command, feed it the
 // prompt, bound it, classify the exit. The run's OUTPUT IS DISCARDED — stdout
 // is counted, never kept, never parsed, never logged. A run's text can quote
-// peer messages, and the doorbell reads no message content, ever. The only
+// peer messages, and the integration reads no message content, ever. The only
 // thing retained is a short, credential-redacted tail of stderr for the
 // failure diagnostic, because "exited 1" alone has cost days of debugging.
 //
@@ -19,7 +19,7 @@ import type { RunOutcome } from './runner.js'
 // stderr tail rides along in the detail either way.
 //
 // The run is spawned as its own process group (detached) so the whole tree
-// can be signalled at once: on the budget, and when the doorbell is stopping
+// can be signalled at once: on the budget, and when the integration is stopping
 // (`signal`) — a daemon that exits with a run still going orphans a model call
 // that nobody will read and that the restarted daemon would run again.
 
@@ -42,6 +42,8 @@ export interface SpawnRunSpec {
    * the outcome is `failed` with an "interrupted" detail.
    */
   readonly signal?: AbortSignal
+  /** Called once when the child process has been spawned (`RunRequest.onStarted`). */
+  readonly onStarted?: () => void
 }
 
 /** Strip anything key-shaped or terminal-styled from a diagnostic, and bound it. */
@@ -120,6 +122,17 @@ export function spawnRun(spec: SpawnRunSpec): Promise<RunOutcome> {
       return
     }
 
+    if (spec.onStarted) {
+      const onStarted = spec.onStarted
+      child.once('spawn', () => {
+        try {
+          onStarted()
+        } catch {
+          /* the callback belongs to the invoker; a failure there is not the run's */
+        }
+      })
+    }
+
     child.stdout?.on('data', (chunk: Buffer | string) => {
       stdoutBytes += chunk.length // counted, never kept
     })
@@ -177,7 +190,7 @@ export function spawnRun(spec: SpawnRunSpec): Promise<RunOutcome> {
         finish({
           state: 'failed',
           exitCode: code,
-          detail: `interrupted — the doorbell was stopping; the tray stays stored for the next run${tail ? `: ${tail}` : ''}`,
+          detail: `interrupted — the integration was stopping; the tray stays unread for the next run${tail ? `: ${tail}` : ''}`,
         })
         return
       }

@@ -1,10 +1,10 @@
 import { describe, expect, it } from 'vitest'
-import { hostedMcpUrl, probeHostedMcp } from '../src/doorbell/mcp-probe.js'
+import { hostedMcpUrl, probeHostedMcp } from '../src/integration/mcp-probe.js'
 
 // ─── One MCP initialize with the key, nothing else ──────────────────────────
 
 const probe = (fetchImpl: typeof fetch) =>
-  probeHostedMcp({ apiKey: 'ac_' + 'p'.repeat(32), apiBase: 'https://api.example.test/', clientName: 'test doctor', clientVersion: '0', fetch: fetchImpl })
+  probeHostedMcp({ apiKey: 'ac_' + 'p'.repeat(32), apiBase: 'https://api.example.test/', client: { runtime: 'generic', version: '0.0.0-test' }, clientName: 'test doctor', clientVersion: '0', fetch: fetchImpl })
 
 describe('probeHostedMcp', () => {
   it('posts initialize with the bearer key to <base>/mcp and reads a JSON answer', async () => {
@@ -21,6 +21,8 @@ describe('probeHostedMcp', () => {
     expect(calls[0]?.url).toBe('https://api.example.test/mcp')
     const headers = calls[0]?.init.headers as Record<string, string>
     expect(headers['authorization']).toBe('Bearer ac_' + 'p'.repeat(32))
+    expect(headers['X-AgentChat-Client']).toBe('generic')
+    expect(headers['X-AgentChat-Client-Version']).toBe('0.0.0-test')
     const body = JSON.parse(String(calls[0]?.init.body)) as { method: string }
     expect(body.method).toBe('initialize')
     expect(calls).toHaveLength(1)

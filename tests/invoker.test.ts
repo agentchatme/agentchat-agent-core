@@ -1,9 +1,9 @@
 import { describe, expect, it } from 'vitest'
-import { DoorbellInvoker, RETRY_LADDER_MS } from '../src/doorbell/invoker.js'
-import type { RunOutcome, RunRequest, RunRunner } from '../src/doorbell/runner.js'
+import { IntegrationInvoker, RETRY_LADDER_MS } from '../src/integration/invoker.js'
+import type { RunOutcome, RunRequest, RunRunner } from '../src/integration/runner.js'
 import { FakeClock, flush } from './helpers/fake-clock.js'
 
-// ─── Knock → one run; never two; failures climb the ladder one rung per outage ─
+// ─── Wake → one run; never two; failures climb the ladder one rung per outage ─
 
 type Script = (request: RunRequest) => Promise<RunOutcome> | RunOutcome
 
@@ -50,7 +50,8 @@ const failed = (): RunOutcome => ({ state: 'failed', exitCode: 1, durationMs: 10
 const notStarted = (): RunOutcome => ({ state: 'not_started', exitCode: 127, durationMs: 1, detail: 'exit 127 before any output' })
 const timedOut = (): RunOutcome => ({ state: 'timed_out', exitCode: null, durationMs: 600_000, detail: 'killed' })
 
-const PROMPTS = { knock: 'KNOCK PROMPT', invite: 'INVITE PROMPT' }
+const PROMPTS = { wake: 'WAKE PROMPT', invite: 'INVITE PROMPT' }
+const prompts = async () => PROMPTS
 
 /**
  * The wire's tray count, faked: `GET /v1/inbox?wait_ms=0&limit=1` answering
@@ -67,9 +68,9 @@ class FakeTray {
 }
 
 function invoker(clock: FakeClock, runner: FakeRunner, ladder: readonly number[] = RETRY_LADDER_MS, tray?: FakeTray) {
-  return new DoorbellInvoker({
+  return new IntegrationInvoker({
     runner,
-    prompts: PROMPTS,
+    prompts,
     budgetMs: 600_000,
     debounceMs: 2_000,
     retryLadderMs: ladder,
@@ -81,33 +82,33 @@ function invoker(clock: FakeClock, runner: FakeRunner, ladder: readonly number[]
   })
 }
 
-describe('DoorbellInvoker — knocks', () => {
-  it('coalesces a burst into one run with the fixed knock prompt and the budget', async () => {
+describe('IntegrationInvoker — wakes', () => {
+  it('coalesces a burst into one run with the fixed wake prompt and the budget', async () => {
     const clock = new FakeClock()
     const runner = new FakeRunner()
     const inv = invoker(clock, runner)
-    inv.knock('message')
-    inv.knock('message')
-    inv.knock('message')
+    inv.wake('message')
+    inv.wake('message')
+    inv.wake('message')
     await clock.advanceAsync(2_000)
     await inv.settled()
     expect(runner.requests).toHaveLength(1)
-    expect(runner.requests[0]).toMatchObject({ kind: 'knock', prompt: 'KNOCK PROMPT', budgetMs: 600_000 })
-    expect(inv.counters()).toMatchObject({ knocks: 3, absorbed: 2, runsStarted: 1, runsOk: 1, retryRung: 0 })
+    expect(runner.requests[0]).toMatchObject({ kind: 'wake', prompt: 'WAKE PROMPT', budgetMs: 600_000 })
+    expect(inv.counters()).toMatchObject({ wakes: 3, absorbed: 2, runsStarted: 1, runsOk: 1, retryRung: 0 })
   })
 
-  it('never runs two at once: a knock during a run earns exactly ONE more run after it', async () => {
+  it('never runs two at once: a wake during a run earns exactly ONE more run after it', async () => {
     const clock = new FakeClock()
     const runner = new FakeRunner()
     runner['script'] = runner.holding()
     const inv = invoker(clock, runner)
-    inv.knock('message')
+    inv.wake('message')
     await clock.advanceAsync(2_000)
     expect(runner.requests).toHaveLength(1)
 
-    // Ten knocks while the run is in flight.
+    // Ten wakes while the run is in flight.
     for (let i = 0; i < 10; i++) {
-      inv.knock('message')
+      inv.wake('message')
       await clock.advanceAsync(2_000)
     }
     expect(runner.requests).toHaveLength(1)
@@ -128,13 +129,13 @@ describe('DoorbellInvoker — knocks', () => {
     const clock = new FakeClock()
     const runner = new FakeRunner(() => notStarted())
     const inv = invoker(clock, runner)
-    inv.knock('connect')
+    inv.wake('connect')
     await clock.advanceAsync(2_000)
     await inv.settled()
     expect(runner.requests).toHaveLength(1)
     expect(inv.counters()).toMatchObject({ runsNotStarted: 1, retryRung: 1, retryDueAt: 2_000 + 60_000 })
 
-    await clock.advanceAsync(60_000) // the delayed knock
+    await clock.advanceAsync(60_000) // the delayed wake
     await clock.advanceAsync(2_000) // its debounce
     await inv.settled()
     expect(runner.requests).toHaveLength(2)
@@ -146,7 +147,7 @@ describe('DoorbellInvoker — knocks', () => {
     const outcomes = [failed(), timedOut(), ok()]
     const runner = new FakeRunner(() => outcomes.shift() ?? ok())
     const inv = invoker(clock, runner)
-    inv.knock('message')
+    inv.wake('message')
     await clock.advanceAsync(2_000)
     await inv.settled()
     expect(inv.counters()).toMatchObject({ runsFailed: 1, retryRung: 1 })
@@ -161,18 +162,18 @@ describe('DoorbellInvoker — knocks', () => {
     expect(runner.requests).toHaveLength(3)
   })
 
-  it('one outage climbs ONE rung: a knock that fails while a retry is pending does not replace it', async () => {
+  it('one outage climbs ONE rung: a wake that fails while a retry is pending does not replace it', async () => {
     const clock = new FakeClock()
     const runner = new FakeRunner(() => failed())
     const inv = invoker(clock, runner)
-    inv.knock('message')
+    inv.wake('message')
     await clock.advanceAsync(2_000)
     await inv.settled()
     expect(inv.counters()).toMatchObject({ retryRung: 1, retryDueAt: 62_000 })
 
     // A peer writes again mid-outage; that run fails too.
     await clock.advanceAsync(10_000)
-    inv.knock('message')
+    inv.wake('message')
     await clock.advanceAsync(2_000)
     await inv.settled()
     expect(runner.requests).toHaveLength(2)
@@ -180,11 +181,11 @@ describe('DoorbellInvoker — knocks', () => {
     expect(inv.counters()).toMatchObject({ retryRung: 1, retryDueAt: 62_000 })
   })
 
-  it('the ladder is exhausted after its last rung and waits for the next knock', async () => {
+  it('the ladder is exhausted after its last rung and waits for the next wake', async () => {
     const clock = new FakeClock()
     const runner = new FakeRunner(() => failed())
     const inv = invoker(clock, runner, [10, 20])
-    inv.knock('message')
+    inv.wake('message')
     await clock.advanceAsync(2_000)
     await inv.settled()
     await clock.advanceAsync(2_010)
@@ -195,7 +196,7 @@ describe('DoorbellInvoker — knocks', () => {
     expect(inv.counters().retryRung).toBe(2)
     await clock.advanceAsync(100_000)
     expect(runner.requests).toHaveLength(3) // nothing more scheduled
-    inv.knock('message')
+    inv.wake('message')
     await clock.advanceAsync(2_000)
     await inv.settled()
     expect(runner.requests).toHaveLength(4)
@@ -207,7 +208,7 @@ describe('DoorbellInvoker — knocks', () => {
       throw new Error('boom')
     })
     const inv = invoker(clock, runner)
-    inv.knock('message')
+    inv.wake('message')
     await clock.advanceAsync(2_000)
     await inv.settled()
     expect(inv.counters()).toMatchObject({ runsNotStarted: 1, retryRung: 1 })
@@ -218,17 +219,17 @@ describe('DoorbellInvoker — knocks', () => {
     const clock = new FakeClock()
     const runner = new FakeRunner()
     const inv = invoker(clock, runner)
-    inv.knock('message')
+    inv.wake('message')
     await clock.advanceAsync(2_000)
     await inv.settled()
-    expect(inv.counters().lastRun).toMatchObject({ kind: 'knock', state: 'ok', exit_code: 0 })
+    expect(inv.counters().lastRun).toMatchObject({ kind: 'wake', state: 'ok', exit_code: 0 })
   })
 
-  it('stop cancels pending knocks and retries', async () => {
+  it('stop cancels pending wakes and retries', async () => {
     const clock = new FakeClock()
     const runner = new FakeRunner(() => failed())
     const inv = invoker(clock, runner)
-    inv.knock('message')
+    inv.wake('message')
     await clock.advanceAsync(2_000)
     await inv.settled()
     inv.stop()
@@ -237,7 +238,7 @@ describe('DoorbellInvoker — knocks', () => {
   })
 })
 
-describe('DoorbellInvoker — invites', () => {
+describe('IntegrationInvoker — invites', () => {
   const invite = (id: string) => ({ inviteId: id, groupId: 'grp_1', groupName: 'Ops', inviterHandle: 'alice' })
 
   it('starts one invite run with the fixed invite prompt, deduplicated by invite id', async () => {
@@ -253,26 +254,26 @@ describe('DoorbellInvoker — invites', () => {
     expect(inv.counters().invites).toBe(1)
   })
 
-  it('serializes invite runs and knock runs on one worker', async () => {
+  it('serializes invite runs and wake runs on one worker', async () => {
     const clock = new FakeClock()
     const runner = new FakeRunner()
     runner['script'] = runner.holding()
     const inv = invoker(clock, runner)
     inv.invite(invite('gri_1'))
     await flush()
-    inv.knock('message')
+    inv.wake('message')
     await clock.advanceAsync(2_000)
     expect(runner.requests).toHaveLength(1)
     runner.release(ok())
     await flush()
     expect(runner.requests).toHaveLength(2)
-    expect(runner.requests[1]?.kind).toBe('knock')
+    expect(runner.requests[1]?.kind).toBe('wake')
     expect(runner.maxInFlight).toBe(1)
     runner.release(ok())
     await flush()
   })
 
-  it('a failed invite run does not climb the knock ladder — the invite stays pending server-side', async () => {
+  it('a failed invite run does not climb the wake ladder — the invite stays pending server-side', async () => {
     const clock = new FakeClock()
     const runner = new FakeRunner(() => failed())
     const inv = invoker(clock, runner)
@@ -283,7 +284,7 @@ describe('DoorbellInvoker — invites', () => {
   })
 })
 
-describe('DoorbellInvoker — stop interrupts, preflight watch after an exhausted ladder', () => {
+describe('IntegrationInvoker — stop interrupts, preflight watch after an exhausted ladder', () => {
   it('stop aborts the run in flight; settled resolves once it has ended; nothing is rescheduled', async () => {
     const clock = new FakeClock()
     const runner = new FakeRunner(
@@ -293,7 +294,7 @@ describe('DoorbellInvoker — stop interrupts, preflight watch after an exhauste
         }),
     )
     const inv = invoker(clock, runner)
-    inv.knock('message')
+    inv.wake('message')
     await clock.advanceAsync(2_000)
     await flush()
     expect(runner.inFlight).toBe(1)
@@ -305,15 +306,15 @@ describe('DoorbellInvoker — stop interrupts, preflight watch after an exhauste
     expect(clock.pending()).toBe(0) // no retry: stopped
   })
 
-  it('after the ladder is exhausted, a runtime that was down and comes back earns ONE re-knock', async () => {
+  it('after the ladder is exhausted, a runtime that was down and comes back earns ONE re-wake', async () => {
     const clock = new FakeClock()
     let preflightOk = false
     let mode: 'down' | 'ok' = 'down'
     const runner = new FakeRunner(() => (mode === 'down' ? notStarted() : ok()))
     runner.preflight = async () => ({ ok: preflightOk })
-    const inv = new DoorbellInvoker({
+    const inv = new IntegrationInvoker({
       runner,
-      prompts: PROMPTS,
+      prompts,
       budgetMs: 600_000,
       debounceMs: 2_000,
       retryLadderMs: [1_000, 2_000, 3_000],
@@ -322,7 +323,7 @@ describe('DoorbellInvoker — stop interrupts, preflight watch after an exhauste
       setTimeout: (fn, ms) => clock.setTimeout(fn, ms),
       clearTimeout: (h) => clock.clearTimeout(h),
     })
-    inv.knock('message')
+    inv.wake('message')
     await clock.advanceAsync(2_000)
     await inv.settled() // run 1 → rung 1
     await clock.advanceAsync(1_000 + 2_000)
@@ -346,7 +347,7 @@ describe('DoorbellInvoker — stop interrupts, preflight watch after an exhauste
     mode = 'ok'
     await clock.advanceAsync(10_000)
     await flush()
-    await clock.advanceAsync(2_000) // the re-knock coalesces like any other
+    await clock.advanceAsync(2_000) // the re-wake coalesces like any other
     await inv.settled()
     expect(runner.requests).toHaveLength(5)
     expect(inv.counters().runsOk).toBe(1)
@@ -354,12 +355,12 @@ describe('DoorbellInvoker — stop interrupts, preflight watch after an exhauste
     expect(clock.pending()).toBe(0) // success ends the watch
   })
 
-  it('when preflight was already ok, an exhausted ladder waits for the next knock — no re-knock, no endless probing', async () => {
+  it('when preflight was already ok, an exhausted ladder waits for the next wake — no re-wake, no endless probing', async () => {
     const clock = new FakeClock()
     const runner = new FakeRunner(() => failed())
-    const inv = new DoorbellInvoker({
+    const inv = new IntegrationInvoker({
       runner,
-      prompts: PROMPTS,
+      prompts,
       budgetMs: 600_000,
       debounceMs: 2_000,
       retryLadderMs: [1_000],
@@ -368,7 +369,7 @@ describe('DoorbellInvoker — stop interrupts, preflight watch after an exhauste
       setTimeout: (fn, ms) => clock.setTimeout(fn, ms),
       clearTimeout: (h) => clock.clearTimeout(h),
     })
-    inv.knock('message')
+    inv.wake('message')
     await clock.advanceAsync(2_000)
     await inv.settled()
     await clock.advanceAsync(1_000 + 2_000)
@@ -379,34 +380,34 @@ describe('DoorbellInvoker — stop interrupts, preflight watch after an exhauste
     await flush()
     expect(runner.requests).toHaveLength(2)
     expect(clock.pending()).toBe(0) // the watch stopped: the failures were not readiness
-    // A peer's knock still runs as always.
-    inv.knock('message')
+    // A peer's wake still runs as always.
+    inv.wake('message')
     await clock.advanceAsync(2_000)
     await inv.settled()
     expect(runner.requests).toHaveLength(3)
   })
 })
 
-describe('DoorbellInvoker — the tray count before every knock run (E1)', () => {
-  it('a deferred-only tray plus the drain knocks → zero runs: one count, nothing owed', async () => {
-    // Connect knock + the server's drain re-offering a deferred envelope as
+describe('IntegrationInvoker — the tray count before every wake run (E1)', () => {
+  it('a deferred-only tray plus the drain wakes → zero runs: one count, nothing owed', async () => {
+    // Connect wake + the server's drain re-offering a deferred envelope as
     // message.new: the tray hides the deferred card, so nothing is waiting.
     const clock = new FakeClock()
     const runner = new FakeRunner()
     const tray = new FakeTray(false)
     const inv = invoker(clock, runner, RETRY_LADDER_MS, tray)
-    inv.knock('connect')
-    inv.knock('message')
-    inv.knock('message')
+    inv.wake('connect')
+    inv.wake('message')
+    inv.wake('message')
     await clock.advanceAsync(2_000)
     await inv.settled()
     expect(runner.requests).toHaveLength(0)
     expect(tray.calls).toBe(1)
-    expect(inv.counters()).toMatchObject({ knocks: 3, absorbed: 2, runsStarted: 0, runsSkippedEmpty: 1, retryRung: 0 })
+    expect(inv.counters()).toMatchObject({ wakes: 3, absorbed: 2, runsStarted: 0, runsSkippedEmpty: 1, retryRung: 0 })
 
     // The next reconnect drains the same deferred envelope again: still no run.
-    inv.knock('connect')
-    inv.knock('message')
+    inv.wake('connect')
+    inv.wake('message')
     await clock.advanceAsync(2_000)
     await inv.settled()
     expect(runner.requests).toHaveLength(0)
@@ -418,12 +419,12 @@ describe('DoorbellInvoker — the tray count before every knock run (E1)', () =>
     const runner = new FakeRunner()
     const tray = new FakeTray(true)
     const inv = invoker(clock, runner, RETRY_LADDER_MS, tray)
-    inv.knock('message')
+    inv.wake('message')
     await clock.advanceAsync(2_000)
     await inv.settled()
     expect(tray.calls).toBe(1)
     expect(runner.requests).toHaveLength(1)
-    expect(runner.requests[0]).toMatchObject({ kind: 'knock', prompt: 'KNOCK PROMPT' })
+    expect(runner.requests[0]).toMatchObject({ kind: 'wake', prompt: 'WAKE PROMPT' })
     expect(inv.counters()).toMatchObject({ runsStarted: 1, runsOk: 1, runsSkippedEmpty: 0 })
   })
 
@@ -432,7 +433,7 @@ describe('DoorbellInvoker — the tray count before every knock run (E1)', () =>
     const runner = new FakeRunner()
     const tray = new FakeTray(new Error('AgentChat API 503: upstream unavailable'))
     const inv = invoker(clock, runner, RETRY_LADDER_MS, tray)
-    inv.knock('message')
+    inv.wake('message')
     await clock.advanceAsync(2_000)
     await inv.settled()
     expect(tray.calls).toBe(1)
@@ -441,18 +442,18 @@ describe('DoorbellInvoker — the tray count before every knock run (E1)', () =>
   })
 
   it('the burst follow-on finds the tray empty → no second run', async () => {
-    // Live-fire leg 3 at 1.2 s spacing: the third knock lands mid-run and
+    // Live-fire leg 3 at 1.2 s spacing: the third wake lands mid-run and
     // earns one follow-on; the first run already answered everything.
     const clock = new FakeClock()
     const runner = new FakeRunner()
     runner['script'] = runner.holding()
     const tray = new FakeTray(true)
     const inv = invoker(clock, runner, RETRY_LADDER_MS, tray)
-    inv.knock('message')
-    inv.knock('message')
+    inv.wake('message')
+    inv.wake('message')
     await clock.advanceAsync(2_000)
     expect(runner.requests).toHaveLength(1)
-    inv.knock('message') // mid-run
+    inv.wake('message') // mid-run
     await clock.advanceAsync(2_000)
     tray.answer = false // the run replied to all three
     runner.release(ok())
@@ -464,19 +465,19 @@ describe('DoorbellInvoker — the tray count before every knock run (E1)', () =>
     expect(inv.counters()).toMatchObject({ runsStarted: 1, runsOk: 1, runsSkippedEmpty: 1 })
   })
 
-  it('the ladder re-knock finds the tray empty → no run, and the rung is reset', async () => {
+  it('the ladder re-wake finds the tray empty → no run, and the rung is reset', async () => {
     const clock = new FakeClock()
     const runner = new FakeRunner(() => failed())
     const tray = new FakeTray(true)
     const inv = invoker(clock, runner, RETRY_LADDER_MS, tray)
-    inv.knock('message')
+    inv.wake('message')
     await clock.advanceAsync(2_000)
     await inv.settled()
     expect(inv.counters()).toMatchObject({ runsFailed: 1, retryRung: 1, retryDueAt: 62_000 })
 
-    // Before the re-knock lands, the agent's own session settled the card.
+    // Before the re-wake lands, the agent's own session settled the card.
     tray.answer = false
-    await clock.advanceAsync(60_000) // the delayed knock
+    await clock.advanceAsync(60_000) // the delayed wake
     await clock.advanceAsync(2_000) // its debounce
     await inv.settled()
     expect(runner.requests).toHaveLength(1)
@@ -485,24 +486,24 @@ describe('DoorbellInvoker — the tray count before every knock run (E1)', () =>
 
     // A later failure starts the ladder from its first rung again.
     tray.answer = true
-    inv.knock('message')
+    inv.wake('message')
     await clock.advanceAsync(2_000)
     await inv.settled()
     expect(inv.counters()).toMatchObject({ runsFailed: 2, retryRung: 1 })
     expect(inv.counters().retryDueAt).toBe(clock.now() + 60_000)
   })
 
-  it('an empty count while a re-knock is pending cancels it and ends the preflight watch', async () => {
+  it('an empty count while a re-wake is pending cancels it and ends the preflight watch', async () => {
     const clock = new FakeClock()
     const runner = new FakeRunner(() => failed())
     const tray = new FakeTray(true)
     const inv = invoker(clock, runner, RETRY_LADDER_MS, tray)
-    inv.knock('message')
+    inv.wake('message')
     await clock.advanceAsync(2_000)
     await inv.settled()
     expect(inv.counters().retryDueAt).toBe(62_000)
     tray.answer = false
-    inv.knock('message') // a frame for something already settled
+    inv.wake('message') // a frame for something already settled
     await clock.advanceAsync(2_000)
     await inv.settled()
     expect(inv.counters()).toMatchObject({ runsSkippedEmpty: 1, retryRung: 0, retryDueAt: null })
@@ -528,9 +529,9 @@ describe('DoorbellInvoker — the tray count before every knock run (E1)', () =>
     const clock = new FakeClock()
     const runner = new FakeRunner()
     let answer: (v: boolean) => void = () => undefined
-    const inv = new DoorbellInvoker({
+    const inv = new IntegrationInvoker({
       runner,
-      prompts: PROMPTS,
+      prompts,
       budgetMs: 600_000,
       debounceMs: 2_000,
       now: () => clock.now(),
@@ -538,7 +539,7 @@ describe('DoorbellInvoker — the tray count before every knock run (E1)', () =>
       clearTimeout: (h) => clock.clearTimeout(h),
       trayHasWaiting: () => new Promise<boolean>((resolve) => (answer = resolve)),
     })
-    inv.knock('message')
+    inv.wake('message')
     await clock.advanceAsync(2_000)
     inv.stop()
     answer(true)
@@ -547,21 +548,21 @@ describe('DoorbellInvoker — the tray count before every knock run (E1)', () =>
   })
 })
 
-describe('DoorbellInvoker — a successful run cancels a pending re-knock (E2)', () => {
-  it('failure → re-knock pending → a knock runs ok → past the rung, no extra run', async () => {
+describe('IntegrationInvoker — a successful run cancels a pending re-wake (E2)', () => {
+  it('failure → re-wake pending → a wake runs ok → past the rung, no extra run', async () => {
     // Codex live-fire leg 10: rung 2 was due in 300 s; a new DM ran ok and the
-    // rung went to 0, but the stale re-knock still fired 4.5 min later.
+    // rung went to 0, but the stale re-wake still fired 4.5 min later.
     const clock = new FakeClock()
     const outcomes = [failed(), ok()]
     const runner = new FakeRunner(() => outcomes.shift() ?? ok())
     const inv = invoker(clock, runner)
-    inv.knock('message')
+    inv.wake('message')
     await clock.advanceAsync(2_000)
     await inv.settled()
     expect(inv.counters()).toMatchObject({ retryRung: 1, retryDueAt: 62_000 })
 
     await clock.advanceAsync(10_000)
-    inv.knock('message') // a new DM, mid-outage
+    inv.wake('message') // a new DM, mid-outage
     await clock.advanceAsync(2_000)
     await inv.settled()
     expect(runner.requests).toHaveLength(2)
@@ -573,12 +574,12 @@ describe('DoorbellInvoker — a successful run cancels a pending re-knock (E2)',
     expect(clock.pending()).toBe(0)
   })
 
-  it('an ok INVITE run leaves a pending knock re-knock alone — it never read the tray', async () => {
+  it('an ok INVITE run leaves a pending wake re-wake alone — it never read the tray', async () => {
     const clock = new FakeClock()
     const outcomes = [failed(), ok(), ok()]
     const runner = new FakeRunner(() => outcomes.shift() ?? ok())
     const inv = invoker(clock, runner)
-    inv.knock('message')
+    inv.wake('message')
     await clock.advanceAsync(2_000)
     await inv.settled()
     expect(inv.counters()).toMatchObject({ retryRung: 1, retryDueAt: 62_000 })
@@ -589,6 +590,6 @@ describe('DoorbellInvoker — a successful run cancels a pending re-knock (E2)',
     await clock.advanceAsync(60_000)
     await clock.advanceAsync(2_000)
     await inv.settled()
-    expect(runner.requests.map((r) => r.kind)).toEqual(['knock', 'invite', 'knock'])
+    expect(runner.requests.map((r) => r.kind)).toEqual(['wake', 'invite', 'wake'])
   })
 })

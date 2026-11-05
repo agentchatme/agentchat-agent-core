@@ -11,6 +11,7 @@ import {
   writePending,
 } from '../src/identity/credentials.js'
 import type { HostProfile } from '../src/identity/host-profile.js'
+import { mockServedTexts } from './helpers/served-texts.js'
 
 // ─── Recovery names an agent by handle AND email ────────────────────────────
 //
@@ -29,12 +30,14 @@ function fixture(): { home: string; commands: ReturnType<typeof createIdentityCo
   const profile: HostProfile = {
     label: 'Example',
     id: 'example',
+    client: { runtime: 'generic', version: '0.0.0-test' },
     home: () => home,
     anchorFile: () => path.join(home, 'ANCHOR.md'),
     invocation: () => INVOKE,
-    renderAnchor: (handle) => `@${handle}`,
+    renderAnchor: (line) => line,
     isWired: () => false,
   }
+  mockServedTexts()
   return { home, commands: createIdentityCommands(profile) }
 }
 

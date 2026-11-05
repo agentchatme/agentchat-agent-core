@@ -1,30 +1,39 @@
 // ─── The runner seam ────────────────────────────────────────────────────────
 //
-// The doorbell starts ONE headless run of the resident coding agent and
+// The integration starts ONE headless run of the resident coding agent and
 // discards everything the run says: the agent's only way to say anything on
 // AgentChat is the hosted send tool during its own run. How a runtime is
 // started — its binary, its headless flags, its permission profile — is the
 // one genuinely host-specific piece, so each integration implements this and
 // the engine never names a runtime.
 
-export type RunKind = 'knock' | 'invite'
+export type RunKind = 'wake' | 'invite'
 
 export interface RunRequest {
   readonly kind: RunKind
-  /** The fixed prompt for this kind of run (`buildDoorbellPrompts`). */
+  /** The prompt for this kind of run: the served text, then the manual pointer (`buildRunPrompts`). */
   readonly prompt: string
   /** Unique per run; for logs and for runtimes that want a session name. */
   readonly runId: string
   /** The run is killed past this budget and counts as failed. */
   readonly budgetMs: number
   /**
-   * Aborted when the doorbell is stopping (daemon shutdown, identity change,
-   * refused key). A runner passes it to `spawnRun`, which SIGTERMs the run's
-   * process group and SIGKILLs after a grace; the outcome is `failed` with an
-   * "interrupted" detail. Optional so a runner that cannot interrupt still
-   * satisfies the contract.
+   * Aborted when the integration is stopping (daemon shutdown, identity
+   * change). A runner passes it to `spawnRun`, which SIGTERMs the
+   * run's process group and SIGKILLs after a grace; the outcome is `failed`
+   * with an "interrupted" detail. Optional so a runner that cannot interrupt
+   * still satisfies the contract.
    */
   readonly signal?: AbortSignal
+  /**
+   * Called once, as soon as the runtime's process has been started. The
+   * invoker records a group invite as offered at this moment — not when the
+   * run ends — so a run cut short by a shutdown or a crash still counts as
+   * the invite's one offer from this machine. A runner built on `spawnRun`
+   * passes it through; a runner that cannot tell may leave it uncalled, and
+   * the invoker then records the offer when the run ends instead.
+   */
+  readonly onStarted?: () => void
 }
 
 /**
@@ -57,7 +66,7 @@ export interface RunRunner {
    * Is the runtime usable right now (binary present, signed in)? Called
    * before the socket is held, and — after the retry ladder is exhausted —
    * periodically, so a runtime that comes back (the user signs in again)
-   * earns one re-knock without waiting for the next peer.
+   * earns one re-wake without waiting for the next peer.
    */
   preflight(): Promise<RunPreflight>
   /** Start one run and wait for it. Never throws — returns an outcome. */

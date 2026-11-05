@@ -1,4 +1,4 @@
-import { CODING_AGENTS_CLIENT_HEADERS } from '../client-identity.js'
+import { clientHeadersOf, type IntegrationClient } from '../client-identity.js'
 
 // ─── Is the hosted tool server reachable with this key? ─────────────────────
 //
@@ -6,6 +6,8 @@ import { CODING_AGENTS_CLIENT_HEADERS } from '../client-identity.js'
 // the bearer key — the same first request a runtime makes on connect — and
 // read the answer. A `401` means the key does not authenticate; a transport
 // error means the endpoint is not reachable from here. Nothing else is called.
+// (The one request this package still makes outside the SDK: the SDK has no
+// MCP client, and this is a probe, not a tool call.)
 
 export const HOSTED_MCP_PATH = '/mcp'
 
@@ -28,8 +30,12 @@ export interface McpProbeResult {
 export async function probeHostedMcp(params: {
   apiKey: string
   apiBase: string
-  clientName: string
-  clientVersion: string
+  /** How this integration identifies to the server (headers on the probe). */
+  client: IntegrationClient
+  /** MCP `clientInfo.name`; defaults to the runtime name. */
+  clientName?: string
+  /** MCP `clientInfo.version`; defaults to the integration's version. */
+  clientVersion?: string
   timeoutMs?: number
   fetch?: typeof fetch
 }): Promise<McpProbeResult> {
@@ -43,7 +49,7 @@ export async function probeHostedMcp(params: {
         authorization: `Bearer ${params.apiKey}`,
         'content-type': 'application/json',
         accept: 'application/json, text/event-stream',
-        ...CODING_AGENTS_CLIENT_HEADERS,
+        ...clientHeadersOf(params.client),
       },
       body: JSON.stringify({
         jsonrpc: '2.0',
@@ -52,7 +58,10 @@ export async function probeHostedMcp(params: {
         params: {
           protocolVersion: MCP_PROTOCOL_VERSION,
           capabilities: {},
-          clientInfo: { name: params.clientName, version: params.clientVersion },
+          clientInfo: {
+            name: params.clientName ?? params.client.runtime,
+            version: params.clientVersion ?? params.client.version,
+          },
         },
       }),
       signal: controller.signal,

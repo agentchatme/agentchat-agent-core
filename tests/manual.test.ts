@@ -1,11 +1,12 @@
 import { describe, expect, it } from 'vitest'
 import * as fs from 'node:fs'
 import * as path from 'node:path'
-import { MANUAL, MANUAL_URL, manualCarriesIdentityLine, manualPointer, manualVersion } from '../src/skill/manual.js'
-import { IDENTITY_LINE_TEMPLATE, renderIdentityLine } from '../src/skill/identity-line.js'
+import { MANUAL, MANUAL_URL, manualPointer, manualVersion } from '../src/skill/manual.js'
+import { identityLineOf, normalizeHandle } from '../src/skill/identity-line.js'
 import { renderAnchorBlock, readAnchorHandleFrom, ANCHOR_START, ANCHOR_END } from '../src/anchor/block.js'
+import { textsFor } from './helpers/served-texts.js'
 
-// ─── The manual is bundled verbatim; the identity line is the manual's ──────
+// ─── The manual is bundled verbatim; the identity line is served, only placed ─
 
 const SOURCE = path.join(__dirname, '..', 'src', 'skill', 'agentchat.skill.md')
 
@@ -24,14 +25,9 @@ describe('the bundled manual', () => {
 
   it('is the version the platform publishes — a stale bundle is a deliberate choice, not drift', () => {
     // Bump this with the two-command refresh (README § Refreshing the manual)
-    // when https://agentchat.me/skill.md moves on. The Hermes and OpenClaw
-    // doorbells place the same version.
+    // when https://agentchat.me/skill.md moves on. The served texts carry the
+    // manual's version too (`manual.version`); `status` shows both.
     expect(manualVersion()).toBe('2.1.2')
-  })
-
-  it('carries the identity line template verbatim — the engine writes what the manual publishes', () => {
-    expect(manualCarriesIdentityLine()).toBe(true)
-    expect(MANUAL).toContain(IDENTITY_LINE_TEMPLATE)
   })
 
   it('is not this package’s own words: it names no CLI invocation of ours', () => {
@@ -46,24 +42,33 @@ describe('the bundled manual', () => {
 })
 
 describe('the identity line', () => {
-  it('substitutes the handle and nothing else', () => {
-    const line = renderIdentityLine('@Alice-Dev')
-    expect(line).toBe(IDENTITY_LINE_TEMPLATE.split('<handle>').join('alice-dev'))
-    expect(line).not.toContain('<handle>')
-    expect(line).toContain('I am @alice-dev on AgentChat')
+  it('carries no template of its own: the package has no identity text to render', () => {
+    const source = fs.readFileSync(path.join(__dirname, '..', 'src', 'skill', 'identity-line.ts'), 'utf-8')
+    expect(source).not.toMatch(/I am @/)
+    expect(source).not.toMatch(/IDENTITY_LINE_TEMPLATE/)
   })
 
-  it('refuses an empty handle', () => {
-    expect(() => renderIdentityLine('  @ ')).toThrow(/empty/)
+  it('is the served `identity_line`, placed as-is', () => {
+    const texts = textsFor('Alice-Dev')
+    expect(identityLineOf(texts)).toBe(texts.identity_line)
+  })
+
+  it('normalises a handle for comparison and nothing else', () => {
+    expect(normalizeHandle('  @Alice-Dev ')).toBe('alice-dev')
   })
 
   it('is what the anchor block carries, and reads back', () => {
-    const block = renderAnchorBlock('agent-a')
-    expect(block).toBe(`${ANCHOR_START}\n${renderIdentityLine('agent-a')}\n${ANCHOR_END}`)
+    const line = textsFor('agent-a').identity_line
+    const block = renderAnchorBlock(line)
+    expect(block).toBe(`${ANCHOR_START}\n${line}\n${ANCHOR_END}`)
     expect(readAnchorHandleFrom(block)).toBe('agent-a')
   })
 
-  it('still reads the pre-doorbell block so doctor can refresh it', () => {
+  it('refuses an empty line', () => {
+    expect(() => renderAnchorBlock('   ')).toThrow(/empty/)
+  })
+
+  it('still reads the block releases before the integration wrote, so doctor can refresh it', () => {
     expect(readAnchorHandleFrom(`${ANCHOR_START}\nYou are **@old-agent** on AgentChat.\n${ANCHOR_END}`)).toBe('old-agent')
   })
 })

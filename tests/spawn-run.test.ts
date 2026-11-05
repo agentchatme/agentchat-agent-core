@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
-import { redactDiagnostic, spawnRun } from '../src/doorbell/spawn-run.js'
+import { redactDiagnostic, spawnRun } from '../src/integration/spawn-run.js'
 import { until } from './helpers/server-double.js'
 
 // ─── One headless run: bounded, classified, output discarded ────────────────
@@ -161,5 +161,43 @@ describe('redactDiagnostic', () => {
     expect(out.length).toBeLessThanOrEqual(100)
     expect(out).not.toContain('\u001B')
     expect(redactDiagnostic('key ac_' + 'b'.repeat(32))).toBe('key [redacted AgentChat key]')
+  })
+})
+
+
+describe('spawnRun — onStarted', () => {
+  it('fires once the process has spawned, before it ends', async () => {
+    const events: string[] = []
+    const outcome = await spawnRun({
+      command: process.execPath,
+      args: ['-e', 'process.stdout.write("x")'],
+      cwd: process.cwd(),
+      env: process.env,
+      stdin: null,
+      budgetMs: 10_000,
+      onStarted: () => events.push('started'),
+    })
+    expect(outcome.state).toBe('ok')
+    expect(events).toEqual(['started'])
+  })
+
+  it('a binary that does not exist is not_started; onStarted stays silent where the spawn itself fails', async () => {
+    const events: string[] = []
+    const outcome = await spawnRun({
+      command: 'agentchat-no-such-binary-' + process.pid,
+      args: [],
+      cwd: process.cwd(),
+      env: process.env,
+      stdin: null,
+      budgetMs: 10_000,
+      onStarted: () => events.push('started'),
+    })
+    expect(outcome.state).toBe('not_started')
+    // `onStarted` means the child process spawned. On Windows cross-spawn runs
+    // the command through cmd.exe, so the shim spawns and only then reports the
+    // missing binary (exit 1, nothing on stdout): `onStarted` fires there, and
+    // the invoker takes the invite's record back on `not_started`
+    // (`settleInvite`). Elsewhere the spawn fails outright and nothing fires.
+    expect(events).toEqual(process.platform === 'win32' ? ['started'] : [])
   })
 })

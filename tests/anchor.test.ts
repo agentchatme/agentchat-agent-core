@@ -18,6 +18,10 @@ import {
 // The anchor module edits a fenced block in a file it is TOLD about. It has no
 // notion of which coding agent owns that file — picking the file was the job
 // that once stamped one agent's handle into another agent's instructions.
+// The block's words are the server's identity line, handed in; the module
+// only fences them.
+
+const line = (handle: string): string => `I am @${handle} on AgentChat (api.agentchat.me). Served line, test copy.`
 
 let dir: string
 const fileA = (): string => path.join(dir, 'A.md')
@@ -31,13 +35,13 @@ afterEach(() => fs.rmSync(dir, { recursive: true, force: true }))
 describe('writeAnchor', () => {
   it('creates the file and its parent directory', () => {
     const nested = path.join(dir, 'deep', 'nest', 'CLAUDE.md')
-    writeAnchor(nested, renderAnchorBlock('agent-a'), 'agent-a')
+    writeAnchor(nested, renderAnchorBlock(line('agent-a')), 'agent-a')
     expect(fs.readFileSync(nested, 'utf-8')).toContain('@agent-a')
   })
 
   it('preserves the user’s own content around the block', () => {
     fs.writeFileSync(fileA(), '# My notes\n\nSomething I wrote.\n')
-    writeAnchor(fileA(), renderAnchorBlock('agent-a'), 'agent-a')
+    writeAnchor(fileA(), renderAnchorBlock(line('agent-a')), 'agent-a')
     const out = fs.readFileSync(fileA(), 'utf-8')
     expect(out).toContain('# My notes')
     expect(out).toContain('Something I wrote.')
@@ -45,8 +49,8 @@ describe('writeAnchor', () => {
   })
 
   it('replaces rather than appends on re-write, converging to ONE block', () => {
-    writeAnchor(fileA(), renderAnchorBlock('old-handle'), 'old-handle')
-    writeAnchor(fileA(), renderAnchorBlock('new-handle'), 'new-handle')
+    writeAnchor(fileA(), renderAnchorBlock(line('old-handle')), 'old-handle')
+    writeAnchor(fileA(), renderAnchorBlock(line('new-handle')), 'new-handle')
     const out = fs.readFileSync(fileA(), 'utf-8')
     expect(out.split(ANCHOR_START)).toHaveLength(2) // exactly one block
     expect(out).toContain('@new-handle')
@@ -62,9 +66,9 @@ describe('writeAnchor', () => {
   })
 
   it('writing one file never touches another', () => {
-    writeAnchor(fileB(), renderAnchorBlock('agent-b'), 'agent-b')
+    writeAnchor(fileB(), renderAnchorBlock(line('agent-b')), 'agent-b')
     const before = fs.readFileSync(fileB(), 'utf-8')
-    writeAnchor(fileA(), renderAnchorBlock('agent-a'), 'agent-a')
+    writeAnchor(fileA(), renderAnchorBlock(line('agent-a')), 'agent-a')
     expect(fs.readFileSync(fileB(), 'utf-8')).toBe(before)
     expect(fs.readFileSync(fileB(), 'utf-8')).toContain('@agent-b')
   })
@@ -73,7 +77,7 @@ describe('writeAnchor', () => {
 describe('removeAnchorAt', () => {
   it('strips our block and leaves the rest byte-for-byte', () => {
     fs.writeFileSync(fileA(), '# Keep me\n')
-    writeAnchor(fileA(), renderAnchorBlock('agent-a'), 'agent-a')
+    writeAnchor(fileA(), renderAnchorBlock(line('agent-a')), 'agent-a')
     expect(removeAnchorAt(fileA())).toBe('removed')
     expect(fs.readFileSync(fileA(), 'utf-8')).toBe('# Keep me\n')
   })
@@ -87,7 +91,7 @@ describe('removeAnchorAt', () => {
 
 describe('reading the claimed handle', () => {
   it('reads back what the block announces', () => {
-    writeAnchor(fileA(), renderAnchorBlock('agent-a'), 'agent-a')
+    writeAnchor(fileA(), renderAnchorBlock(line('agent-a')), 'agent-a')
     expect(readAnchorHandleAt(fileA())).toBe('agent-a')
     expect(hasAnchorAt(fileA())).toBe(true)
   })
@@ -132,7 +136,7 @@ describe('block parsing edge cases', () => {
       `${ANCHOR_START}\nfirst **@a**\n${ANCHOR_END}`,
       `${ANCHOR_START}\nsecond **@b**\n${ANCHOR_END}`,
     ].join('\n\n')
-    const out = upsertAnchorBlock(doubled, renderAnchorBlock('agent-c'))
+    const out = upsertAnchorBlock(doubled, renderAnchorBlock(line('agent-c')))
     expect(out.split(ANCHOR_START)).toHaveLength(2)
     expect(out).toContain('@agent-c')
   })

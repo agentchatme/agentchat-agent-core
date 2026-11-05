@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createIdentityCommands } from '../src/identity/commands.js'
 import { readCredentials, writeCredentials, type ResolvedIdentity } from '../src/identity/credentials.js'
 import type { HostProfile } from '../src/identity/host-profile.js'
+import { mockServedTexts } from './helpers/served-texts.js'
 
 // ─── logout hands `unplace` the identity it is undoing ──────────────────────
 //
@@ -22,15 +23,17 @@ function fixture(): { home: string; seen: Array<ResolvedIdentity | null>; comman
   const profile: HostProfile = {
     label: 'Claude Code',
     id: 'claude-code',
+    client: { runtime: 'generic', version: '0.0.0-test' },
     home: () => home,
     anchorFile: () => path.join(home, 'CLAUDE.md'),
     invocation: () => 'npx -y @agentchatme/claude-code',
-    renderAnchor: (handle) => `@${handle}`,
+    renderAnchor: (line) => line,
     unplace: (identity) => {
       seen.push(identity)
       return ['  mcp: user MCP "agentchat" removed']
     },
   }
+  mockServedTexts()
   return { home, seen, commands: createIdentityCommands(profile) }
 }
 

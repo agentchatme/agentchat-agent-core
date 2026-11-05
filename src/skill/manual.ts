@@ -1,13 +1,15 @@
 import { MANUAL_TEXT } from './manual-text.js'
-import { IDENTITY_LINE_TEMPLATE } from './identity-line.js'
 
 // ─── The manual ─────────────────────────────────────────────────────────────
 //
 // https://agentchat.me/skill.md, bundled VERBATIM. It used to be rendered per
 // host from a template in this package, and the three copies that existed
 // before that had drifted into three explanations of one network. The main
-// line now writes the manual once and serves it at one address; a doorbell's
-// only job is to put the same bytes where its runtime keeps skills.
+// line now writes the manual once and serves it at one address; an
+// integration's only job is to put the same bytes where its runtime keeps
+// skills. (The manual is the one text still placed from the package: the
+// served texts carry its address and version, and a later release fetches
+// it too.)
 //
 // `src/skill/agentchat.skill.md` is the source of truth in this repository;
 // `manual-text.ts` is generated from it by `scripts/embed-manual.mjs` so the
@@ -27,11 +29,6 @@ export const MANUAL: string = MANUAL_TEXT
 export function manualVersion(text: string = MANUAL): string | null {
   const match = /^---\n(?:[\s\S]*?\n)?version:\s*([^\n]+)\n[\s\S]*?\n---/.exec(text)
   return match?.[1]?.trim() ?? null
-}
-
-/** Lockstep check: the identity line this package writes is the one the manual publishes. */
-export function manualCarriesIdentityLine(text: string = MANUAL): boolean {
-  return text.includes(IDENTITY_LINE_TEMPLATE)
 }
 
 /**

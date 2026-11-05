@@ -1,29 +1,29 @@
-// ─── Knock coalescing — one run per burst, not per frame ────────────────────
+// ─── Wake coalescing — one run per burst, not per frame ─────────────────────
 //
-// A `message.new` frame is a knock: a hint that something is waiting, never
-// the carrier of what is waiting (the main line's rule 2). A group burst
-// arrives as many frames within a second; the first knock arms a short timer,
-// every knock inside the window is absorbed, and the timer fires exactly once.
-// Whoever fires then starts ONE run, and the run reads the whole tray through
-// the hosted tools — so nothing a later frame announced is missed. The tray is
-// the truth, the knock is not.
+// A `message.new` frame, a `wake` frame, a (re)connect: each is a WAKE — a
+// hint that something may be waiting, never the carrier of what is waiting.
+// A group burst arrives as many frames within a second; the first wake arms a
+// short timer, every wake inside the window is absorbed, and the timer fires
+// exactly once. Whoever fires then starts ONE run, and the run reads the whole
+// tray through the hosted tools — so nothing a later frame announced is
+// missed. The tray is the truth, the wake is not.
 //
-// `knockAfter` serves the local retry ladder: when a run could not start or
-// did not complete, the doorbell schedules another knock later instead of
+// `wakeAfter` serves the local retry ladder: when a run could not start or did
+// not complete, the integration schedules another wake later instead of
 // dropping the backlog. The server's own ladder only rings webhooks; a
-// connected socket gets no re-ring, so the doorbell carries that duty itself.
-// When a delayed knock is already pending the SOONER deadline wins — a later
-// retry never pushes an earlier one back. (Learned on the Hermes doorbell: two
-// failed cycles inside one outage once climbed the ladder to 300 s and
-// replaced the pending 60 s retry.) `cancelDelayed` drops a pending retry once
-// nothing is owed: a stale re-knock once fired 4.5 min after a successful run
-// and started a run on an empty tray (Codex live-fire, leg 10).
+// connected socket gets no re-ring, so the integration carries that duty
+// itself. When a delayed wake is already pending the SOONER deadline wins — a
+// later retry never pushes an earlier one back. (Learned on the Hermes
+// integration: two failed cycles inside one outage once climbed the ladder to
+// 300 s and replaced the pending 60 s retry.) `cancelDelayed` drops a pending
+// retry once nothing is owed: a stale re-wake once fired 4.5 min after a
+// successful run and started a run on an empty tray (Codex live-fire, leg 10).
 
-export const DEFAULT_KNOCK_DEBOUNCE_MS = 2_000
+export const DEFAULT_WAKE_DEBOUNCE_MS = 2_000
 
 export type TimerHandle = ReturnType<typeof setTimeout>
 
-export interface KnockCoalescerOptions {
+export interface WakeCoalescerOptions {
   readonly onFire: () => void
   readonly debounceMs?: number
   /** Clock and timers are injectable so tests never wait on real time. */
@@ -32,7 +32,7 @@ export interface KnockCoalescerOptions {
   readonly clearTimeout?: (handle: TimerHandle) => void
 }
 
-export class KnockCoalescer {
+export class WakeCoalescer {
   private readonly onFire: () => void
   private readonly debounceMs: number
   private readonly now: () => number
@@ -44,12 +44,12 @@ export class KnockCoalescer {
   private delayedDeadline: number | null = null
   private stopped = false
 
-  knocks = 0
+  wakes = 0
   absorbed = 0
   fires = 0
 
-  constructor(options: KnockCoalescerOptions) {
-    const debounce = options.debounceMs ?? DEFAULT_KNOCK_DEBOUNCE_MS
+  constructor(options: WakeCoalescerOptions) {
+    const debounce = options.debounceMs ?? DEFAULT_WAKE_DEBOUNCE_MS
     if (!(debounce >= 0)) throw new RangeError('debounceMs must be >= 0')
     this.onFire = options.onFire
     this.debounceMs = debounce
@@ -63,20 +63,20 @@ export class KnockCoalescer {
     return this.timer !== null
   }
 
-  /** True while a retry knock is scheduled and has not fired. */
+  /** True while a retry wake is scheduled and has not fired. */
   get delayedPending(): boolean {
     return this.delayed !== null
   }
 
-  /** Epoch ms of the pending retry knock, or null. */
+  /** Epoch ms of the pending retry wake, or null. */
   get delayedDue(): number | null {
     return this.delayedDeadline
   }
 
-  /** A knock: arm the timer if none is armed; otherwise absorb. */
-  knock(): void {
+  /** A wake: arm the timer if none is armed; otherwise absorb. */
+  wake(): void {
     if (this.stopped) return
-    this.knocks += 1
+    this.wakes += 1
     if (this.timer !== null) {
       this.absorbed += 1
       return
@@ -84,8 +84,8 @@ export class KnockCoalescer {
     this.timer = this._setTimeout(() => this.fire(), this.debounceMs)
   }
 
-  /** A delayed knock (retry ladder). The sooner pending deadline is kept. */
-  knockAfter(delayMs: number): void {
+  /** A delayed wake (retry ladder). The sooner pending deadline is kept. */
+  wakeAfter(delayMs: number): void {
     if (this.stopped) return
     const delay = Math.max(0, delayMs)
     const deadline = this.now() + delay
@@ -99,13 +99,13 @@ export class KnockCoalescer {
     this.delayed = this._setTimeout(() => {
       this.delayed = null
       this.delayedDeadline = null
-      this.knock()
+      this.wake()
     }, delay)
   }
 
   /**
-   * Drop a pending retry knock, if there is one; returns whether there was.
-   * The debounce timer and later knocks are unaffected. For when nothing is
+   * Drop a pending retry wake, if there is one; returns whether there was.
+   * The debounce timer and later wakes are unaffected. For when nothing is
    * owed any more — a run read the whole tray, or the tray was found empty —
    * so the retry would only ring for a backlog that is already handled.
    */
@@ -117,7 +117,7 @@ export class KnockCoalescer {
     return true
   }
 
-  /** Cancel everything; later knocks are ignored. */
+  /** Cancel everything; later wakes are ignored. */
   stop(): void {
     this.stopped = true
     if (this.timer !== null) {
@@ -135,7 +135,7 @@ export class KnockCoalescer {
       this.onFire()
     } catch {
       // The callback belongs to the invoker; a failure there must not kill
-      // the timer machinery. The next knock re-arms as usual.
+      // the timer machinery. The next wake re-arms as usual.
     }
   }
 }

@@ -2,21 +2,21 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
-import { runDoorbell } from '../src/doorbell/run.js'
-import { readDoorbellStatus } from '../src/doorbell/status.js'
+import { runIntegration } from '../src/integration/run.js'
+import { readIntegrationStatus } from '../src/integration/status.js'
 import { alwaysOnState, markAlwaysOnWanted } from '../src/daemon/health.js'
-import type { RunRunner } from '../src/doorbell/runner.js'
+import type { RunRunner } from '../src/integration/runner.js'
 import { startServerDouble, until } from './helpers/server-double.js'
 
 // ─── The supervisor is resident, follows the credential, and honours `off` ──
 
+const CLIENT = { runtime: 'generic' as const, version: '0.0.0-test' }
+
 let home: string
 beforeEach(() => {
-  home = fs.mkdtempSync(path.join(os.tmpdir(), 'agentchat-doorbell-run-'))
+  home = fs.mkdtempSync(path.join(os.tmpdir(), 'agentchat-integration-run-'))
 })
 afterEach(() => fs.rmSync(home, { recursive: true, force: true }))
-
-const prompts = { knock: 'K', invite: 'I' }
 
 function runner(preflight: { ok: boolean; detail?: string }): RunRunner & { starts: number } {
   return {
@@ -35,30 +35,40 @@ function runner(preflight: { ok: boolean; detail?: string }): RunRunner & { star
 const signIn = (): void =>
   fs.writeFileSync(path.join(home, 'credentials'), JSON.stringify({ api_key: 'ac_' + 'a'.repeat(40), handle: 'probe', api_base: 'http://127.0.0.1:9' }))
 
+const base = () => ({ home, client: CLIENT, manualPointer: '(POINTER)', workdir: path.join(home, 'w') })
+
 async function runFor(ms: number, env: NodeJS.ProcessEnv, r: RunRunner): Promise<number> {
   const controller = new AbortController()
-  const done = runDoorbell({ home, runner: r, prompts, env, signal: controller.signal })
+  const done = runIntegration({ ...base(), runner: r, env, signal: controller.signal })
   await new Promise((resolve) => setTimeout(resolve, ms))
   controller.abort()
   return done
 }
 
-describe('runDoorbell', () => {
+describe('runIntegration', () => {
   it('with no identity it idles: no socket, status idle, heartbeat cleared', async () => {
     markAlwaysOnWanted(home)
     const r = runner({ ok: true })
     const code = await runFor(400, {}, r)
     expect(code).toBe(0)
-    expect(readDoorbellStatus(home)).toMatchObject({ socket: 'idle', handle: null, runtime: 'fake-runtime' })
+    expect(readIntegrationStatus(home)).toMatchObject({ version: 2, socket: 'idle', handle: null, runtime: 'fake-runtime', wakes: 0 })
     expect(alwaysOnState(home)).toBe('idle')
     expect(r.starts).toBe(0)
   }, 10_000)
 
-  it('AGENTCHAT_DOORBELL=off holds no socket even with an identity', async () => {
+  it('AGENTCHAT_INTEGRATION=off holds no socket even with an identity', async () => {
+    signIn()
+    const r = runner({ ok: true })
+    await runFor(400, { AGENTCHAT_INTEGRATION: 'off' }, r)
+    expect(readIntegrationStatus(home)).toMatchObject({ socket: 'off', handle: 'probe' })
+    expect(r.starts).toBe(0)
+  }, 10_000)
+
+  it('the previous spelling, AGENTCHAT_DOORBELL=off, still holds for one release (a service captured it into its unit)', async () => {
     signIn()
     const r = runner({ ok: true })
     await runFor(400, { AGENTCHAT_DOORBELL: 'off' }, r)
-    expect(readDoorbellStatus(home)).toMatchObject({ socket: 'off', handle: 'probe' })
+    expect(readIntegrationStatus(home)).toMatchObject({ socket: 'off', handle: 'probe' })
     expect(r.starts).toBe(0)
   }, 10_000)
 
@@ -66,23 +76,23 @@ describe('runDoorbell', () => {
     signIn()
     const r = runner({ ok: false, detail: 'runtime CLI not found on PATH' })
     await runFor(600, {}, r)
-    const status = readDoorbellStatus(home)
+    const status = readIntegrationStatus(home)
     expect(status?.socket).toBe('idle')
     expect(status?.last_error).toMatch(/not ready: runtime CLI not found/)
   }, 10_000)
 
   it('refuses to run twice for one home (leader lock)', async () => {
     const first = new AbortController()
-    const a = runDoorbell({ home, runner: runner({ ok: true }), prompts, env: {}, signal: first.signal })
+    const a = runIntegration({ ...base(), runner: runner({ ok: true }), env: {}, signal: first.signal })
     await new Promise((resolve) => setTimeout(resolve, 200))
-    const second = await runDoorbell({ home, runner: runner({ ok: true }), prompts, env: {}, signal: AbortSignal.abort() })
+    const second = await runIntegration({ ...base(), runner: runner({ ok: true }), env: {}, signal: AbortSignal.abort() })
     expect(second).toBe(1)
     first.abort()
     expect(await a).toBe(0)
   }, 10_000)
 })
 
-describe('runDoorbell — shutdown', () => {
+describe('runIntegration — shutdown', () => {
   it('SIGTERM interrupts the run in flight, waits for it, and exits 0 (a launchd stop must reach the child)', async () => {
     const double = await startServerDouble({ tray: { waiting: 1 } })
     try {
@@ -106,7 +116,7 @@ describe('runDoorbell — shutdown', () => {
         },
       }
       const exits: number[] = []
-      const done = runDoorbell({ home, runner: r, prompts, env: {}, exit: (code) => exits.push(code) })
+      const done = runIntegration({ ...base(), runner: r, env: {}, exit: (code) => exits.push(code) })
       await until(() => r.starts === 1, 6_000)
       const started = Date.now()
       process.emit('SIGTERM')
