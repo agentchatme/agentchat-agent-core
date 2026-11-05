@@ -621,7 +621,7 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
       me = await client.getMe()
     } catch (err) {
       // A refused key is not an unreachable server, and neither hides the
-      // integration: its socket state and last error (`terminal`, `auth
+      // integration: its socket state and last error (`blocked`, `auth
       // rejected (close 1008 …)`) are exactly what explains the failure.
       const status = httpStatusOf(err)
       const refused = status === 401 || status === 403

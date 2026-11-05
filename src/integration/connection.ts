@@ -40,9 +40,9 @@ import type { SocketState } from './status.js'
 //                      invoker's tray count, never this class's call.
 //   * `state`        → the status file's `socket` word (`socketStateOf`): the
 //                      SDK's `backoff` is `reconnecting`, its `blocked` is
-//                      `terminal` (the word `status` already uses for a
-//                      refused key; the refusal itself travels as the `blocked`
-//                      event's detail, for `last error`).
+//                      `blocked` — one word for one state across the layers;
+//                      the refusal itself travels as the `blocked` event's
+//                      detail, for `last error`.
 //
 // `ws` stays a dependency of this package although nothing here imports it:
 // the SDK prefers it on Node, and only on `ws` are the server's 45 s pings
@@ -83,7 +83,7 @@ export interface IntegrationConnectionEvents {
   ready: () => void
   /**
    * The server refused the credential on the hello (the SDK is `blocked`,
-   * read here as `terminal`). Once per rejected attempt — the first one in a
+   * and so is `state`). Once per rejected attempt — the first one in a
    * run and every 10–15 minutes after it, until a hello is accepted and
    * `state` → `ready` lifts it. `detail` is the line `status` shows as the
    * last error.
@@ -107,25 +107,25 @@ export interface IntegrationConnectionOptions {
  * The SDK's connection state in the status file's vocabulary. Pure. `previous`
  * is the status word in effect, which decides two things the SDK's state alone
  * does not say: a `connecting` after a close is `reconnecting`, and the slow
- * retry out of `blocked` (`connecting` again) does not lift `terminal` — only
- * an accepted hello (`ready`) does. `stop()` on a refused key keeps `terminal`
- * so the refusal is not dressed up as a clean close.
+ * retry out of `blocked` (`connecting` again) stays `blocked` — only an
+ * accepted hello (`ready`) lifts it. `stopped` is `closed` from any state; a
+ * refusal stays visible as the last error, not as the socket word.
  */
 export function socketStateOf(next: RealtimeState, previous: SocketState): SocketState {
   switch (next) {
     case 'idle':
       return 'idle'
     case 'connecting':
-      if (previous === 'terminal') return 'terminal'
+      if (previous === 'blocked') return 'blocked'
       return previous === 'idle' || previous === 'connecting' ? 'connecting' : 'reconnecting'
     case 'ready':
       return 'ready'
     case 'backoff':
       return 'reconnecting'
     case 'blocked':
-      return 'terminal'
+      return 'blocked'
     case 'stopped':
-      return previous === 'terminal' ? 'terminal' : 'closed'
+      return 'closed'
   }
 }
 
@@ -232,19 +232,18 @@ export class IntegrationConnection extends EventEmitter {
     const rt = this.rt
     this.rt = null
     try {
-      rt?.disconnect() // fires `state` → `stopped`, mapped below; a late frame flushed here is ignored
+      rt?.disconnect() // fires `state` → `stopped`, mapped to `closed`; a late frame flushed here is ignored
     } catch {
       /* already closed */
     }
-    // A refused key must not read as a clean close in `status`.
-    if (this._state !== 'terminal') this.setState('closed')
+    this.setState('closed') // also for a connection that was never started
   }
 
   private setState(next: SocketState): void {
     const prev = this._state
     if (prev === next) return
     this._state = next
-    // `ready` is logged with the ack note on hello.ok, `terminal` with the
+    // `ready` is logged with the ack note on hello.ok, `blocked` with the
     // refusal on the blocked event.
     if (next === 'connecting') log.info('socket connecting')
     else if (next === 'reconnecting') log.info('socket reconnecting — the SDK backs off and retries; it never gives up')
@@ -258,10 +257,10 @@ export class IntegrationConnection extends EventEmitter {
     const detail = blockedDetail(info)
     this.refusals += 1
     if (this.refusals === 1) {
-      log.error(`socket terminal (auth): ${detail}`)
+      log.error(`socket blocked (auth): ${detail}`)
     } else {
       const next = info.retryInMs === null ? 'no retry' : `next hello in about ${Math.max(1, Math.round(info.retryInMs / 60_000))} min`
-      log.info(`socket still terminal (auth): close ${info.code}${info.reason ? ` ${info.reason}` : ''} — ${next}`)
+      log.info(`socket still blocked (auth): close ${info.code}${info.reason ? ` ${info.reason}` : ''} — ${next}`)
     }
     this.emit('blocked', detail, info)
   }

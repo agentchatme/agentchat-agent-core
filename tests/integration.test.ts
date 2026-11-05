@@ -170,7 +170,7 @@ describe('Integration — connect-time catch-up', () => {
     expect(JSON.stringify(i.snapshot())).not.toContain('PREVIEW')
   }, 10_000)
 
-  it('a refused key reads socket terminal with the refusal as the last error, starts no run, and is not retried in a storm (the SDK tries a fresh hello every 10–15 min)', async () => {
+  it('a refused key reads socket blocked with the refusal as the last error, starts no run, and is not retried in a storm (the SDK tries a fresh hello every 10–15 min)', async () => {
     double = await startServerDouble({ upgrade: 'refuse', tray: { waiting: 5 } })
     const runner = new FakeRunner(() => double)
     const i = await integration(runner)
@@ -179,14 +179,14 @@ describe('Integration — connect-time catch-up', () => {
     expect(double.upgrades).toBe(1)
     expect(double.requests.filter((r) => !r.startsWith('/v1/texts'))).toEqual([]) // no catch-up without hello.ok
     expect(runner.requests).toHaveLength(0)
-    expect(i.snapshot().socket).toBe('terminal')
+    expect(i.snapshot().socket).toBe('blocked')
     expect(i.snapshot().last_error).toMatch(/^auth rejected \(close 1008 Invalid token\) — check the agent's API key/)
-    expect(readIntegrationStatus(home)).toMatchObject({ socket: 'terminal', last_error: expect.stringMatching(/auth rejected/) })
-    // The integration stays up for the SDK's retry; `closed` after a stop
-    // would read as a clean shutdown and hide the refusal.
+    expect(readIntegrationStatus(home)).toMatchObject({ socket: 'blocked', last_error: expect.stringMatching(/auth rejected/) })
+    // The integration stays up for the SDK's retry. A stop reads `closed`
+    // like any other; the refusal stays in the last error.
     i.stop()
-    expect(i.snapshot().socket).toBe('terminal')
-    expect(readIntegrationStatus(home)?.socket).toBe('terminal')
+    expect(i.snapshot()).toMatchObject({ socket: 'closed', last_error: expect.stringMatching(/auth rejected/) })
+    expect(readIntegrationStatus(home)).toMatchObject({ socket: 'closed', last_error: expect.stringMatching(/auth rejected/) })
   })
 
   it('a key refused now and accepted later: the SDK’s next hello makes the socket ready, clears the last error, and the connect wake runs the backlog', async () => {
@@ -201,7 +201,7 @@ describe('Integration — connect-time catch-up', () => {
       retryInMs = info.retryInMs
     })
     const i = await integration(runner, connection)
-    await until(() => i.snapshot().socket === 'terminal' && i.snapshot().last_error !== null && retryInMs !== null)
+    await until(() => i.snapshot().socket === 'blocked' && i.snapshot().last_error !== null && retryInMs !== null)
     double.setUpgrade('hello')
     await vi.advanceTimersByTimeAsync(retryInMs! + 1) // the SDK's blocked retry, and no further
     await until(() => i.snapshot().socket === 'ready', 5_000)

@@ -117,7 +117,7 @@ export class Integration {
     this.connection.on('blocked', (detail) => {
       // A refused key is a state to show, not to die from: the SDK's client
       // stays up in `blocked` and tries a fresh hello every 10–15 min; `status`
-      // reads `socket terminal` with this line as the last error until one is
+      // reads `socket blocked` with this line as the last error until one is
       // accepted, or the user signs in with another key (a new connection).
       this.lastError = detail
       this.writeStatus()
@@ -191,11 +191,9 @@ export class Integration {
 
   snapshot(): IntegrationStatus {
     const c = this.invoker.counters()
-    // A connection whose key stands refused stays `terminal` through a stop:
-    // `closed` would read as a clean shutdown and hide the refusal from
-    // `status` and `doctor`.
-    const socket: SocketState =
-      this.connection.state === 'terminal' ? 'terminal' : this.stopping ? 'closed' : this.connection.state
+    // Stopping reads `closed` whatever the socket was doing; a refusal stays
+    // visible to `status` and `doctor` as the last error.
+    const socket: SocketState = this.stopping ? 'closed' : this.connection.state
     const texts = this.texts.current()
     return {
       version: 2,

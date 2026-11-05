@@ -13,7 +13,7 @@ import { mockServedTexts } from './helpers/served-texts.js'
 //
 // Live-fire E4: a getMe failure printed "Could not reach AgentChat:
 // UNAUTHORIZED: Invalid API key" and returned before the integration lines — so
-// the daemon's `socket terminal` / `auth rejected (close 1008 …)`, the one
+// the daemon's `socket blocked` / `auth rejected (close 1008 …)`, the one
 // thing that explains the failure, never appeared. A refused key (401/403) is
 // now said as such, an unreachable server as such, and both print the integration.
 
@@ -44,7 +44,7 @@ function refusedIntegration(): IntegrationStatus {
     runtime: 'claude',
     handle: 'probe',
     profile: 'answer',
-    socket: 'terminal',
+    socket: 'blocked',
     wakes: 0,
     wakes_absorbed: 0,
     invites: 0,
@@ -124,7 +124,7 @@ describe('status when getMe fails', () => {
     expect(err.join('\n')).toContain('npx -y @agentchatme/claude-code login')
     const text = out.join('\n')
     expect(text).toContain('@probe — key refused (HTTP 401)')
-    expect(text).toContain('Integration: socket terminal')
+    expect(text).toContain('Integration: socket blocked')
     expect(text).toContain('last error: auth rejected (close 1008 Invalid token)')
   })
 
@@ -154,7 +154,7 @@ describe('status when getMe fails', () => {
 
     const parsed = JSON.parse(out.join('\n')) as { error: { kind: string; status: number }; integration: { socket: string }; doorbell: { socket: string } }
     expect(parsed.error).toMatchObject({ kind: 'key_refused', status: 401 })
-    expect(parsed.integration.socket).toBe('terminal')
-    expect(parsed.doorbell.socket).toBe('terminal')
+    expect(parsed.integration.socket).toBe('blocked')
+    expect(parsed.doorbell.socket).toBe('blocked')
   })
 })

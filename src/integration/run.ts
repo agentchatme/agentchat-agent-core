@@ -26,7 +26,7 @@ import { writeIntegrationStatus } from './status.js'
 //
 // A refused key is not this loop's case: the SDK's client stays up in
 // `blocked` and tries a fresh hello every 10–15 minutes (`status` reads
-// `socket terminal` meanwhile), so a rotated-back key or a reinstated account
+// `socket blocked` meanwhile), so a rotated-back key or a reinstated account
 // reconnects on its own, and a different key is simply a credential change.
 //
 // The only thing that removes this process is an explicit `daemon disable`.

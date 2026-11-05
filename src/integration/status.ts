@@ -21,8 +21,16 @@ export const INTEGRATION_STATUS_FILE = 'integration.status.json'
 /** The file a daemon before the rename writes; read when the current one is absent. */
 export const LEGACY_STATUS_FILE = 'doorbell.status.json'
 
-export const SOCKET_STATES = ['off', 'idle', 'connecting', 'ready', 'reconnecting', 'terminal', 'closed'] as const
+/**
+ * The socket word. `blocked` is the SDK's own word for it (`RealtimeState`):
+ * the server refused the credential on the hello and a fresh hello is tried
+ * every 10–15 min until one is accepted — not an end state. Daemons before
+ * this release wrote `terminal` for it; readers map that on the way in.
+ */
+export const SOCKET_STATES = ['off', 'idle', 'connecting', 'ready', 'reconnecting', 'blocked', 'closed'] as const
 export type SocketState = (typeof SOCKET_STATES)[number]
+/** What an older daemon wrote for `blocked`. Accepted on read, never written. */
+const LEGACY_BLOCKED_STATE = 'terminal'
 
 export type TextsSource = 'server' | 'cache' | 'none'
 
@@ -97,7 +105,7 @@ const StatusSchema = z
     runtime: z.string().nullable(),
     handle: z.string().nullable(),
     profile: z.string(),
-    socket: z.enum(SOCKET_STATES),
+    socket: z.enum([...SOCKET_STATES, LEGACY_BLOCKED_STATE]),
     wakes: z.number().optional(),
     wakes_absorbed: z.number().optional(),
     knocks: z.number().optional(),
@@ -127,7 +135,7 @@ function normalize(raw: z.infer<typeof StatusSchema>): IntegrationStatus {
     runtime: raw.runtime,
     handle: raw.handle,
     profile: raw.profile,
-    socket: raw.socket,
+    socket: raw.socket === LEGACY_BLOCKED_STATE ? 'blocked' : raw.socket,
     wakes: raw.wakes ?? raw.knocks ?? 0,
     wakes_absorbed: raw.wakes_absorbed ?? raw.knocks_absorbed ?? 0,
     invites: raw.invites,

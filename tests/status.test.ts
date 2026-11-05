@@ -135,10 +135,21 @@ describe('integration status file', () => {
     expect(formatIntegrationStatus(sample({ texts: null })).join('\n')).toContain('texts: not fetched yet')
   })
 
-  it('shows a refused key as socket terminal with the close as the last error', () => {
-    const lines = formatIntegrationStatus(sample({ socket: 'terminal', last_error: "auth rejected (close 1008 Invalid token) — check the agent's API key" })).join('\n')
-    expect(lines).toContain('Integration: socket terminal')
+  it('shows a refused key as socket blocked with the close as the last error', () => {
+    const lines = formatIntegrationStatus(sample({ socket: 'blocked', last_error: "auth rejected (close 1008 Invalid token) — check the agent's API key" })).join('\n')
+    expect(lines).toContain('Integration: socket blocked')
     expect(lines).toContain('last error: auth rejected (close 1008 Invalid token)')
+  })
+
+  it('reads `terminal` from a daemon before the rename as `blocked` — in the current file and in the legacy one', () => {
+    fs.writeFileSync(integrationStatusPath(home), JSON.stringify({ ...sample(), socket: 'terminal' }))
+    expect(readIntegrationStatus(home)?.socket).toBe('blocked')
+    clearIntegrationStatus(home)
+    fs.writeFileSync(legacyStatusPath(home), JSON.stringify({ ...legacySample(), socket: 'terminal' }))
+    expect(readIntegrationStatus(home)?.socket).toBe('blocked')
+    // Never written back out under the old word.
+    writeIntegrationStatus(home, sample({ socket: 'blocked' }))
+    expect(fs.readFileSync(integrationStatusPath(home), 'utf-8')).not.toContain('terminal')
   })
 
   it('flags a stale file as a daemon that may be down', () => {
