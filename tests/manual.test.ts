@@ -6,11 +6,11 @@ import { identityLineOf, normalizeHandle } from '../src/skill/identity-line.js'
 import { renderAnchorBlock, readAnchorHandleFrom, ANCHOR_START, ANCHOR_END } from '../src/anchor/block.js'
 import { textsFor } from './helpers/served-texts.js'
 
-// ─── The manual is bundled verbatim; the identity line is served, only placed ─
+// ─── The bundled manual is the served one at release time; the identity line is served, only placed ─
 
 const SOURCE = path.join(__dirname, '..', 'src', 'skill', 'agentchat.skill.md')
 
-describe('the bundled manual', () => {
+describe('the bundled manual (the fallback for a skill file that cannot be downloaded)', () => {
   it('is byte-identical to src/skill/agentchat.skill.md (regenerate with scripts/embed-manual.mjs)', () => {
     // `.gitattributes` pins LF; the normalization below only guards a checkout
     // that ignored it, so the comparison is about content, not line endings.
@@ -23,11 +23,12 @@ describe('the bundled manual', () => {
     expect(MANUAL).toContain(MANUAL_URL.replace('https://', ''))
   })
 
-  it('is the version the platform publishes — a stale bundle is a deliberate choice, not drift', () => {
-    // Bump this with the two-command refresh (README § Refreshing the manual)
-    // when https://agentchat.me/skill.md moves on. The served texts carry the
-    // manual's version too (`manual.version`); `status` shows both.
-    expect(manualVersion()).toBe('2.1.2')
+  it('is the version the platform published when this release was cut', () => {
+    // The skill file follows the SERVED manual (served-manual.test.ts); this
+    // copy is only what a first install writes when it cannot download one.
+    // Refresh it at release time with the two-command refresh (README §
+    // Refreshing the bundled manual) so the fallback is never far behind.
+    expect(manualVersion()).toBe('2.2.0')
   })
 
   it('is not this package’s own words: it names no CLI invocation of ours', () => {

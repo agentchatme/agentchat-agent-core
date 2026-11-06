@@ -11,6 +11,7 @@ import type { RunProfile } from './profile.js'
 import type { RunRunner } from './runner.js'
 import { writeIntegrationStatus, type IntegrationStatus, type SocketState } from './status.js'
 import { TextsStore } from './texts.js'
+import { ManualFollower, type ManualFetch } from '../skill/served-manual.js'
 import { trayHasWaiting } from './tray.js'
 
 // ─── The integration: a connection, an invoker, a runner ────────────────────
@@ -39,6 +40,9 @@ import { trayHasWaiting } from './tray.js'
 //
 // The texts a run starts with are the server's (`GET /v1/texts`), fetched at
 // start, refreshed daily, cached in the identity home for an offline start.
+// The same texts announce the current manual; with a `manualPath` the skill
+// file follows it on that cadence (`ManualFollower`: a download only when the
+// announced version is not the one on disk, the old file kept on any failure).
 
 const HEARTBEAT_MS = 30_000
 const STATUS_MS = 30_000
@@ -52,6 +56,10 @@ export interface IntegrationOptions {
   readonly client: IntegrationClient
   /** The one pointer line a run prompt ends with (`manualPointer(...)`). */
   readonly manualPointer: string
+  /** The skill file that follows the served manual (`<skills dir>/agentchat/SKILL.md`); absent, the daemon leaves the manual to the CLI. */
+  readonly manualPath?: string
+  /** Injectable for tests; the manual download's `fetch`. */
+  readonly manualFetch?: ManualFetch
   readonly profile: RunProfile
   readonly budgetMs: number
   /** Injectable for tests; defaults to a real connection on the SDK socket. */
@@ -66,6 +74,7 @@ export class Integration {
   private readonly api: AgentChatClient
   private readonly connection: IntegrationConnection
   private readonly texts: TextsStore
+  private readonly manual: ManualFollower | null
   private readonly invoker: IntegrationInvoker
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null
   private statusTimer: ReturnType<typeof setInterval> | null = null
@@ -83,9 +92,13 @@ export class Integration {
         timeoutMs: HTTP_TIMEOUT_MS,
         retry: { maxRetries: 0, baseDelayMs: 0, maxDelayMs: 0 },
       })
+    this.manual =
+      options.manualPath === undefined
+        ? null
+        : new ManualFollower({ path: options.manualPath, ...(options.manualFetch !== undefined ? { fetch: options.manualFetch } : {}) })
     this.texts =
       options.texts ??
-      new TextsStore({ home: cfg.home, runtime: client.runtime, client: this.api, onChange: () => this.writeStatus() })
+      new TextsStore({ home: cfg.home, runtime: client.runtime, client: this.api, onChange: () => this.textsChanged() })
     this.invoker = new IntegrationInvoker({
       runner: options.runner,
       prompts: () => this.runPrompts(),
@@ -158,6 +171,7 @@ export class Integration {
     if (this.statusTimer) clearInterval(this.statusTimer)
     this.invoker.stop()
     this.texts.stop()
+    this.manual?.stop()
     this.connection.stop()
     idle(this.options.cfg.home)
     this.writeStatus()
@@ -223,6 +237,16 @@ export class Integration {
         manual_version: texts?.manual.version ?? null,
       },
     }
+  }
+
+  /**
+   * After every change in the texts in hand: the status file, and the skill
+   * file brought to the manual they announce. Exposed for an injected store's
+   * `onChange` (tests); the store this class builds calls it itself.
+   */
+  textsChanged(): void {
+    this.writeStatus()
+    if (this.manual !== null && !this.stopping) void this.manual.follow(this.texts.current()?.manual ?? null)
   }
 
   /** The served texts plus the pointer line, or null while no text is in hand. */

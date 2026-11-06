@@ -3,13 +3,23 @@ import * as path from 'node:path'
 
 // Atomic write: tmp file + rename in the same directory. A crash mid-write
 // leaves either the old file or a stray tmp — never a truncated JSON that
-// would make every subsequent hook invocation throw.
+// would make every subsequent hook invocation throw. A failed write removes
+// its tmp file and leaves the old file exactly as it was.
 export function atomicWriteFile(filePath: string, data: string, mode?: number): void {
   const dir = path.dirname(filePath)
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
   const tmp = path.join(dir, `.${path.basename(filePath)}.${process.pid}.tmp`)
-  fs.writeFileSync(tmp, data, mode === undefined ? {} : { mode })
-  fs.renameSync(tmp, filePath)
+  try {
+    fs.writeFileSync(tmp, data, mode === undefined ? {} : { mode })
+    fs.renameSync(tmp, filePath)
+  } catch (err) {
+    try {
+      fs.rmSync(tmp, { force: true })
+    } catch {
+      /* preserve the original error */
+    }
+    throw err
+  }
   if (mode !== undefined) {
     // rename preserves the tmp file's mode, but be explicit in case the
     // file pre-existed with looser permissions.

@@ -6,7 +6,9 @@ import { Integration } from '../src/integration/integration.js'
 import { IntegrationConnection } from '../src/integration/connection.js'
 import { readIntegrationStatus } from '../src/integration/status.js'
 import { offeredInvitesPath } from '../src/integration/invites.js'
-import { textsCachePath, writeCachedTexts } from '../src/integration/texts.js'
+import { AgentChatClient } from 'agentchatme'
+import { TextsStore, textsCachePath, writeCachedTexts } from '../src/integration/texts.js'
+import { readManualVersion } from '../src/skill/served-manual.js'
 import type { RunRequest, RunRunner } from '../src/integration/runner.js'
 import { startServerDouble, until, pause, type ServerDouble } from './helpers/server-double.js'
 import { textsFor } from './helpers/served-texts.js'
@@ -303,4 +305,80 @@ describe('Integration — the served texts', () => {
     expect(runner.requests[0]!.prompt).toBe(`CACHED WAKE INSTRUCTION\n\n${POINTER}`)
     expect(i.snapshot().texts).toMatchObject({ source: 'cache', fetched_at: '2026-11-01T00:00:00.000Z' })
   }, 10_000)
+})
+
+describe('Integration — the skill file follows the served manual', () => {
+  const manualText = (version: string): string => `---\nname: agentchat\nversion: ${version}\ndescription: d\n---\n\n# Served ${version}\n`
+  const skillFile = (): string => path.join(home, 'skills', 'agentchat', 'SKILL.md')
+
+  it('the start fetch announces a version the file does not carry: downloaded (no credentials sent) and written; the next start fetches nothing', async () => {
+    double = await startServerDouble({ manual: { version: '9.1.0', body: manualText('9.1.0') } })
+    fs.mkdirSync(path.dirname(skillFile()), { recursive: true })
+    fs.writeFileSync(skillFile(), manualText('9.0.0'))
+    const runner = new FakeRunner(() => double)
+    const i = new Integration({
+      cfg: { apiKey: KEY, handle: 'me', apiBase: double.apiBase, wsBase: double.wsBase, home, workdir: path.join(home, 'w') },
+      runner,
+      client: CLIENT,
+      manualPointer: POINTER,
+      manualPath: skillFile(),
+      profile: 'answer',
+      budgetMs: 60_000,
+    })
+    integrations.push(i)
+    await i.start()
+    await until(() => readManualVersion(skillFile()) === '9.1.0', 5_000)
+    expect(fs.readFileSync(skillFile(), 'utf-8')).toBe(manualText('9.1.0'))
+    expect(double.manualAuth).toEqual([undefined])
+    i.stop()
+
+    const again = new Integration({
+      cfg: { apiKey: KEY, handle: 'me', apiBase: double.apiBase, wsBase: double.wsBase, home, workdir: path.join(home, 'w') },
+      runner,
+      client: CLIENT,
+      manualPointer: POINTER,
+      manualPath: skillFile(),
+      profile: 'answer',
+      budgetMs: 60_000,
+    })
+    integrations.push(again)
+    await again.start()
+    await until(() => textsFetches() === 2)
+    await pause(200)
+    expect(double.manualAuth).toHaveLength(1) // current: one file read, no download
+  }, 15_000)
+
+  it('a texts refresh that announces a new version replaces the file; a download that fails keeps it', async () => {
+    double = await startServerDouble({ manual: { version: '9.1.0', body: manualText('9.1.0') } })
+    const api = new AgentChatClient({ apiKey: KEY, baseUrl: double.apiBase, timeoutMs: 5_000, retry: { maxRetries: 0, baseDelayMs: 0, maxDelayMs: 0 } })
+    let i: Integration | null = null
+    const texts = new TextsStore({ home, runtime: 'generic', client: api, refreshMs: 150, onChange: () => i?.textsChanged() })
+    i = new Integration({
+      cfg: { apiKey: KEY, handle: 'me', apiBase: double.apiBase, wsBase: double.wsBase, home, workdir: path.join(home, 'w') },
+      runner: new FakeRunner(() => double),
+      client: CLIENT,
+      manualPointer: POINTER,
+      manualPath: skillFile(),
+      profile: 'answer',
+      budgetMs: 60_000,
+      api,
+      texts,
+    })
+    integrations.push(i)
+    await i.start()
+    await until(() => readManualVersion(skillFile()) === '9.1.0', 5_000)
+
+    // The server moves on; the next refresh carries the new announcement.
+    double.setManual({ version: '9.2.0', body: manualText('9.2.0') })
+    await until(() => readManualVersion(skillFile()) === '9.2.0', 5_000)
+    expect(fs.readFileSync(skillFile(), 'utf-8')).toBe(manualText('9.2.0'))
+
+    // Announced, but what is served there is not that version (a deploy in
+    // flight): the file stays at the last good version.
+    const downloads = double.manualAuth.length
+    double.setManual({ version: '9.3.0', body: manualText('9.2.0') })
+    await until(() => double.manualAuth.length >= downloads + 2, 5_000)
+    expect(readManualVersion(skillFile())).toBe('9.2.0')
+    expect(fs.readFileSync(skillFile(), 'utf-8')).toBe(manualText('9.2.0'))
+  }, 15_000)
 })

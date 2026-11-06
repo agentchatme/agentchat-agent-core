@@ -1,4 +1,5 @@
 import type { IntegrationClient } from '../client-identity.js'
+import type { ServedManual } from '../skill/served-manual.js'
 import type { ResolvedIdentity } from './credentials.js'
 
 export type Verdict = 'PASS' | 'WARN' | 'FAIL'
@@ -9,9 +10,11 @@ export interface DoctorCheck {
   detail: string
 }
 
-/** What the shared `status` hands a host's extra lines: the served identity line it already fetched (one fetch per command). */
+/** What the shared `status` hands a host's extra lines: what it already fetched from the served texts (one fetch per command). */
 export interface StatusContext {
   identityLine: string | null
+  /** The manual the served texts announce (`texts.manual`), or null when none are in hand — what `checkManual` compares the skill file with. */
+  manual: ServedManual | null
 }
 
 /** What the shared doctor hands a host's extra checks. */
@@ -19,6 +22,8 @@ export interface DoctorContext {
   fix?: boolean
   /** The served identity line for this agent, or null when the server could not be reached and nothing is cached. */
   identityLine: string | null
+  /** The manual the served texts announce, or null when none are in hand (`--fix` syncs the skill file to it). */
+  manual: ServedManual | null
 }
 
 /**
@@ -72,10 +77,11 @@ export interface HostProfile {
    * and recover (every time the key changes), and by `doctor --fix`.
    * `identityLine` is the served line for this agent (fetched just before,
    * or the cached one), or null when neither could be had — the host then
-   * leaves the anchor for `doctor --fix` and says so. Returns report lines.
-   * When absent, only the anchor is written.
+   * leaves the anchor for `doctor --fix` and says so. `manual` is what the
+   * same texts announce (`syncManual` brings the skill file to it), or null.
+   * Returns report lines. When absent, only the anchor is written.
    */
-  place?(handle: string, apiKey: string, identityLine: string | null): string[]
+  place?(handle: string, apiKey: string, identityLine: string | null, manual: ServedManual | null): string[] | Promise<string[]>
   /**
    * Undo `place` for the identity being signed out: remove the key from the
    * tool server registration and anything else that would still authenticate
@@ -90,11 +96,11 @@ export interface HostProfile {
    */
   unplace?(identity: ResolvedIdentity | null): string[]
   /** Host-specific doctor checks, appended after the shared ones. */
-  extraDoctorChecks?(context: DoctorContext): DoctorCheck[]
+  extraDoctorChecks?(context: DoctorContext): DoctorCheck[] | Promise<DoctorCheck[]>
   /**
    * Host-specific `status` lines (placement, probes), printed after the shared
-   * ones in text mode. The served identity line comes along so the host does
-   * not fetch `/v1/texts` a second time.
+   * ones in text mode. The served identity line and manual come along so the
+   * host does not fetch `/v1/texts` a second time.
    */
   extraStatus?(context: StatusContext): string[] | Promise<string[]>
   /** Extra lines printed after a successful logout. */

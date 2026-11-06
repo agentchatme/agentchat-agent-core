@@ -16,7 +16,8 @@ import { writeAnchor, removeAnchorAt, readAnchorHandleAt, hasAnchorAt, anchorIsC
 import { traySummary } from '../integration/tray.js'
 import { loadTexts } from '../integration/texts.js'
 import { identityLineOf } from '../skill/identity-line.js'
-import { anchorLabelOf, type DoctorCheck, type HostProfile, type Verdict } from './host-profile.js'
+import type { ServedManual } from '../skill/served-manual.js'
+import { anchorLabelOf, type DoctorCheck, type HostProfile, type StatusContext, type Verdict } from './host-profile.js'
 import { clientIdentityOf } from '../client-identity.js'
 import { formatIntegrationStatus, readIntegrationStatus } from '../integration/status.js'
 
@@ -40,7 +41,9 @@ import { formatIntegrationStatus, readIntegrationStatus } from '../integration/s
 //
 // The identity line the anchor carries is the server's (`GET /v1/texts`,
 // fetched for this agent just before placing; the identity-home cache when
-// the server cannot be reached). No copy of it lives here.
+// the server cannot be reached). No copy of it lives here. The same fetch
+// says which manual is current; `place` and `doctor --fix` bring the skill
+// file to it.
 
 // Canonical handle rule, mirrored from the server so obviously-bad input fails
 // locally with a helpful message instead of a round-trip.
@@ -207,22 +210,23 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
       : new AgentChatClient({ apiKey, baseUrl: apiBase, clientIdentity, timeoutMs: 15_000 })
 
   /**
-   * The served identity line for this agent: fetched now (one attempt, 5 s),
-   * else the cached one, else null (offline and never fetched). Fetched ONCE
-   * per command: the result is handed to the host's `place`, `extraStatus`
-   * and `extraDoctorChecks`, which must not fetch again. The CLI never writes
-   * an identity line it did not get from the server.
+   * The served texts for this agent: fetched now (one attempt, 5 s), else the
+   * cached ones, else null (offline and never fetched). Fetched ONCE per
+   * command: the identity line and the announced manual are handed to the
+   * host's `place`, `extraStatus` and `extraDoctorChecks`, which must not
+   * fetch again. The CLI never writes an identity line it did not get from
+   * the server.
    */
-  async function servedIdentityLine(apiKey: string, apiBase: string): Promise<string | null> {
+  async function served(apiKey: string, apiBase: string): Promise<{ identityLine: string | null; manual: ServedManual | null }> {
     const loaded = await loadTexts({ home: profile.home(), runtime: profile.client.runtime, client: apiClient(apiKey, apiBase), timeoutMs: 5_000 })
-    return loaded === null ? null : identityLineOf(loaded.texts)
+    return loaded === null ? { identityLine: null, manual: null } : { identityLine: identityLineOf(loaded.texts), manual: loaded.texts.manual }
   }
 
-  /** The host's extra `status` lines, with the line already fetched. */
-  async function printExtraStatus(identityLine: string | null): Promise<void> {
+  /** The host's extra `status` lines, with the texts already fetched. */
+  async function printExtraStatus(context: StatusContext): Promise<void> {
     if (profile.extraStatus === undefined) return
     try {
-      for (const line of await profile.extraStatus({ identityLine })) console.log(line)
+      for (const line of await profile.extraStatus(context)) console.log(line)
     } catch (err) {
       console.log(`  (host status failed: ${err instanceof Error ? err.message : String(err)})`)
     }
@@ -234,10 +238,10 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
    * gets the anchor alone (the identity line in its instruction file).
    */
   async function placeIdentity(handle: string, apiKey: string, apiBase: string): Promise<string[]> {
-    const identityLine = await servedIdentityLine(apiKey, apiBase)
+    const { identityLine, manual } = await served(apiKey, apiBase)
     if (profile.place !== undefined) {
       try {
-        return profile.place(handle, apiKey, identityLine)
+        return await profile.place(handle, apiKey, identityLine, manual)
       } catch (err) {
         return [`  placement FAILED — ${String(err)}; repair with \`${invocation()} doctor --fix\``]
       }
@@ -656,14 +660,15 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
           ].join('\n'),
         )
         // The server did not answer, so no texts fetch either: the host checks
-        // what it can without the line.
-        await printExtraStatus(null)
+        // what it can without them.
+        await printExtraStatus({ identityLine: null, manual: null })
       }
       return 1
     }
 
     const tray = await traySummary(client).catch(() => null)
-    const identityLine = await servedIdentityLine(identity.apiKey, identity.apiBase)
+    const texts = await served(identity.apiKey, identity.apiBase)
+    const identityLine = texts.identityLine
     const anchorCurrent = identityLine === null ? null : anchorIsCurrentAt(anchorFile, identityLine)
 
     if (opts.json) {
@@ -699,7 +704,7 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
           ...formatIntegrationStatus(integration),
         ].join('\n'),
       )
-      await printExtraStatus(identityLine)
+      await printExtraStatus(texts)
     }
     return 0
   }
@@ -759,6 +764,7 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
     const anchorFile = profile.anchorFile()
     const checks: DoctorCheck[] = []
     let identityLine: string | null = null
+    let manual: ServedManual | null = null
 
     checks.push({ name: 'node', verdict: 'PASS', detail: process.version })
     checks.push({ name: 'home', verdict: 'PASS', detail: home })
@@ -801,7 +807,7 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
       // on the machine whenever any one registered, so a two-agent box could
       // end up with an instruction file announcing the OTHER agent's handle.
       const apiBase = identity?.apiBase ?? creds.api_base ?? DEFAULT_API_BASE
-      identityLine = await servedIdentityLine(creds.api_key, apiBase)
+      ;({ identityLine, manual } = await served(creds.api_key, apiBase))
       const claimed = readAnchorHandleAt(anchorFile)
       const current = identityLine === null ? null : anchorIsCurrentAt(anchorFile, identityLine)
       checks.push(
@@ -838,7 +844,7 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
       }
     }
 
-    if (profile.extraDoctorChecks !== undefined) checks.push(...profile.extraDoctorChecks({ ...opts, identityLine }))
+    if (profile.extraDoctorChecks !== undefined) checks.push(...(await profile.extraDoctorChecks({ ...opts, identityLine, manual })))
 
     console.log(checks.map((c) => `${c.verdict.padEnd(4)} ${c.name}: ${c.detail}`).join('\n'))
     return checks.some((c) => c.verdict === 'FAIL') ? 1 : 0

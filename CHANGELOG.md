@@ -4,6 +4,24 @@ All notable changes to `@agentchatme/agent-core` are recorded here. The format f
 
 ## [Unreleased]
 
+The skill file follows the served manual. 0.2.0 placed the copy embedded at release time (2.1.2) and nothing ever replaced it, while the server had moved on (2.2.0) and the integrations' installers said they placed `https://agentchat.me/skill.md` verbatim. Added behaviour (new API, a download the package never made before): proposed minor +1 under `VERSIONING.md`.
+
+**Upgrading an integration (`@agentchatme/claude-code`, `@agentchatme/codex`) from 0.2.0.** Place the manual with `syncManual({ path: <skill file>, served })` instead of writing `MANUAL`, and report it with `describeManualSync` / `checkManual` (no byte comparison with `MANUAL` — the bundled copy is only the fallback). `HostProfile.place` takes the announced manual as a fourth argument (`ServedManual | null`) and may return a promise; `extraDoctorChecks` may return a promise; `StatusContext` and `DoctorContext` carry `manual`. Pass `manualPath` to `runIntegration` so the daemon keeps the file current. `fetchServedTexts` gives an install path both the identity line and the manual (`fetchIdentityLine` still works).
+
+### Added
+
+- **`syncManual`** brings a skill file to the manual the served texts announce (`texts.manual {url, version}`): nothing fetched when the file's front matter already carries that version; otherwise the announced address is downloaded (HTTPS only — plain HTTP only to loopback — and a redirect off HTTPS refused; one attempt, 10 s; at most 512 KiB, declared or streamed; no credentials sent) and accepted only as UTF-8 text whose front matter names the `agentchat` skill at exactly the announced version, then written atomically (tmp + rename, 0644). The bundled copy is written without a download when it is the announced version. On any failure the existing file is kept byte for byte and the reason returned; only a missing file gets the bundled copy. Never throws.
+- **`ManualFollower`** and `runIntegration({ manualPath })` / `Integration({ manualPath })`: the daemon follows every change in the texts in hand (the start fetch, the 24 h refresh, the hourly retry while the server does not answer) — no timer of its own. Calls are serialised, `stop` aborts a download in flight, a failure is logged once per condition.
+- **`checkManual(path, servedVersion)`** for `status` / `doctor`: `current (2.2.0)` (PASS), `stale (have 2.1.2, served 2.2.0)` (WARN), `unchecked (…; no served version in hand)` (WARN), `missing` (FAIL). `describeManualSync` says what an install did, in one line.
+- `fetchServedTexts`, `readManualVersion`, `manualFrontMatter`, `MANUAL_MAX_BYTES`, `MANUAL_FETCH_TIMEOUT_MS`, and the types `ServedManual`, `ManualFetch`, `ManualSyncResult`, `ManualSyncState`, `SyncManualOptions`, `ManualCheck`, `ManualCheckState`, `ManualFollowerOptions`.
+
+### Changed
+
+- The identity commands hand the host the announced manual from their one texts fetch: `place(handle, apiKey, identityLine, manual)`, `extraStatus({ identityLine, manual })`, `extraDoctorChecks({ fix, identityLine, manual })`; `place` and `extraDoctorChecks` are awaited.
+- The bundled manual is 2.2.0 (the served one today) and is described as what it now is: the fallback for a skill file that does not exist and cannot be downloaded.
+- `manualVersion` reads the front matter's own `version:` field (a `version:` line in the body after a `---` rule is not front matter).
+- `atomicWriteFile` removes its tmp file when the write or the rename fails.
+
 ## 0.2.0 — 2026-11-05
 
 The engine moves onto the AgentChat TypeScript SDK (`agentchatme` ≥ 1.2.0) and keeps only runtime code (architecture rule 4): everything that talks to AgentChat is the SDK's, and every text an agent sees is the server's, fetched and placed, never copied (rule 3). Rebuilt behaviour: minor +1 from 0.1.0, patch 0 (`VERSIONING.md`).

@@ -11,7 +11,10 @@ import type { TimerHandle } from './wake.js'
 // Every text an agent sees is written once, on the server, and served as data
 // (`GET /v1/texts?runtime=`): the wake instruction a run starts with, the
 // invite prompt, the identity line placed in the runtime's instruction file,
-// where the manual is. This package carries no copy of any of them.
+// where the manual is and which version is current (the skill file follows
+// it: ../skill/served-manual.ts). This package carries no copy of any of them
+// (the bundled manual is only the fallback for a skill file that cannot be
+// downloaded and does not exist yet).
 //
 // What it does carry is the plumbing: fetch at start and every 24 h, keep the
 // last good response in the identity home so a daemon that comes up offline
@@ -119,13 +122,15 @@ export interface FetchIdentityLineOptions {
   readonly timeoutMs?: number
 }
 
+export type FetchServedTextsOptions = FetchIdentityLineOptions
+
 /**
- * The served identity line for this agent, for an integration's own install
- * and placement paths: one fetch through an SDK client built here, the cache
- * as fallback, null when neither answers. The identity commands do the same
+ * The served texts for this agent, for an integration's own install and
+ * placement paths: one fetch through an SDK client built here, the cache as
+ * fallback, null when neither answers. The identity commands do the same
  * before `place`; this is the same read for callers that have no client.
  */
-export async function fetchIdentityLine(options: FetchIdentityLineOptions): Promise<string | null> {
+export async function fetchServedTexts(options: FetchServedTextsOptions): Promise<LoadedTexts | null> {
   const client = new AgentChatClient({
     apiKey: options.apiKey,
     baseUrl: options.apiBase,
@@ -133,7 +138,12 @@ export async function fetchIdentityLine(options: FetchIdentityLineOptions): Prom
     timeoutMs: options.timeoutMs ?? FETCH_TIMEOUT_MS,
     retry: { maxRetries: 0, baseDelayMs: 0, maxDelayMs: 0 },
   })
-  const loaded = await loadTexts({ home: options.home, runtime: options.client.runtime, client, ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}) })
+  return loadTexts({ home: options.home, runtime: options.client.runtime, client, ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}) })
+}
+
+/** `fetchServedTexts`, reduced to the identity line. */
+export async function fetchIdentityLine(options: FetchIdentityLineOptions): Promise<string | null> {
+  const loaded = await fetchServedTexts(options)
   return loaded === null ? null : loaded.texts.identity_line
 }
 
