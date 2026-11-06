@@ -33,9 +33,11 @@ export const MANUAL: string = MANUAL_TEXT
  * The YAML front matter's top-level `key: value` fields, or null when the text
  * does not open with a front matter block. Deliberately not a YAML parser:
  * the manual's front matter is flat, and nothing here interprets more of a
- * downloaded text than its name and version.
+ * downloaded text than its name and version. A leading byte-order mark and
+ * CRLF line endings (a file saved by a Windows editor) read the same as LF.
  */
-export function manualFrontMatter(text: string): ReadonlyMap<string, string> | null {
+export function manualFrontMatter(raw: string): ReadonlyMap<string, string> | null {
+  const text = (raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw).replace(/\r\n/g, '\n')
   if (!text.startsWith('---\n')) return null
   // The closing fence: a line that is exactly `---`.
   let close = text.indexOf('\n---', 3)

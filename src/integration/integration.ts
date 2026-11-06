@@ -95,7 +95,7 @@ export class Integration {
     this.manual =
       options.manualPath === undefined
         ? null
-        : new ManualFollower({ path: options.manualPath, ...(options.manualFetch !== undefined ? { fetch: options.manualFetch } : {}) })
+        : new ManualFollower({ path: options.manualPath, apiBase: cfg.apiBase, ...(options.manualFetch !== undefined ? { fetch: options.manualFetch } : {}) })
     this.texts =
       options.texts ??
       new TextsStore({ home: cfg.home, runtime: client.runtime, client: this.api, onChange: () => this.textsChanged() })

@@ -98,6 +98,7 @@ export {
   ManualFollower,
   MANUAL_MAX_BYTES,
   MANUAL_FETCH_TIMEOUT_MS,
+  MANUAL_MAX_REDIRECTS,
   type ServedManual,
   type ManualFetch,
   type ManualSyncState,
@@ -105,6 +106,7 @@ export {
   type SyncManualOptions,
   type ManualCheck,
   type ManualCheckState,
+  type CheckManualOptions,
   type ManualFollowerOptions,
 } from './skill/served-manual.js'
 export { identityLineOf, normalizeHandle } from './skill/identity-line.js'
