@@ -14,7 +14,7 @@ import {
 import { clearOfferDeclined } from './state.js'
 import { writeAnchor, removeAnchorAt, readAnchorHandleAt, hasAnchorAt, anchorIsCurrentAt } from '../anchor/block.js'
 import { traySummary } from '../integration/tray.js'
-import { loadTexts } from '../integration/texts.js'
+import { loadTexts, readCachedTexts } from '../integration/texts.js'
 import { identityLineOf } from '../skill/identity-line.js'
 import type { ServedManual } from '../skill/served-manual.js'
 import { anchorLabelOf, type DoctorCheck, type HostProfile, type StatusContext, type Verdict } from './host-profile.js'
@@ -660,8 +660,10 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
           ].join('\n'),
         )
         // The server did not answer, so no texts fetch either: the host checks
-        // what it can without them.
-        await printExtraStatus({ identityLine: null, manual: null })
+        // what it can against the identity-home cache (what a fetch would
+        // have fallen back to), or without texts when nothing is cached.
+        const cached = readCachedTexts(home, profile.client.runtime)
+        await printExtraStatus(cached === null ? { identityLine: null, manual: null } : { identityLine: identityLineOf(cached.texts), manual: cached.texts.manual })
       }
       return 1
     }

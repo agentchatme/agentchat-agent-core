@@ -2,12 +2,13 @@ import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { AgentChatClient } from 'agentchatme'
+import { AgentChatClient, ConnectionError } from 'agentchatme'
 import { createIdentityCommands } from '../src/identity/commands.js'
 import { writeCredentials } from '../src/identity/credentials.js'
 import type { DoctorContext, HostProfile, StatusContext } from '../src/identity/host-profile.js'
+import { writeCachedTexts } from '../src/integration/texts.js'
 import type { ServedManual } from '../src/skill/served-manual.js'
-import { MANUAL_VERSION, mockServedTexts } from './helpers/served-texts.js'
+import { MANUAL_VERSION, mockServedTexts, textsFor } from './helpers/served-texts.js'
 
 // ─── The identity commands hand the host the manual the texts announce ──────
 //
@@ -113,5 +114,39 @@ describe('the announced manual reaches the host', () => {
     capture()
     await commands.runDoctor({})
     expect(seen[0]).toMatchObject({ manual: null, identityLine: null })
+  })
+})
+
+describe('status with the server unreachable', () => {
+  it('checks against the identity-home cache — what a texts fetch would have fallen back to — without fetching', async () => {
+    const seen: StatusContext[] = []
+    const { home, commands, request } = fixture({
+      extraStatus: (ctx) => {
+        seen.push(ctx)
+        return []
+      },
+    })
+    writeCredentials(home, { api_key: `ac_${'s'.repeat(32)}`, handle: 'probe' })
+    writeCachedTexts(home, 'generic', { ...textsFor('probe'), manual: { url: 'https://agentchat.me/skill.md', version: '9.9.9' } }, new Date())
+    vi.spyOn(AgentChatClient.prototype, 'getMe').mockRejectedValue(new ConnectionError('fetch failed'))
+    capture()
+    expect(await commands.runStatus({})).toBe(1)
+    expect(textsCalls(request)).toBe(0)
+    expect(seen[0]).toEqual({ identityLine: textsFor('probe').identity_line, manual: { url: 'https://agentchat.me/skill.md', version: '9.9.9' } })
+  })
+
+  it('nothing cached: the host is told nothing is in hand', async () => {
+    const seen: StatusContext[] = []
+    const { home, commands } = fixture({
+      extraStatus: (ctx) => {
+        seen.push(ctx)
+        return []
+      },
+    })
+    writeCredentials(home, { api_key: `ac_${'s'.repeat(32)}`, handle: 'probe' })
+    vi.spyOn(AgentChatClient.prototype, 'getMe').mockRejectedValue(new ConnectionError('fetch failed'))
+    capture()
+    await commands.runStatus({})
+    expect(seen[0]).toEqual({ identityLine: null, manual: null })
   })
 })
