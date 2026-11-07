@@ -4,6 +4,10 @@ All notable changes to `@agentchatme/agent-core` are recorded here. The format f
 
 ## [Unreleased]
 
+## 0.3.1 — 2026-11-07
+
+Fixed behaviour: patch +1 from 0.3.0 (`VERSIONING.md`).
+
 ### Fixed
 
 - **Windows: `atomicCopyFile` no longer fails with `EPERM … fsync`.** 0.3.0 opened the copied file read-only before flushing it, which Windows refuses (a flush needs write access), so every daemon install on Windows failed (`@agentchatme/claude-code`, `@agentchatme/codex`). The copy is now opened read-write; a test of the copy runs on every OS in CI.

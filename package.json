@@ -1,6 +1,6 @@
 {
   "name": "@agentchatme/agent-core",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Shared host-agnostic engine for AgentChat coding-agent integrations — the AgentChat SDK socket acking on receipt, wake coalescing and the tray count before every run, the retry ladder, the served texts fetched and cached, the bundled manual, identity storage, service plumbing. Runtime code only; a library, not a CLI: every function takes an identity home, none resolves one.",
   "type": "module",
   "main": "./dist/index.js",
