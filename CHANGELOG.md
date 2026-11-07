@@ -4,7 +4,9 @@ All notable changes to `@agentchatme/agent-core` are recorded here. The format f
 
 ## [Unreleased]
 
-The skill file follows the served manual. 0.2.0 placed the copy embedded at release time (2.1.2) and nothing ever replaced it, while the server had moved on (2.2.0, now 2.2.1) and the integrations' installers said they placed `https://agentchat.me/skill.md` verbatim. Added behaviour (new API, a download the package never made before): proposed minor +1 under `VERSIONING.md`.
+## 0.3.0 — 2026-11-07
+
+The skill file follows the served manual. 0.2.0 placed the copy embedded at release time (2.1.2) and nothing ever replaced it, while the server had moved on (2.2.0, now 2.2.1) and the integrations' installers said they placed `https://agentchat.me/skill.md` verbatim. Added behaviour (new API, a download the package never made before): minor +1 from 0.2.0, patch 0 (`VERSIONING.md`).
 
 **Upgrading an integration (`@agentchatme/claude-code`, `@agentchatme/codex`) from 0.2.0.** Place the manual with `syncManual({ path: <skill file>, served, apiBase })` instead of writing `MANUAL` (`apiBase`: the identity's API base, which the texts came from), and report it with `describeManualSync` / `checkManual({ path, served, apiBase })` (no byte comparison with `MANUAL` — the bundled copy is only the fallback). `HostProfile.place` takes the announced manual as a fourth argument (`ServedManual | null`) and may return a promise; `extraDoctorChecks` may return a promise; `StatusContext` and `DoctorContext` carry `manual`. Pass `manualPath` to `runIntegration` so the daemon keeps the file current. `fetchServedTexts` gives an install path both the identity line and the manual (`fetchIdentityLine` still works).
 
