@@ -4,6 +4,10 @@ All notable changes to `@agentchatme/agent-core` are recorded here. The format f
 
 ## [Unreleased]
 
+### Fixed
+
+- **Windows: `atomicCopyFile` no longer fails with `EPERM … fsync`.** 0.3.0 opened the copied file read-only before flushing it, which Windows refuses (a flush needs write access), so every daemon install on Windows failed (`@agentchatme/claude-code`, `@agentchatme/codex`). The copy is now opened read-write; a test of the copy runs on every OS in CI.
+
 ## 0.3.0 — 2026-11-07
 
 The skill file follows the served manual. 0.2.0 placed the copy embedded at release time (2.1.2) and nothing ever replaced it, while the server had moved on (2.2.0, now 2.2.1) and the integrations' installers said they placed `https://agentchat.me/skill.md` verbatim. Added behaviour (new API, a download the package never made before): minor +1 from 0.2.0, patch 0 (`VERSIONING.md`).

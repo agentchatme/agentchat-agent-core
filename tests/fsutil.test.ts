@@ -65,6 +65,19 @@ describe('atomicWriteFile', () => {
 })
 
 describe('atomicCopyFile', () => {
+  // Runs on every OS in CI: 0.3.0 opened the copy read-only before fsync,
+  // which Windows refuses (EPERM), and no test exercised the copy there.
+  it('copies, replaces an existing file and leaves no tmp file behind, on every OS', () => {
+    const source = path.join(dir, 'daemon.src')
+    const target = path.join(dir, 'daemon.mjs')
+    fs.writeFileSync(source, '// daemon v1\n')
+    atomicCopyFile(source, target, 0o755)
+    fs.writeFileSync(source, '// daemon v2\n')
+    atomicCopyFile(source, target, 0o755)
+    expect(fs.readFileSync(target, 'utf-8')).toBe('// daemon v2\n')
+    expect(fs.readdirSync(dir).filter((f) => f.endsWith('.tmp'))).toEqual([])
+  })
+
   it.skipIf(!posix)('the same: a planted predictable tmp symlink is not followed', () => {
     const source = path.join(dir, 'daemon.src')
     const target = path.join(dir, 'daemon.mjs')
