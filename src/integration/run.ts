@@ -62,6 +62,13 @@ export interface RunIntegrationOpts {
   client: IntegrationClient
   /** The one pointer line a run prompt ends with: how THIS runtime reaches its copy of the manual (`manualPointer(...)`). */
   manualPointer: string
+  /**
+   * The skill file that follows the served manual (`<skills dir>/agentchat/SKILL.md`):
+   * whenever the texts in hand announce a version the file does not carry, the
+   * announced manual is downloaded, checked and written over it. Absent, the
+   * daemon leaves the manual to the CLI's install and `doctor --fix`.
+   */
+  manualPath?: string
   /** Scratch dir for runs. The integration decides where; this package never derives one. */
   workdir: string
   /** Defaults to `AGENTCHAT_RUN_PROFILE`, then `answer`. */
@@ -240,6 +247,7 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
           runner: opts.runner,
           client: opts.client,
           manualPointer: opts.manualPointer,
+          ...(opts.manualPath !== undefined ? { manualPath: opts.manualPath } : {}),
           profile,
           budgetMs,
         })

@@ -24,8 +24,9 @@
 // served texts — and every text an agent sees is the server's, fetched and
 // placed, never copied (rule 3). What stays here is what must NOT drift
 // between integrations: the identity flows, the credential format, the wake
-// coalescer and retry ladder, the texts cache, the bundled manual's
-// placement, the service plumbing. What belongs to each integration: where
+// coalescer and retry ladder, the texts cache, the manual's placement (the
+// served one, kept current; the bundled copy only as a fallback), the service
+// plumbing. What belongs to each integration: where
 // its home is, which file its anchor lives in, how to start one headless run
 // of its runtime, and where its runtime keeps skills.
 
@@ -38,6 +39,7 @@ export { traySummary, trayHasWaiting, type TraySummary, type TrayClient } from '
 // The served texts: fetched, cached in the identity home, never copied.
 export {
   loadTexts,
+  fetchServedTexts,
   fetchIdentityLine,
   readCachedTexts,
   writeCachedTexts,
@@ -48,6 +50,7 @@ export {
   TextsStore,
   type CachedTexts,
   type FetchIdentityLineOptions,
+  type FetchServedTextsOptions,
   type LoadedTexts,
   type LoadTextsOptions,
   type TextsClient,
@@ -83,8 +86,29 @@ export {
   type IdentityState,
 } from './identity/state.js'
 
-// The manual (still placed from the package), the identity line's placement, the wizard's offer.
-export { MANUAL, MANUAL_URL, MANUAL_SKILL_NAME, MANUAL_FILENAME, manualVersion, manualPointer } from './skill/manual.js'
+// The manual: the served one placed and kept current (the bundled copy is the
+// fallback for a skill file that does not exist and cannot be downloaded),
+// then the identity line's placement and the wizard's offer.
+export { MANUAL, MANUAL_URL, MANUAL_SKILL_NAME, MANUAL_FILENAME, manualFrontMatter, manualVersion, manualPointer } from './skill/manual.js'
+export {
+  syncManual,
+  checkManual,
+  describeManualSync,
+  readManualVersion,
+  ManualFollower,
+  MANUAL_MAX_BYTES,
+  MANUAL_FETCH_TIMEOUT_MS,
+  MANUAL_MAX_REDIRECTS,
+  type ServedManual,
+  type ManualFetch,
+  type ManualSyncState,
+  type ManualSyncResult,
+  type SyncManualOptions,
+  type ManualCheck,
+  type ManualCheckState,
+  type CheckManualOptions,
+  type ManualFollowerOptions,
+} from './skill/served-manual.js'
 export { identityLineOf, normalizeHandle } from './skill/identity-line.js'
 export { renderUnregisteredBlock, renderDeclinedBlock, type HostCopy } from './anchor/offer.js'
 

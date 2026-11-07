@@ -28,6 +28,9 @@ import { textsFor } from './served-texts.js'
 //                                    `deferred` count the cards exclude)
 //   * GET /v1/groups/invites       → the configured pending invites
 //   * GET /v1/texts?runtime=R      → the served texts for R (or `textsStatus`)
+// and, with `manual`, the manual the texts announce, at `<apiBase>/skill.md`
+// (plain HTTP to loopback, which the manual download accepts for a local
+// development server).
 
 export type UpgradeMode = 'hello' | 'refuse' | 'hello-required' | number
 
@@ -47,6 +50,13 @@ export interface ServerDoubleOptions {
   invites?: ReadonlyArray<{ id: string; group_id?: string; group_name?: string; inviter_handle?: string }>
   /** HTTP status for GET /v1/texts; 200 serves the texts. */
   textsStatus?: number
+  /** Announce this manual in the texts (url `<apiBase>/skill.md`) and serve `body` there. */
+  manual?: ServedManualDouble
+}
+
+export interface ServedManualDouble {
+  version: string
+  body: string
 }
 
 export interface Served {
@@ -71,6 +81,10 @@ export interface ServerDouble {
   setUpgrade(mode: UpgradeMode): void
   setTray(tray: Tray): void
   setTextsStatus(status: number): void
+  /** Announce (and serve) a different manual from the next texts fetch on. */
+  setManual(manual: ServedManualDouble): void
+  /** The Authorization header of every `/skill.md` request (undefined: none sent). */
+  readonly manualAuth: Array<string | undefined>
   /** Push a frame to the most recent live socket. */
   send(frame: unknown): void
   /** Acks recorded across every connection. */
@@ -85,6 +99,8 @@ export async function startServerDouble(options: ServerDoubleOptions = {}): Prom
   const drain = options.drain ?? []
   const invites = options.invites ?? []
   const caps = options.helloCapabilities ?? ['ack']
+  let manual = options.manual ?? null
+  const manualAuth: Array<string | undefined> = []
   const served: Served[] = []
   const requests: string[] = []
 
@@ -134,7 +150,15 @@ export async function startServerDouble(options: ServerDoubleOptions = {}): Prom
         res.end(JSON.stringify({ code: 'UNAVAILABLE', message: `texts ${textsStatus}` }))
         return
       }
-      res.end(JSON.stringify({ runtime: url.searchParams.get('runtime'), ...textsFor('me', url.searchParams.get('runtime') ?? 'generic') }))
+      const texts = textsFor('me', url.searchParams.get('runtime') ?? 'generic')
+      if (manual !== null) texts.manual = { url: `${double.apiBase}/skill.md`, version: manual.version }
+      res.end(JSON.stringify({ runtime: url.searchParams.get('runtime'), ...texts }))
+      return
+    }
+    if (url.pathname === '/skill.md' && manual !== null) {
+      manualAuth.push(req.headers.authorization)
+      res.setHeader('content-type', 'text/markdown; charset=utf-8')
+      res.end(manual.body)
       return
     }
     res.statusCode = 404
@@ -157,6 +181,10 @@ export async function startServerDouble(options: ServerDoubleOptions = {}): Prom
     setTextsStatus: (next) => {
       textsStatus = next
     },
+    setManual: (next) => {
+      manual = next
+    },
+    manualAuth,
     send: (frame) => {
       const last = served[served.length - 1]
       if (!last) throw new Error('no live socket to send on')
