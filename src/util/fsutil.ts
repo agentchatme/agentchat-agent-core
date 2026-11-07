@@ -92,7 +92,11 @@ export function atomicCopyFile(source: string, destination: string, mode = 0o755
   const tmp = tmpPathFor(destination)
   try {
     fs.copyFileSync(source, tmp, fs.constants.COPYFILE_EXCL)
-    const fd = fs.openSync(tmp, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0))
+    // Read-write, not read-only: Windows flushes a file to disk only through
+    // a handle with write access (FlushFileBuffers), so fsync on a read-only
+    // descriptor fails there with EPERM. 0.3.0 opened it read-only and every
+    // Windows daemon install failed at this line.
+    const fd = fs.openSync(tmp, fs.constants.O_RDWR | (fs.constants.O_NOFOLLOW ?? 0))
     try {
       fs.fchmodSync(fd, mode)
       fs.fsyncSync(fd)
