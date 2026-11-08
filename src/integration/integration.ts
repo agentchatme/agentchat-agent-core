@@ -237,7 +237,9 @@ export class Integration {
       if (payload.reason === 'unanswered' && typeof payload.step === 'number') this.lastUnansweredStep = payload.step
     })
     this.loop = new kit.ReceiveLoop({
-      client: options.dismissIgnoredInvites === false ? withoutInviteDismissal(this.api) : this.api,
+      client: this.api,
+      // The kit's own switch: off, no invite is dismissed on the agent's behalf.
+      ...(options.dismissIgnoredInvites === false ? { dismissIgnoredInvites: false } : {}),
       texts: this.texts,
       mode: 'singleRun',
       socket: this.realtime,
@@ -487,15 +489,4 @@ export class Integration {
   private writeStatus(): void {
     writeIntegrationStatus(this.options.cfg.home, this.snapshot())
   }
-}
-
-/**
- * The loop's client with `groups.dismissInvite` answered here, never sent:
- * for a mode whose "completed run" is no proof the agent saw an invite.
- * Everything else is the real client's.
- */
-function withoutInviteDismissal(api: AgentChatClient): kit.ReceiveLoopClient {
-  const groups = Object.create(api.groups) as AgentChatClient['groups']
-  groups.dismissInvite = async () => ({ dismissed: false })
-  return { inbox: api.inbox, decisions: api.decisions, groups, ...(typeof api.baseUrl === 'string' ? { baseUrl: api.baseUrl } : {}) }
 }
