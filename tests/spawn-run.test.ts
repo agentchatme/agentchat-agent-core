@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
-import { redactDiagnostic, spawnRun, sweepWindowsDescendants } from '../src/integration/spawn-run.js'
+import { describeWindowsSweep, redactDiagnostic, spawnRun, sweepWindowsDescendants } from '../src/integration/spawn-run.js'
 import { until } from './helpers/server-double.js'
 
 // ─── One headless run: bounded, classified, output discarded ────────────────
@@ -230,16 +230,24 @@ describe('spawnRun — never hangs the worker', () => {
     const orphan = Number(fs.readFileSync(pidFile, 'utf-8'))
     try {
       expect(alive(orphan)).toBe(true)
-      // A window that ended before the orphan was born spares it.
-      sweepWindowsDescendants(parentPid, startedAt - 60_000, startedAt - 30_000)
-      await new Promise((r) => setTimeout(r, 4_000))
-      expect(alive(orphan)).toBe(true)
-      sweepWindowsDescendants(parentPid, startedAt, exitedAt)
-      await until(() => !alive(orphan), 20_000)
+      // A window that ended before the orphan was born spares it. A cold
+      // PowerShell on a CI runner can take tens of seconds to start.
+      const spared = await sweepWindowsDescendants(parentPid, startedAt - 60_000, startedAt - 30_000, { timeoutMs: 30_000 })
+      const sparedLine = spared === null ? 'no sweep' : describeWindowsSweep(spared)
+      console.log(`[sweep diagnostics, spare] ${sparedLine}`)
+      expect(spared?.killed ?? [], sparedLine).toEqual([])
+      expect(alive(orphan), sparedLine).toBe(true)
+      const swept = await sweepWindowsDescendants(parentPid, startedAt, exitedAt, { timeoutMs: 30_000 })
+      const sweptLine = swept === null ? 'no sweep' : describeWindowsSweep(swept)
+      console.log(`[sweep diagnostics, kill] ${sweptLine} (orphan ${orphan}, parent ${parentPid})`)
+      expect(swept?.killed.map((k) => k.pid) ?? [], sweptLine).toContain(orphan)
+      await until(() => !alive(orphan), 5_000).catch(() => {
+        throw new Error(`the orphan ${orphan} is still alive after the sweep: ${sweptLine}`)
+      })
     } finally {
       reap(orphan)
     }
-  }, 40_000)
+  }, 90_000)
 
   it.skipIf(process.platform === 'win32')(
     'POSIX only (setsid / process groups): a process that escaped the group and holds the pipes past SIGKILL: the run is abandoned, never awaited forever',

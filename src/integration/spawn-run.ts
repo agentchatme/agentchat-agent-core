@@ -1,6 +1,7 @@
 import type { ChildProcess } from 'node:child_process'
 import { spawnCommand, spawnCommandSync } from '../util/spawn.js'
 import type { RunOutcome } from './runner.js'
+import { log } from '../util/log.js'
 
 // ─── Spawning one headless run ──────────────────────────────────────────────
 //
@@ -128,36 +129,115 @@ function fileTime(ms: number): string {
   return String((BigInt(Math.round(ms)) + 11_644_473_600_000n) * 10_000n)
 }
 
+/** What one Windows sweep saw and did, for the log line and for tests. */
+export interface WindowsSweep {
+  /** PowerShell's exit code; null when it was killed past its deadline or could not start. */
+  readonly exitCode: number | null
+  readonly timedOut: boolean
+  /** Every child of the root the sweep saw, as `<pid> <created ISO>`, in or out of the window. */
+  readonly candidates: string[]
+  /** Pids it ran `taskkill /T /F` on, with taskkill's exit code. */
+  readonly killed: Array<{ pid: number; code: number }>
+  /** The window it used, ISO. */
+  readonly window: string | null
+  /** stderr, bounded. */
+  readonly stderr: string
+}
+
+/** A cold PowerShell on a busy runner takes seconds to start; past this the sweep is given up. */
+export const WINDOWS_SWEEP_TIMEOUT_MS = 60_000
+
 /**
  * Windows: kill the processes an exited run left behind — its direct
  * children, which keep the dead run's pid as their `ParentProcessId` (Windows
  * does not reparent), created while the run was alive (so a reused pid cannot
- * pick up a stranger's children), each with its own tree. Best effort and
- * fire-and-forget: a detached `powershell -EncodedCommand` (no quoting to get
- * wrong), never waited for, so it cannot hold the worker either. A process
- * that was already re-parented further down, or that the sweep cannot see,
- * survives; the run's pipes are released either way.
+ * pick up a stranger's children), each with its own tree. Best effort, and
+ * never waited for by the run: `spawnRun` only logs the result. A
+ * `powershell -EncodedCommand` (no quoting to get wrong), bounded by
+ * `timeoutMs`. Resolves null off Windows.
  */
-export function sweepWindowsDescendants(rootPid: number, aliveFromMs: number, aliveUntilMs: number): void {
-  if (process.platform !== 'win32' || !Number.isInteger(rootPid) || rootPid <= 0) return
+export function sweepWindowsDescendants(
+  rootPid: number,
+  aliveFromMs: number,
+  aliveUntilMs: number,
+  options: { timeoutMs?: number } = {},
+): Promise<WindowsSweep | null> {
+  if (process.platform !== 'win32' || !Number.isInteger(rootPid) || rootPid <= 0) return Promise.resolve(null)
   const script = [
+    "$ErrorActionPreference = 'Continue'",
     `$from = [DateTime]::FromFileTime(${fileTime(aliveFromMs - 1_000)})`,
     `$until = [DateTime]::FromFileTime(${fileTime(aliveUntilMs + 1_000)})`,
-    `Get-CimInstance Win32_Process -Filter 'ParentProcessId=${rootPid}' |`,
-    '  Where-Object { $_.CreationDate -ge $from -and $_.CreationDate -le $until } |',
-    '  ForEach-Object { & taskkill.exe /T /F /PID $_.ProcessId 2>$null | Out-Null }',
+    "Write-Output ('window ' + $from.ToUniversalTime().ToString('o') + ' ' + $until.ToUniversalTime().ToString('o'))",
+    `foreach ($p in @(Get-CimInstance Win32_Process -Filter 'ParentProcessId=${rootPid}')) {`,
+    "  Write-Output ('candidate ' + $p.ProcessId + ' ' + $p.CreationDate.ToUniversalTime().ToString('o'))",
+    '  if ($p.CreationDate -ge $from -and $p.CreationDate -le $until) {',
+    '    & taskkill.exe /T /F /PID $p.ProcessId 2>&1 | Out-Null',
+    "    Write-Output ('kill ' + $p.ProcessId + ' ' + $LASTEXITCODE)",
+    '  }',
+    '}',
   ].join('\n')
-  try {
-    const sweeper = spawnCommand(
-      'powershell.exe',
-      ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')],
-      { detached: true, stdio: 'ignore', windowsHide: true },
-    )
-    sweeper.on('error', () => undefined)
-    sweeper.unref()
-  } catch {
-    /* best effort */
-  }
+  return new Promise<WindowsSweep>((resolve) => {
+    let stdout = ''
+    let stderr = ''
+    let timedOut = false
+    let done = false
+    const finish = (exitCode: number | null): void => {
+      if (done) return
+      done = true
+      clearTimeout(timer)
+      const lines = stdout.split(/\r?\n/).map((l) => l.trim()).filter((l) => l.length > 0)
+      resolve({
+        exitCode,
+        timedOut,
+        candidates: lines.filter((l) => l.startsWith('candidate ')).map((l) => l.slice('candidate '.length)),
+        killed: lines
+          .filter((l) => l.startsWith('kill '))
+          .map((l) => l.split(' '))
+          .map(([, pid, code]) => ({ pid: Number(pid), code: Number(code) })),
+        window: lines.find((l) => l.startsWith('window '))?.slice('window '.length) ?? null,
+        stderr: redactDiagnostic(stderr),
+      })
+    }
+    let sweeper: ChildProcess
+    try {
+      sweeper = spawnCommand(
+        'powershell.exe',
+        ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')],
+        { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true },
+      )
+    } catch (err) {
+      stderr = String(err)
+      finish(null)
+      return
+    }
+    const timer = setTimeout(() => {
+      timedOut = true
+      try {
+        sweeper.kill()
+      } catch {
+        /* gone */
+      }
+      finish(null)
+    }, options.timeoutMs ?? WINDOWS_SWEEP_TIMEOUT_MS)
+    timer.unref?.()
+    sweeper.stdout?.on('data', (c: Buffer | string) => {
+      stdout = (stdout + String(c)).slice(-16_000)
+    })
+    sweeper.stderr?.on('data', (c: Buffer | string) => {
+      stderr = (stderr + String(c)).slice(-4_000)
+    })
+    sweeper.on('error', (err) => {
+      stderr += String(err)
+      finish(null)
+    })
+    sweeper.on('close', (code) => finish(code))
+  })
+}
+
+/** One line for the log: what a sweep found and did. */
+export function describeWindowsSweep(sweep: WindowsSweep): string {
+  const killed = sweep.killed.map((k) => `${k.pid} (taskkill ${k.code})`).join(', ') || 'none'
+  return `windows leftover sweep: exit ${sweep.exitCode ?? (sweep.timedOut ? 'timed out' : 'none')}; window ${sweep.window ?? '?'}; children seen ${sweep.candidates.length > 0 ? sweep.candidates.join(', ') : 'none'}; killed ${killed}${sweep.stderr ? `; stderr: ${sweep.stderr}` : ''}`
 }
 
 /** Start the command, wait for it, classify. Never throws, and always resolves. */
@@ -337,7 +417,12 @@ export function spawnRun(spec: SpawnRunSpec): Promise<RunOutcome> {
         // The run is over; what is left of it is a leftover: its process
         // group on POSIX; on Windows its orphaned children (no groups there).
         killProcessTree(proc, 'SIGKILL')
-        if (proc.pid !== undefined) sweepWindowsDescendants(proc.pid, started, exited.at)
+        if (proc.pid !== undefined) {
+          // Never awaited: the run's outcome does not wait for the sweep.
+          void sweepWindowsDescendants(proc.pid, started, exited.at).then((sweep) => {
+            if (sweep !== null) (sweep.exitCode === 0 ? log.info : log.warn)(describeWindowsSweep(sweep))
+          })
+        }
         detach()
         finish(
           classify(
