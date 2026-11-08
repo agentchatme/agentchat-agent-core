@@ -593,3 +593,69 @@ describe('IntegrationInvoker — a successful run cancels a pending re-wake (E2)
     expect(runner.requests.map((r) => r.kind)).toEqual(['wake', 'invite', 'wake'])
   })
 })
+
+describe('IntegrationInvoker — the worker outlives every runner', () => {
+  it('a runner that never returns is abandoned past its budget plus the slack: signal aborted, timed_out, the next wake runs', async () => {
+    const clock = new FakeClock()
+    const signals: AbortSignal[] = []
+    let calls = 0
+    const runner = new FakeRunner((request) => {
+      calls += 1
+      if (request.signal) signals.push(request.signal)
+      // The first run hangs forever, whatever its signal says.
+      return calls === 1 ? new Promise<RunOutcome>(() => undefined) : ok()
+    })
+    const inv = new IntegrationInvoker({
+      runner,
+      prompts,
+      budgetMs: 10_000,
+      debounceMs: 2_000,
+      runnerDeadlineSlackMs: 5_000,
+      now: () => clock.now(),
+      setTimeout: (fn, ms) => clock.setTimeout(fn, ms),
+      clearTimeout: (h) => clock.clearTimeout(h),
+    })
+    inv.wake('message')
+    await clock.advanceAsync(2_000)
+    expect(runner.requests).toHaveLength(1)
+    await clock.advanceAsync(14_999)
+    expect(inv.counters().running).toBe(true)
+    await clock.advanceAsync(1)
+    await flush()
+    expect(signals[0]?.aborted).toBe(true)
+    expect(inv.counters()).toMatchObject({ runsTimedOut: 1, running: false })
+    expect(inv.counters().lastRun?.detail).toMatch(/did not return/)
+
+    // The worker is free: a new wake runs (the ladder's rung is pending too).
+    inv.wake('message')
+    await clock.advanceAsync(2_000)
+    await inv.settled()
+    expect(runner.requests).toHaveLength(2)
+    expect(inv.counters().runsOk).toBe(1)
+    inv.stop()
+  })
+
+  it('a tray count that never answers counts as failed past its deadline — the run starts anyway', async () => {
+    const clock = new FakeClock()
+    const runner = new FakeRunner()
+    const inv = new IntegrationInvoker({
+      runner,
+      prompts,
+      budgetMs: 600_000,
+      debounceMs: 2_000,
+      trayCountDeadlineMs: 30_000,
+      now: () => clock.now(),
+      setTimeout: (fn, ms) => clock.setTimeout(fn, ms),
+      clearTimeout: (h) => clock.clearTimeout(h),
+      trayHasWaiting: () => new Promise<boolean>(() => undefined),
+    })
+    inv.wake('message')
+    await clock.advanceAsync(2_000)
+    await clock.advanceAsync(29_999)
+    expect(runner.requests).toHaveLength(0)
+    await clock.advanceAsync(1)
+    await inv.settled()
+    expect(runner.requests).toHaveLength(1)
+    inv.stop()
+  })
+})

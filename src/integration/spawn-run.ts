@@ -23,7 +23,26 @@ import type { RunOutcome } from './runner.js'
 // (`signal`) — a daemon that exits with a run still going orphans a model call
 // that nobody will read and that the restarted daemon would run again.
 
+// A run must never hang the worker that started it. Two ways a child can
+// outlive its own classification, both seen with real runtimes:
+//
+//   * the run's process exits, but something it started still holds its
+//     stdout/stderr (a helper spawned with inherited pipes, an MCP server
+//     that daemonised): Node's `close` waits for every holder of the pipes,
+//     so it never comes. After `exit`, `close` gets DRAIN_MS; then the
+//     leftovers of the run's process group are killed, the pipes are
+//     dropped, and the run is classified by the exit it did make.
+//   * a SIGKILL that does not end it (a process that escaped the group with
+//     `setsid` and still holds the pipes; a process stuck in the kernel):
+//     ABANDON_MS after the SIGKILL the pipes are dropped, the child is
+//     unref'd, and the run is classified `timed_out` / `failed` as the
+//     budget or the interrupt said — the worker moves on.
+
 const DEFAULT_GRACE_MS = 5_000
+/** After the run's process exited: how long its pipes get to close before the run is detached from them. */
+const DEFAULT_DRAIN_MS = 2_000
+/** After the SIGKILL: how long before a run that still has not ended is abandoned. */
+const DEFAULT_ABANDON_MS = 5_000
 const STDERR_TAIL_CHARS = 400
 
 export interface SpawnRunSpec {
@@ -37,6 +56,10 @@ export interface SpawnRunSpec {
   readonly budgetMs: number
   /** SIGTERM first; SIGKILL this long after. */
   readonly graceMs?: number
+  /** After the process exited, how long its pipes may stay open before the run is detached from them. */
+  readonly drainMs?: number
+  /** After the SIGKILL, how long before a run that has still not ended is abandoned. */
+  readonly abandonMs?: number
   /**
    * Aborting it SIGTERMs the run's process group (SIGKILL after `graceMs`);
    * the outcome is `failed` with an "interrupted" detail.
@@ -81,26 +104,74 @@ function killProcessTree(child: ChildProcess, signal: NodeJS.Signals): void {
   }
 }
 
-/** Start the command, wait for it, classify. Never throws. */
+/** Start the command, wait for it, classify. Never throws, and always settles. */
 export function spawnRun(spec: SpawnRunSpec): Promise<RunOutcome> {
   const started = Date.now()
+  const graceMs = spec.graceMs ?? DEFAULT_GRACE_MS
+  const drainMs = spec.drainMs ?? DEFAULT_DRAIN_MS
+  const abandonMs = spec.abandonMs ?? DEFAULT_ABANDON_MS
   return new Promise<RunOutcome>((resolve) => {
     let settled = false
     let stdoutBytes = 0
     let stderrTail = ''
     let timedOut = false
     let interrupted = false
-    let killTimer: ReturnType<typeof setTimeout> | null = null
-    let graceTimer: ReturnType<typeof setTimeout> | null = null
+    let terminating = false
+    let exited: { code: number | null; signal: NodeJS.Signals | null } | null = null
+    const timers = new Set<ReturnType<typeof setTimeout>>()
     let onAbort: (() => void) | null = null
+    let child: ChildProcess | null = null
+
+    const later = (ms: number, fn: () => void): void => {
+      const timer = setTimeout(() => {
+        timers.delete(timer)
+        fn()
+      }, ms)
+      timers.add(timer)
+    }
 
     const finish = (outcome: Omit<RunOutcome, 'durationMs'>): void => {
       if (settled) return
       settled = true
-      if (killTimer) clearTimeout(killTimer)
-      if (graceTimer) clearTimeout(graceTimer)
+      for (const timer of timers) clearTimeout(timer)
+      timers.clear()
       if (onAbort) spec.signal?.removeEventListener('abort', onAbort)
       resolve({ ...outcome, durationMs: Date.now() - started })
+    }
+
+    /** Stop waiting on the child's pipes and let the event loop forget it. */
+    const detach = (): void => {
+      if (child === null) return
+      for (const stream of [child.stdin, child.stdout, child.stderr]) {
+        try {
+          stream?.destroy()
+        } catch {
+          /* already gone */
+        }
+      }
+      try {
+        child.unref()
+      } catch {
+        /* already gone */
+      }
+    }
+
+    /** The outcome for an exit the run did make; `note` says why `close` was not waited for. */
+    const classify = (code: number | null, signal: NodeJS.Signals | null, note: string | null): Omit<RunOutcome, 'durationMs'> => {
+      const tail = redactDiagnostic(stderrTail)
+      const extra = `${note ? ` (${note})` : ''}${tail ? `: ${tail}` : ''}`
+      if (timedOut) {
+        return { state: 'timed_out', exitCode: code, detail: `run exceeded its ${Math.round(spec.budgetMs / 1000)} s budget and was killed${extra}` }
+      }
+      if (interrupted) {
+        return { state: 'failed', exitCode: code, detail: `interrupted — the integration was stopping; the tray stays unread for the next run${extra}` }
+      }
+      if (code === 0) return note ? { state: 'ok', exitCode: 0, detail: note } : { state: 'ok', exitCode: 0 }
+      const exit = code === null ? `signal ${signal ?? 'unknown'}` : `exit ${code}`
+      // Nothing on stdout: the runtime did not get going (missing, refused
+      // to start, auth gate). Whatever it complained about is in the tail.
+      if (stdoutBytes === 0) return { state: 'not_started', exitCode: code, detail: `${exit} with nothing on stdout${extra}` }
+      return { state: 'failed', exitCode: code, detail: `${exit}${extra}` }
     }
 
     if (spec.signal?.aborted) {
@@ -108,7 +179,6 @@ export function spawnRun(spec: SpawnRunSpec): Promise<RunOutcome> {
       return
     }
 
-    let child: ChildProcess
     try {
       child = spawnCommand(spec.command, [...spec.args], {
         cwd: spec.cwd,
@@ -121,10 +191,11 @@ export function spawnRun(spec: SpawnRunSpec): Promise<RunOutcome> {
       finish({ state: 'not_started', exitCode: null, detail: redactDiagnostic(String(err)) })
       return
     }
+    const proc: ChildProcess = child
 
     if (spec.onStarted) {
       const onStarted = spec.onStarted
-      child.once('spawn', () => {
+      proc.once('spawn', () => {
         try {
           onStarted()
         } catch {
@@ -133,35 +204,59 @@ export function spawnRun(spec: SpawnRunSpec): Promise<RunOutcome> {
       })
     }
 
-    child.stdout?.on('data', (chunk: Buffer | string) => {
+    proc.stdout?.on('data', (chunk: Buffer | string) => {
       stdoutBytes += chunk.length // counted, never kept
     })
-    child.stderr?.on('data', (chunk: Buffer | string) => {
+    proc.stderr?.on('data', (chunk: Buffer | string) => {
       stderrTail = (stderrTail + String(chunk)).slice(-4 * STDERR_TAIL_CHARS)
     })
+    // A pipe torn down under us (detach, a dying child) must never surface as
+    // an unhandled 'error' event.
+    proc.stdout?.on('error', () => undefined)
+    proc.stderr?.on('error', () => undefined)
 
-    if (spec.stdin !== null && child.stdin) {
-      child.stdin.on('error', () => {
+    if (spec.stdin !== null && proc.stdin) {
+      proc.stdin.on('error', () => {
         /* the child closed stdin early; the exit code tells the story */
       })
       try {
-        child.stdin.write(spec.stdin)
-        child.stdin.end()
+        proc.stdin.write(spec.stdin)
+        proc.stdin.end()
       } catch {
         /* handled by the close path */
       }
     }
 
     const terminate = (): void => {
-      killProcessTree(child, 'SIGTERM')
-      if (graceTimer) clearTimeout(graceTimer)
-      graceTimer = setTimeout(() => killProcessTree(child, 'SIGKILL'), spec.graceMs ?? DEFAULT_GRACE_MS)
+      if (terminating || settled) return
+      terminating = true
+      killProcessTree(proc, 'SIGTERM')
+      later(graceMs, () => {
+        if (settled) return
+        killProcessTree(proc, 'SIGKILL')
+        later(abandonMs, () => {
+          if (settled) return
+          // Exited but the pipes stayed open: the drain timer owns that case.
+          if (exited !== null) return
+          detach()
+          const tail = redactDiagnostic(stderrTail)
+          const why = `the run did not end ${Math.round((graceMs + abandonMs) / 1000)} s after it was signalled (SIGKILL included) — abandoned so the next wake can run${tail ? `: ${tail}` : ''}`
+          finish(
+            timedOut
+              ? { state: 'timed_out', exitCode: null, detail: `run exceeded its ${Math.round(spec.budgetMs / 1000)} s budget; ${why}` }
+              : { state: 'failed', exitCode: null, detail: `interrupted — ${why}` },
+          )
+        })
+      })
     }
 
-    killTimer = setTimeout(() => {
+    later(spec.budgetMs, () => {
+      // A run that already exited ended inside its budget; only its pipes
+      // are late, and the drain timer owns that.
+      if (exited !== null) return
       timedOut = true
       terminate()
-    }, spec.budgetMs)
+    })
 
     if (spec.signal) {
       onAbort = (): void => {
@@ -172,40 +267,25 @@ export function spawnRun(spec: SpawnRunSpec): Promise<RunOutcome> {
       spec.signal.addEventListener('abort', onAbort, { once: true })
     }
 
-    child.on('error', (err) => {
+    proc.on('error', (err) => {
       finish({ state: 'not_started', exitCode: null, detail: redactDiagnostic(String(err)) })
     })
 
-    child.on('close', (code, signal) => {
-      const tail = redactDiagnostic(stderrTail)
-      if (timedOut) {
-        finish({
-          state: 'timed_out',
-          exitCode: code,
-          detail: `run exceeded its ${Math.round(spec.budgetMs / 1000)} s budget and was killed${tail ? `: ${tail}` : ''}`,
-        })
-        return
-      }
-      if (interrupted) {
-        finish({
-          state: 'failed',
-          exitCode: code,
-          detail: `interrupted — the integration was stopping; the tray stays unread for the next run${tail ? `: ${tail}` : ''}`,
-        })
-        return
-      }
-      if (code === 0) {
-        finish({ state: 'ok', exitCode: 0 })
-        return
-      }
-      const exit = code === null ? `signal ${signal ?? 'unknown'}` : `exit ${code}`
-      if (stdoutBytes === 0) {
-        // Nothing on stdout: the runtime did not get going (missing, refused
-        // to start, auth gate). Whatever it complained about is in the tail.
-        finish({ state: 'not_started', exitCode: code, detail: `${exit} with nothing on stdout${tail ? `: ${tail}` : ''}` })
-        return
-      }
-      finish({ state: 'failed', exitCode: code, detail: `${exit}${tail ? `: ${tail}` : ''}` })
+    proc.on('exit', (code, signal) => {
+      exited = { code, signal }
+      // `close` follows once every holder of the pipes is gone. A process the
+      // run started that still holds them must not hold the worker.
+      later(drainMs, () => {
+        if (settled || exited === null) return
+        // The run is over; what is left of its process group is a leftover.
+        killProcessTree(proc, 'SIGKILL')
+        detach()
+        finish(classify(exited.code, exited.signal, 'a process the run started kept its output open after it exited; it was killed and the run detached from it'))
+      })
+    })
+
+    proc.on('close', (code, signal) => {
+      finish(classify(code, signal, null))
     })
   })
 }

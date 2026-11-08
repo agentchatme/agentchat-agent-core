@@ -72,6 +72,20 @@ import type { IntegrationLastRun } from './status.js'
 
 export const RETRY_LADDER_MS: readonly number[] = [60_000, 300_000, 1_800_000]
 
+/**
+ * How long past its budget a runner may take to return before the worker
+ * stops waiting for it. `spawnRun` always settles well inside this (grace,
+ * drain and abandon are seconds); the deadline is for a runner that does not
+ * keep the "never hangs" promise — the worker must outlive every runner.
+ */
+export const RUNNER_DEADLINE_SLACK_MS = 60_000
+
+/** The tray count before a wake run is one HTTP request; past this it counts as failed (the run starts anyway). */
+export const TRAY_COUNT_DEADLINE_MS = 30_000
+
+/** A runner's `preflight()` (a `--version`, an auth probe) past this counts as not ok. */
+export const PREFLIGHT_DEADLINE_MS = 60_000
+
 /** After the ladder is exhausted: how often the runtime is asked whether it is usable again. */
 export const PREFLIGHT_WATCH_MS = 5 * 60_000
 
@@ -86,6 +100,10 @@ export interface IntegrationInvokerOptions {
   readonly debounceMs?: number
   readonly retryLadderMs?: readonly number[]
   readonly preflightWatchMs?: number
+  /** Past `budgetMs` plus this, a runner that has not returned is abandoned (`timed_out`). */
+  readonly runnerDeadlineSlackMs?: number
+  /** Past this, a tray count that has not answered counts as failed. */
+  readonly trayCountDeadlineMs?: number
   /**
    * Is anything waiting on the tray? Asked before every wake run (never
    * before an invite run). Resolves the answer; rejects when the count could
@@ -125,6 +143,8 @@ export class IntegrationInvoker {
   private readonly budgetMs: number
   private readonly ladder: readonly number[]
   private readonly preflightWatchMs: number
+  private readonly runnerSlackMs: number
+  private readonly countDeadlineMs: number
   private readonly now: () => number
   private readonly _setTimeout: (fn: () => void, ms: number) => TimerHandle
   private readonly _clearTimeout: (handle: TimerHandle) => void
@@ -168,6 +188,8 @@ export class IntegrationInvoker {
     this.budgetMs = options.budgetMs
     this.ladder = options.retryLadderMs ?? RETRY_LADDER_MS
     this.preflightWatchMs = options.preflightWatchMs ?? PREFLIGHT_WATCH_MS
+    this.runnerSlackMs = options.runnerDeadlineSlackMs ?? RUNNER_DEADLINE_SLACK_MS
+    this.countDeadlineMs = options.trayCountDeadlineMs ?? TRAY_COUNT_DEADLINE_MS
     this.now = options.now ?? Date.now
     this._setTimeout = options.setTimeout ?? ((fn, ms) => setTimeout(fn, ms))
     this._clearTimeout = options.clearTimeout ?? ((handle) => clearTimeout(handle))
@@ -301,7 +323,9 @@ export class IntegrationInvoker {
     if (this.trayHasWaiting === null) return true
     let waiting: boolean
     try {
-      waiting = await this.trayHasWaiting()
+      waiting = await this.withDeadline(this.trayHasWaiting(), this.countDeadlineMs, () => {
+        throw new Error(`no answer within ${Math.round(this.countDeadlineMs / 1000)} s`)
+      })
     } catch (err) {
       if (this.stopped) return false
       log.warn(
@@ -360,14 +384,28 @@ export class IntegrationInvoker {
         outcome = { state: 'not_started', exitCode: null, durationMs: this.now() - startedAt, detail: 'interrupted before the runtime was started' }
       } else {
         const prompt = kind === 'invite' ? prompts.invite : prompts.wake
-        outcome = await this.runner.start({
-          kind,
-          prompt,
-          runId,
-          budgetMs: this.budgetMs,
-          signal: controller.signal,
-          ...(invite !== undefined ? { onStarted } : {}),
-        })
+        const deadlineMs = this.budgetMs + this.runnerSlackMs
+        outcome = await this.withDeadline(
+          this.runner.start({
+            kind,
+            prompt,
+            runId,
+            budgetMs: this.budgetMs,
+            signal: controller.signal,
+            ...(invite !== undefined ? { onStarted } : {}),
+          }),
+          deadlineMs,
+          () => {
+            // Ask the runner to stop what it started, and stop waiting for it.
+            controller.abort()
+            return {
+              state: 'timed_out',
+              exitCode: null,
+              durationMs: this.now() - startedAt,
+              detail: `the runner did not return within ${Math.round(deadlineMs / 1000)} s (budget plus ${Math.round(this.runnerSlackMs / 1000)} s) — abandoned so the next wake can run`,
+            }
+          },
+        )
       }
     } catch (err) {
       // The runner contract is "never throws"; a throw is a bug in the runner,
@@ -467,6 +505,39 @@ export class IntegrationInvoker {
     this.coalescer.wakeAfter(delay)
   }
 
+  /**
+   * `work`, or `onTimeout()` once `ms` have passed — whichever comes first. A
+   * late result of `work` is dropped (and a late rejection swallowed).
+   */
+  private withDeadline<T>(work: Promise<T>, ms: number, onTimeout: () => T): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      let done = false
+      const timer = this._setTimeout(() => {
+        if (done) return
+        done = true
+        try {
+          resolve(onTimeout())
+        } catch (err) {
+          reject(err)
+        }
+      }, ms)
+      work.then(
+        (value) => {
+          if (done) return
+          done = true
+          this._clearTimeout(timer)
+          resolve(value)
+        },
+        (err: unknown) => {
+          if (done) return
+          done = true
+          this._clearTimeout(timer)
+          reject(err)
+        },
+      )
+    })
+  }
+
   // ─── preflight watch, after an exhausted ladder ─────────────────────────
 
   private armPreflightWatch(): void {
@@ -490,7 +561,7 @@ export class IntegrationInvoker {
     if (this.stopped) return
     let ok: boolean
     try {
-      ok = (await this.runner.preflight()).ok
+      ok = (await this.withDeadline(this.runner.preflight(), PREFLIGHT_DEADLINE_MS, () => ({ ok: false }))).ok
     } catch {
       ok = false
     }

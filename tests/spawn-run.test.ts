@@ -154,6 +154,84 @@ describe('spawnRun', () => {
   })
 })
 
+describe('spawnRun — never hangs the worker', () => {
+  it('a run that exits while a process it started still holds its output: classified by the exit, the leftover is killed', async () => {
+    // The leftover inherits stdout/stderr and lives on; Node's `close` would
+    // wait for it forever.
+    const pidFile = path.join(dir, 'holder.pid')
+    const child = script(
+      [
+        "const { spawn } = require('node:child_process')",
+        "const g = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: ['ignore', 'inherit', 'inherit'] })",
+        `require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(g.pid))`,
+        "process.stdout.write('done\\n')",
+        'process.exit(0)',
+      ].join('\n'),
+    )
+    const started = Date.now()
+    const outcome = await run(child, { drainMs: 300 })
+    expect(outcome.state).toBe('ok')
+    expect(outcome.detail).toMatch(/kept its output open/)
+    expect(Date.now() - started).toBeLessThan(5_000)
+    const holder = Number(fs.readFileSync(pidFile, 'utf-8'))
+    if (process.platform !== 'win32') await until(() => !alive(holder), 3_000)
+    else {
+      try {
+        process.kill(holder)
+      } catch {
+        /* gone */
+      }
+    }
+  }, 10_000)
+
+  it.skipIf(process.platform === 'win32')(
+    'a process that escaped the group and holds the pipes past SIGKILL: the run is abandoned, never awaited forever',
+    async () => {
+      // `detached: true` makes the grandchild its own group leader, so the
+      // group kill never reaches it, and it holds the run's pipes. The run
+      // itself ignores SIGTERM to force the SIGKILL leg.
+      const pidFile = path.join(dir, 'escaped.pid')
+      const child = script(
+        [
+          "const { spawn } = require('node:child_process')",
+          "const g = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: ['ignore', 'inherit', 'inherit'], detached: true })",
+          `require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(g.pid))`,
+          "process.on('SIGTERM', () => {})",
+          "process.stdout.write('started\\n')",
+          'setInterval(() => {}, 1000)',
+        ].join('\n'),
+      )
+      const started = Date.now()
+      const outcome = await run(child, { budgetMs: 300, graceMs: 200, drainMs: 300, abandonMs: 300 })
+      const escaped = Number(fs.readFileSync(pidFile, 'utf-8'))
+      try {
+        expect(outcome.state).toBe('timed_out')
+        expect(Date.now() - started).toBeLessThan(5_000)
+      } finally {
+        try {
+          process.kill(escaped, 'SIGKILL')
+        } catch {
+          /* gone */
+        }
+      }
+    },
+    10_000,
+  )
+
+  it('a run that exits inside its budget is never reclassified by the budget timer while its pipes drain', async () => {
+    const child = script(
+      [
+        "const { spawn } = require('node:child_process')",
+        "spawn(process.execPath, ['-e', 'setTimeout(() => {}, 3000)'], { stdio: ['ignore', 'inherit', 'inherit'] })",
+        "process.stdout.write('x')",
+        'process.exit(0)',
+      ].join('\n'),
+    )
+    const outcome = await run(child, { budgetMs: 200, drainMs: 600 })
+    expect(outcome.state).toBe('ok')
+  }, 10_000)
+})
+
 describe('redactDiagnostic', () => {
   it('strips terminal escapes and key shapes, and bounds the tail', () => {
     const noisy = '\u001B[31merror\u001B[0m Authorization: Bearer ' + 'A'.repeat(40) + ' ' + 'x'.repeat(2_000)

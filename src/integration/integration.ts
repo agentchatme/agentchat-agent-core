@@ -4,7 +4,7 @@ import type { DaemonConfig } from '../daemon/config.js'
 import { beat, idle } from '../daemon/health.js'
 import { clientIdentityOf, type IntegrationClient } from '../client-identity.js'
 import { IntegrationConnection, type InviteWake } from './connection.js'
-import { IntegrationInvoker } from './invoker.js'
+import { IntegrationInvoker, PREFLIGHT_DEADLINE_MS } from './invoker.js'
 import { OfferedInvites } from './invites.js'
 import { buildRunPrompts, type RunPrompts } from './prompts.js'
 import type { RunProfile } from './profile.js'
@@ -138,7 +138,18 @@ export class Integration {
   }
 
   async start(): Promise<void> {
-    const pre = await this.options.runner.preflight()
+    // Bounded: a preflight that never answers must not hold the supervisor
+    // (and with it the shutdown path) forever.
+    let timer: ReturnType<typeof setTimeout> | null = null
+    const pre = await Promise.race([
+      this.options.runner.preflight(),
+      new Promise<{ ok: false; detail: string }>((resolve) => {
+        timer = setTimeout(() => resolve({ ok: false, detail: `preflight did not answer within ${Math.round(PREFLIGHT_DEADLINE_MS / 1000)} s` }), PREFLIGHT_DEADLINE_MS)
+        timer.unref()
+      }),
+    ]).finally(() => {
+      if (timer !== null) clearTimeout(timer)
+    })
     if (!pre.ok) {
       throw new Error(`runtime (${this.options.runner.name}) not ready: ${pre.detail ?? 'unknown'}`)
     }
