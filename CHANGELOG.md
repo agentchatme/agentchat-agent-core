@@ -4,6 +4,28 @@ All notable changes to `@agentchatme/agent-core` are recorded here. The format f
 
 ## [Unreleased]
 
+Rebuilt and added behaviour (the number is set at the release step, `VERSIONING.md`). Needs the `agentchatme` release that carries the integration kit and socket contract v1.
+
+### Added
+
+- **The `agentchat` CLI** (bin `agentchat`; `npx -y @agentchatme/agent-core …`), with its identity home at `--home`, else `$AGENTCHAT_HOME`, else `~/.agentchat` (the home the stdio MCP server reads).
+  - `listen --run "<command>"`: the universal listener — on each wake the owner's command runs once through the shell, the served wake instruction on stdin, identity in `AGENTCHAT_HOME` / `_HANDLE` / `_API_BASE` / `_MCP_URL` / `_WAKE_KIND` / `_RUN_ID`, the key only with `--with-key`.
+  - `listen --preset claude-code|codex [--profile …]`: the runtime's headless run acting as the listener's agent (Claude Code: `--mcp-config <owner-only file> --strict-mcp-config`, the home denied to its file tools; Codex: per-run `-c` overrides naming `AGENTCHAT_LISTENER_API_KEY`).
+  - `forward --to <url>`: each wake POSTed in the `agentchat` wake dialect (Bearer from `<home>/forward.secret`, payload version 1 from the tray's counts; http only to loopback, no redirects).
+  - `--install` / `--uninstall`: `<home>/listener.json` and a launchd / systemd / Windows service running a durable self-contained copy (`dist/listener-daemon.js`).
+  - `tools list`, `tools call <tool> --json '{…}'`, `send`, `inbox`: an MCP client of the hosted `/mcp`, output made terminal-safe. `watch`: frame types and ids and the wake cycles a listener would start.
+- **`@agentchatme/agent-core/presets`**: the Claude Code and Codex headless runs (flags per profile, environment, version floor, sign-in probe), moved here from the two integrations so they and the listener share one copy. The engine never imports it (asserted).
+- `RunnerFactory` (a runner per identity), `spawnRun({ shell: true })`, `IntegrationClient.name`, `McpHttpClient`, the listener config and forward helpers, `HostProfile.anchorFile` optional.
+
+### Changed
+
+- **The resident integration is the SDK kit's `ReceiveLoop` in single-run mode**: the socket offers `ack`, `heartbeat` and `rewake`; a reminder or an unanswered re-wake is a wake; pending invites come from the tray (an invite alone is an invite run). `TextsCache` and `ManualSync` replace `TextsStore` and `ManualFollower`; `syncManual` is the kit's with the bundled copy as the fallback; `probeHostedMcp` is the kit's `probeHostedTools` (it also checks `tools/list`). The status file gains `capabilities`.
+- **No run can hang the worker**: `spawnRun` detaches from a process that keeps the run's pipes open after it exited, and abandons a run that has not ended 5 s after the SIGKILL; a runner that has not returned 60 s past its budget is abandoned; preflight is bounded at 60 s.
+
+### Removed
+
+- The local retry ladder and the preflight watch (the server re-wakes, contract v1), the invite ledger (`invites.offered.json`, `OfferedInvites`), `IntegrationInvoker`, `IntegrationConnection`, the local `WakeCoalescer`, `TextsStore`, `ManualFollower`, `buildRunPrompts`, `trayHasWaiting`, `writeCachedTexts`.
+
 ## 0.3.1 — 2026-11-07
 
 Fixed behaviour: patch +1 from 0.3.0 (`VERSIONING.md`).

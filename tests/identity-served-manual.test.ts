@@ -6,9 +6,8 @@ import { AgentChatClient, ConnectionError } from 'agentchatme'
 import { createIdentityCommands } from '../src/identity/commands.js'
 import { writeCredentials } from '../src/identity/credentials.js'
 import type { DoctorContext, HostProfile, StatusContext } from '../src/identity/host-profile.js'
-import { writeCachedTexts } from '../src/integration/texts.js'
 import type { ServedManual } from '../src/skill/served-manual.js'
-import { MANUAL_VERSION, mockServedTexts, textsFor } from './helpers/served-texts.js'
+import { MANUAL_VERSION, mockServedTexts, textsFor, writeTextsCacheFile } from './helpers/served-texts.js'
 
 // ─── The identity commands hand the host the manual the texts announce ──────
 //
@@ -127,7 +126,7 @@ describe('status with the server unreachable', () => {
       },
     })
     writeCredentials(home, { api_key: `ac_${'s'.repeat(32)}`, handle: 'probe' })
-    writeCachedTexts(home, 'generic', { ...textsFor('probe'), manual: { url: 'https://agentchat.me/skill.md', version: '9.9.9' } }, new Date())
+    writeTextsCacheFile(home, 'generic', { ...textsFor('probe'), manual: { url: 'https://agentchat.me/skill.md', version: '9.9.9' } }, new Date())
     vi.spyOn(AgentChatClient.prototype, 'getMe').mockRejectedValue(new ConnectionError('fetch failed'))
     capture()
     expect(await commands.runStatus({})).toBe(1)

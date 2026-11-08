@@ -206,7 +206,7 @@ export function spawnRun(spec: SpawnRunSpec): Promise<RunOutcome> {
         try {
           onStarted()
         } catch {
-          /* the callback belongs to the invoker; a failure there is not the run's */
+          /* the callback belongs to the caller; a failure there is not the run's */
         }
       })
     }

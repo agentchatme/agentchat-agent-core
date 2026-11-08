@@ -38,6 +38,10 @@ export interface Tray {
   waiting: number
   truncated?: boolean
   deferred?: number
+  /** The first `muted` cards are muted (they never wake; nothing is owed for them alone). */
+  muted?: number
+  /** Pending invites on the tray (contract v1, D4): ids. */
+  invites?: string[]
 }
 
 export interface ServerDoubleOptions {
@@ -112,11 +116,17 @@ export async function startServerDouble(options: ServerDoubleOptions = {}): Prom
       const limit = Number(url.searchParams.get('limit') ?? '20')
       const cards = Array.from({ length: Math.min(tray.waiting, limit) }, (_, i) => ({
         conversation_id: `conv_${i}`,
+        unread: 1,
+        last_sender: '@peer',
+        ...(i < (tray.muted ?? 0) ? { muted: true } : {}),
         preview: { message_id: `msg_${i}`, sender: '@peer', text: 'A PREVIEW THAT MUST NEVER BE LOGGED', at: new Date().toISOString() },
       }))
       res.end(
         JSON.stringify({
+          version: 1,
           you: '@me',
+          invites: (tray.invites ?? []).map((id) => ({ invite_id: id, group: { id: `grp_${id}`, name: 'A GROUP NAME', member_count: 2 }, invited_by: '@peer', at: new Date().toISOString() })),
+          invites_truncated: false,
           question: 'q',
           categories: [],
           conversations: cards,

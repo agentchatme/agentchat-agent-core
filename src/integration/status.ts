@@ -76,6 +76,8 @@ export interface IntegrationStatus {
   retry_due_at: string | null
   last_error: string | null
   texts: TextsStatus | null
+  /** The socket capabilities the server accepted (`ack`, `heartbeat`, `rewake`); null before a hello, or from an older daemon. */
+  capabilities?: string[] | null
 }
 
 // What is accepted on read: the current shape (version 2, `wakes`) and the
@@ -122,6 +124,7 @@ const StatusSchema = z
     retry_due_at: z.string().nullable(),
     last_error: z.string().nullable(),
     texts: TextsStatusSchema.nullable().default(null),
+    capabilities: z.array(z.string()).nullable().optional(),
   })
   .passthrough()
 
@@ -150,6 +153,7 @@ function normalize(raw: z.infer<typeof StatusSchema>): IntegrationStatus {
     retry_due_at: raw.retry_due_at,
     last_error: raw.last_error,
     texts: raw.texts,
+    capabilities: raw.capabilities ?? null,
   }
 }
 
@@ -229,6 +233,13 @@ export function formatIntegrationStatus(status: IntegrationStatus | null, now = 
     `  wakes: ${status.wakes} (${status.wakes_absorbed} absorbed into a pending run), invites: ${status.invites}`,
     `  runs: ${status.runs_started} started, ${status.runs_ok} ok, ${status.runs_failed} failed, ${status.runs_timed_out} timed out, ${status.runs_not_started} did not start; ${status.runs_skipped_empty} wake(s) found the tray empty (no run)`,
     textsLine(status.texts, now),
+    ...(status.capabilities === null || status.capabilities === undefined
+      ? []
+      : [
+          status.capabilities.includes('rewake')
+            ? '  re-wake: the server wakes this agent again for cards it has not answered (+1 m, +5 m, +30 m, +3 h)'
+            : '  re-wake: not offered by this server — an unanswered card waits for the next message',
+        ]),
     `  profile: ${status.profile}${status.runtime ? ` (${status.runtime})` : ''}`,
   ]
   if (status.last_run) {

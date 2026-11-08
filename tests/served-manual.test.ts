@@ -9,7 +9,6 @@ import { Readable } from 'node:stream'
 import type { AddressInfo } from 'node:net'
 import { MANUAL, manualFrontMatter, manualVersion } from '../src/skill/manual.js'
 import {
-  ManualFollower,
   checkManual,
   describeManualSync,
   readManualVersion,
@@ -307,87 +306,6 @@ describe('syncManual — over a real socket', () => {
     const r = await syncManual({ apiBase: base, path: file, served: served('9.1.0', `${base}/gone.md`) })
     expect(r).toMatchObject({ state: 'kept' })
     expect(r.error).toMatch(/HTTP 404/)
-  })
-})
-
-describe('ManualFollower — the daemon follows the announced version', () => {
-  it('a changed announced version triggers a download; the same version again fetches nothing', async () => {
-    let current = servedText('9.1.0')
-    const f = fakeFetch(() => ok(current))
-    const follower = new ManualFollower({ path: file, apiBase: API, fetch: f })
-    place(servedText('9.0.0'))
-
-    expect(await follower.follow(served('9.1.0'))).toMatchObject({ state: 'updated', version: '9.1.0' })
-    expect(await follower.follow(served('9.1.0'))).toMatchObject({ state: 'current' })
-    expect(f.calls).toHaveLength(1)
-
-    current = servedText('9.2.0')
-    expect(await follower.follow(served('9.2.0'))).toMatchObject({ state: 'updated', previous: '9.1.0', version: '9.2.0' })
-    expect(f.calls).toHaveLength(2)
-    expect(readManualVersion(file)).toBe('9.2.0')
-  })
-
-  it('calls are serialised: two follows at once download once', async () => {
-    let release: (() => void) | null = null
-    const f = fakeFetch(async () => {
-      await new Promise<void>((resolve) => {
-        release = resolve
-      })
-      return ok(servedText('9.1.0'))
-    })
-    const follower = new ManualFollower({ path: file, apiBase: API, fetch: f })
-    const a = follower.follow(served('9.1.0'))
-    const b = follower.follow(served('9.1.0'))
-    await vi.waitFor(() => expect(release).not.toBeNull())
-    release!()
-    expect((await a)?.state).toBe('updated')
-    expect((await b)?.state).toBe('current')
-    expect(f.calls).toHaveLength(1)
-  })
-
-  it('nothing announced: does nothing (the daemon has no texts yet)', async () => {
-    const f = fakeFetch(() => ok('unused'))
-    expect(await new ManualFollower({ path: file, apiBase: API, fetch: f }).follow(null)).toBeNull()
-    expect(f.calls).toEqual([])
-    expect(fs.existsSync(file)).toBe(false)
-  })
-
-  it('a failure is logged once per condition, kept the file, and is tried again on the next follow', async () => {
-    const warn = vi.spyOn(log, 'warn').mockImplementation(() => undefined)
-    const info = vi.spyOn(log, 'info').mockImplementation(() => undefined)
-    place(servedText('9.0.0'))
-    let up = false
-    const f = fakeFetch(() => {
-      if (!up) throw new TypeError('fetch failed', { cause: Object.assign(new Error('x'), { code: 'ENOTFOUND' }) })
-      return ok(servedText('9.1.0'))
-    })
-    const follower = new ManualFollower({ path: file, apiBase: API, fetch: f })
-    await follower.follow(served('9.1.0'))
-    await follower.follow(served('9.1.0'))
-    expect(f.calls).toHaveLength(2)
-    expect(warn).toHaveBeenCalledTimes(1)
-    expect(warn.mock.calls[0]?.[0]).toMatch(/manual 9\.1\.0 announced but not placed \(fetch failed \(ENOTFOUND\)\) — keeping 9\.0\.0 at .*; tried again at the next texts refresh/)
-    expect(readManualVersion(file)).toBe('9.0.0')
-    up = true
-    expect((await follower.follow(served('9.1.0')))?.state).toBe('updated')
-    expect(info.mock.calls.at(-1)?.[0]).toMatch(/^manual 9\.1\.0 downloaded from/)
-  })
-
-  it('stop aborts a download in flight and nothing is written', async () => {
-    const f = fakeFetch(
-      (_url, init) =>
-        new Promise<Response>((_resolve, reject) => {
-          init.signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true })
-        }),
-    )
-    place(servedText('9.0.0'))
-    const follower = new ManualFollower({ path: file, apiBase: API, fetch: f })
-    const pending = follower.follow(served('9.1.0'))
-    await vi.waitFor(() => expect(f.calls).toHaveLength(1))
-    follower.stop()
-    expect((await pending)?.state).toBe('kept')
-    expect(readManualVersion(file)).toBe('9.0.0')
-    expect(await follower.follow(served('9.1.0'))).toBeNull()
   })
 })
 

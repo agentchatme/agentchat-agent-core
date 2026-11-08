@@ -1,6 +1,6 @@
-import { RealtimeClient, type ServerEvent, type WsMessage } from 'agentchatme'
+import { RealtimeClient, integration as kit, type ServerEvent, type WsMessage } from 'agentchatme'
 import { clientIdentityOf, normalizeHandle, resolveIdentity, type SocketState } from '../index.js'
-import { WakeCoalescer, DEFAULT_WAKE_DEBOUNCE_MS, socketStateOf, wsBaseFor } from '../daemon-entry.js'
+import { socketStateOf, wsBaseFor } from '../daemon-entry.js'
 import { cliClient, invocation } from './home.js'
 import { terminalSafe } from './terminal.js'
 
@@ -26,6 +26,7 @@ const EVENTS: readonly ServerEvent[] = [
   'group.invite.received',
   'group.deleted',
   'wake',
+  'heartbeat',
 ]
 
 export interface WatchIo {
@@ -65,11 +66,17 @@ export function describeFrame(type: string, payload: Record<string, unknown>, se
       wake = !own
       break
     }
-    case 'wake':
+    case 'wake': {
       put('reason', ['reason'])
       put('conv', ['conversation_id'])
+      // A re-wake for unanswered cards names the conversations; their count is enough here.
+      const ids = payload['conversation_ids']
+      if (Array.isArray(ids)) facts['conversations'] = String(ids.length)
       put('step', ['step'])
       wake = true
+      break
+    }
+    case 'heartbeat':
       break
     case 'group.invite.received':
       put('invite', ['invite_id', 'id'])
@@ -107,9 +114,9 @@ export async function runWatch(home: string, opts: { json?: boolean; seconds?: s
   }
 
   let frames = 0
-  const coalescer = new WakeCoalescer({
-    debounceMs: DEFAULT_WAKE_DEBOUNCE_MS,
-    onFire: () => {
+  // The kit's coalescer, as a listener's receive loop uses it: one cycle per burst.
+  const coalescer = new kit.WakeCoalescer({
+    onCycle: () => {
       emit('cycle', `→ wake cycle: a listener would count the tray now and start one run if it holds anything (${frames} signal(s) coalesced)`, { signals: frames })
       frames = 0
     },
@@ -126,6 +133,7 @@ export async function runWatch(home: string, opts: { json?: boolean; seconds?: s
     clientIdentity: clientIdentityOf(cliClient()),
     ackOnReceipt: true,
     reconnect: true,
+    capabilities: { heartbeat: true, rewake: true },
   })
   rt.on('state', (next) => {
     const word = socketStateOf(next, state)
@@ -133,7 +141,8 @@ export async function runWatch(home: string, opts: { json?: boolean; seconds?: s
     state = word
   })
   rt.onConnect(() => {
-    emit('ready', `hello.ok as @${self} — acks ${rt.ackNegotiated ? 'on receipt' : 'not negotiated'}`, { ack: rt.ackNegotiated })
+    const caps = [...rt.capabilities].sort()
+    emit('ready', `hello.ok as @${self} — capabilities ${caps.length > 0 ? caps.join(', ') : 'none (a legacy server)'}`, { capabilities: caps })
     // A connect is a wake for a listener: it catches a backlog no frame announced.
     wakeSignal()
   })

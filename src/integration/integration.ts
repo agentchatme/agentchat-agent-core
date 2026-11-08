@@ -1,53 +1,62 @@
-import { AgentChatClient } from 'agentchatme'
+import * as crypto from 'node:crypto'
+import { AgentChatClient, RealtimeClient, integration as kit } from 'agentchatme'
 import { log } from '../util/log.js'
 import type { DaemonConfig } from '../daemon/config.js'
 import { beat, idle } from '../daemon/health.js'
 import { clientIdentityOf, type IntegrationClient } from '../client-identity.js'
-import { IntegrationConnection, type InviteWake } from './connection.js'
-import { IntegrationInvoker, PREFLIGHT_DEADLINE_MS } from './invoker.js'
-import { OfferedInvites } from './invites.js'
-import { buildRunPrompts, type RunPrompts } from './prompts.js'
 import type { RunProfile } from './profile.js'
-import type { RunRunner } from './runner.js'
-import { writeIntegrationStatus, type IntegrationStatus, type SocketState } from './status.js'
-import { TextsStore } from './texts.js'
-import { ManualFollower, type ManualFetch } from '../skill/served-manual.js'
-import { trayHasWaiting } from './tray.js'
+import type { RunKind, RunOutcome, RunRunner } from './runner.js'
+import { writeIntegrationStatus, type IntegrationLastRun, type IntegrationStatus, type SocketState } from './status.js'
+import { blockedDetail, socketStateOf } from './socket-state.js'
+import { textsCachePath } from './texts.js'
+import { MANUAL } from '../skill/manual.js'
+import { describeManualSync, type ManualFetch } from '../skill/served-manual.js'
 
-// ─── The integration: a connection, an invoker, a runner ────────────────────
+// ─── The integration: the SDK kit's receive loop, and one runtime's runner ──
 //
-// Everything it knows about the agent arrives in `DaemonConfig`; everything it
-// knows about the coding agent arrives as a `RunRunner`. It cannot name a
-// host, so it cannot act on the wrong one.
+// Everything that talks to AgentChat is the SDK's integration kit (`import {
+// integration } from 'agentchatme'`), written once for every runtime:
 //
-// A WAKE IS NOT A RUN. Every wake — a `message.new` frame, a `wake` frame, the
-// connect-time catch-up, a ladder re-wake — goes through the invoker, which
-// reads one COUNT before it starts a run (`trayHasWaiting`: `GET /v1/inbox?
-// limit=1` through the SDK, never a card, never a body, marks nothing read)
-// and starts none when the tray is empty. That single guard is what makes
-// reconnects cheap: sleep/wake, Wi-Fi roaming and every server deploy
-// reconnect the whole fleet, and a reconnect with nothing unread costs a
-// count, not a run.
+//   * the socket — `ackOnReceipt` (delivered = this machine received it) with
+//     the `ack`, `heartbeat` and `rewake` capabilities, never reading a body;
+//   * the wakes — a `message.new` that is not this agent's own echo, a `wake`
+//     frame (a reminder, or the server re-waking unanswered cards), a group
+//     invite, every accepted hello — coalesced into one cycle per burst, one
+//     cycle at a time (`WakeCoalescer`);
+//   * the cycle in SINGLE-RUN mode (`ReceiveLoop`): read the tray; nothing
+//     owed (no cards, only muted ones, no pending invite) starts nothing; a
+//     tray that cannot be read is not an empty tray, and the run starts
+//     anyway; otherwise ONE run with the served wake instruction (and the
+//     invite prompt when invites wait). The run reads the tray and records its
+//     own verdicts; nothing is recorded on its behalf;
+//   * the served texts (`TextsCache`, the last good copy kept in the identity
+//     home) and the manual they announce (`ManualSync`).
 //
-// On `hello.ok` the integration therefore simply wakes once (catching a
-// backlog no frame announced; it coalesces with whatever the server re-offers
-// after the hello) and reads the pending group invites (`GET
-// /v1/groups/invites` through the SDK): the server pushes an invite live only
-// and never re-offers it, so an invite that arrived while the laptop was
-// closed is surfaced here. Deduplicated downstream against the invites
-// already offered from this machine. A failed invite read is logged, never
-// fatal.
+// There is no retry ladder here, and no invite ledger: the server re-wakes
+// unanswered cards on its own durable ladder and shows pending invites on the
+// tray (contract v1, D3/D4), so a run that could not finish leaves the cards
+// where they are and the next wake finds them.
 //
-// The texts a run starts with are the server's (`GET /v1/texts`), fetched at
-// start, refreshed daily, cached in the identity home for an offline start.
-// The same texts announce the current manual; with a `manualPath` the skill
-// file follows it on that cadence (`ManualFollower`: a download only when the
-// announced version is not the one on disk, the old file kept on any failure).
+// What stays here is this package's own: the runner seam (how a runtime's run
+// is started is the integration's — `RunRunner`), the one pointer line a run
+// prompt ends with, a deadline on every run (a runner that never returns must
+// not hold the loop), and the status file `status` and `doctor` read.
 
 const HEARTBEAT_MS = 30_000
 const STATUS_MS = 30_000
-/** HTTP calls the daemon makes are counts and texts; none deserves a long wait or the SDK's retry ramp. */
+/** HTTP calls the loop makes are the tray and the texts; none deserves a long wait or a retry ramp. */
 const HTTP_TIMEOUT_MS = 10_000
+
+/**
+ * How long past its budget a runner may take to return before the loop stops
+ * waiting for it. `spawnRun` always settles well inside this (grace, drain and
+ * abandon are seconds); the deadline is for a runner that does not keep the
+ * "never hangs" promise — the loop must outlive every runner.
+ */
+export const RUNNER_DEADLINE_SLACK_MS = 60_000
+
+/** A runner's `preflight()` (a `--version`, an auth probe) past this counts as not ok. */
+export const PREFLIGHT_DEADLINE_MS = 60_000
 
 export interface IntegrationOptions {
   readonly cfg: DaemonConfig
@@ -56,113 +65,176 @@ export interface IntegrationOptions {
   readonly client: IntegrationClient
   /** The one pointer line a run prompt ends with (`manualPointer(...)`). */
   readonly manualPointer: string
-  /** The skill file that follows the served manual (`<skills dir>/agentchat/SKILL.md`); absent, the daemon leaves the manual to the CLI. */
+  /** The skill file that follows the served manual (`<skills dir>/agentchat/SKILL.md`); absent, the manual is left to the CLI. */
   readonly manualPath?: string
   /** Injectable for tests; the manual download's `fetch`. */
   readonly manualFetch?: ManualFetch
   readonly profile: RunProfile
   readonly budgetMs: number
-  /** Injectable for tests; defaults to a real connection on the SDK socket. */
-  readonly connection?: IntegrationConnection
+  /** Injectable for tests; past `budgetMs` plus this a runner that has not returned is abandoned. */
+  readonly runnerDeadlineSlackMs?: number
   /** Injectable for tests; defaults to an SDK client for `cfg`. */
   readonly api?: AgentChatClient
-  /** Injectable for tests; defaults to a store on `api` and the identity home. */
-  readonly texts?: TextsStore
+  /** Injectable for tests: the socket (built with `ackOnReceipt` and the v1 capabilities otherwise). */
+  readonly realtime?: RealtimeClient
+  /** Injectable for tests: the coalescing window. */
+  readonly quietMs?: number
+  readonly maxMs?: number
+}
+
+/** `work`, or `onTimeout()` once `ms` have passed — whichever first. A late result is dropped. */
+function withDeadline<T>(work: Promise<T>, ms: number, onTimeout: () => T): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    let done = false
+    const timer = setTimeout(() => {
+      if (done) return
+      done = true
+      try {
+        resolve(onTimeout())
+      } catch (err) {
+        reject(err)
+      }
+    }, ms)
+    timer.unref?.()
+    work.then(
+      (value) => {
+        if (done) return
+        done = true
+        clearTimeout(timer)
+        resolve(value)
+      },
+      (err: unknown) => {
+        if (done) return
+        done = true
+        clearTimeout(timer)
+        reject(err)
+      },
+    )
+  })
 }
 
 export class Integration {
   private readonly api: AgentChatClient
-  private readonly connection: IntegrationConnection
-  private readonly texts: TextsStore
-  private readonly manual: ManualFollower | null
-  private readonly invoker: IntegrationInvoker
+  private readonly realtime: RealtimeClient
+  private readonly texts: kit.TextsCache
+  private readonly manual: kit.ManualSync | null
+  private readonly loop: kit.ReceiveLoop
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null
   private statusTimer: ReturnType<typeof setInterval> | null = null
+  private socket: SocketState = 'idle'
   private lastError: string | null = null
   private stopping = false
+  private stopped: Promise<void> | null = null
+
+  private invites = 0
+  private runsStarted = 0
+  private runsOk = 0
+  private runsFailed = 0
+  private runsTimedOut = 0
+  private runsNotStarted = 0
+  private runsSkippedEmpty = 0
+  private lastRun: IntegrationLastRun | null = null
 
   constructor(private readonly options: IntegrationOptions) {
     const { cfg, client } = options
+    const identity = clientIdentityOf(client)
     this.api =
       options.api ??
-      new AgentChatClient({
-        apiKey: cfg.apiKey,
-        baseUrl: cfg.apiBase,
-        clientIdentity: clientIdentityOf(client),
-        timeoutMs: HTTP_TIMEOUT_MS,
-        retry: { maxRetries: 0, baseDelayMs: 0, maxDelayMs: 0 },
-      })
+      new AgentChatClient({ apiKey: cfg.apiKey, baseUrl: cfg.apiBase, clientIdentity: identity, timeoutMs: HTTP_TIMEOUT_MS, retry: { maxRetries: 0, baseDelayMs: 0, maxDelayMs: 0 } })
+    this.texts = new kit.TextsCache({
+      client: this.api,
+      runtime: client.runtime,
+      filePath: textsCachePath(cfg.home),
+      onError: (err) => log.warn(err.message),
+    })
+    this.texts.onChange((texts, source) => {
+      log.info(`texts ${source === 'server' ? 'fetched' : 'read from the cache'} for ${client.runtime} (texts v${texts.version}, manual ${texts.manual.version})`)
+      this.writeStatus()
+    })
     this.manual =
       options.manualPath === undefined
         ? null
-        : new ManualFollower({ path: options.manualPath, apiBase: cfg.apiBase, ...(options.manualFetch !== undefined ? { fetch: options.manualFetch } : {}) })
-    this.texts =
-      options.texts ??
-      new TextsStore({ home: cfg.home, runtime: client.runtime, client: this.api, onChange: () => this.textsChanged() })
-    this.invoker = new IntegrationInvoker({
-      runner: options.runner,
-      prompts: () => this.runPrompts(),
-      budgetMs: options.budgetMs,
-      onChange: () => this.writeStatus(),
-      trayHasWaiting: () => trayHasWaiting(this.api),
-      offeredInvites: OfferedInvites.load(cfg.home),
-    })
-    this.connection =
-      options.connection ??
-      new IntegrationConnection({ apiKey: cfg.apiKey, wsBase: cfg.wsBase, selfHandle: cfg.handle, client })
-    this.connection.on('wake', (wake) => this.invoker.wake(wake.source))
-    this.connection.on('invite', (invite) => {
-      this.invoker.invite(invite)
-    })
-    this.connection.on('ready', () => {
-      void this.catchUp()
-    })
-    this.connection.on('state', (state) => {
-      if (state === 'ready') {
+        : new kit.ManualSync({
+            texts: this.texts,
+            targetPath: options.manualPath,
+            fallback: MANUAL,
+            ...(options.manualFetch !== undefined ? { fetch: options.manualFetch } : {}),
+            onResult: (result) => {
+              const line = `manual: ${describeManualSync({ ...result, source: result.source === 'fallback' ? 'bundled' : result.source })}`
+              if (result.upToDate === false || result.state === 'failed') log.warn(line)
+              else if (result.written) log.info(line)
+            },
+          })
+    // Built here rather than by the loop, so the status file can follow the
+    // socket's own words and a refused key reads `blocked` with its reason.
+    // No REST drain client: the server re-offers unacked envelopes over the
+    // socket right after the hello, and nothing here ever needs a body.
+    this.realtime =
+      options.realtime ??
+      new RealtimeClient({
+        apiKey: cfg.apiKey,
+        baseUrl: cfg.wsBase,
+        clientIdentity: identity,
+        ackOnReceipt: true,
+        reconnect: true,
+        capabilities: { heartbeat: true, rewake: true },
+      })
+    this.realtime.on('state', (next) => {
+      const word = socketStateOf(next, this.socket)
+      if (word === this.socket) return
+      this.socket = word
+      if (word === 'ready') {
         beat(cfg.home)
         // An accepted hello lifts a refusal: the key works again.
         this.lastError = null
+        log.info(`socket ready (hello.ok) — acks ${this.realtime.ackNegotiated ? 'on receipt' : 'not negotiated by this server'}; ${this.realtime.capabilities.has('rewake') ? 'the server re-wakes unanswered cards' : 'this server does not re-wake unanswered cards'}`)
       } else {
         idle(cfg.home)
+        if (word === 'reconnecting') log.info('socket reconnecting — the SDK backs off and retries; it never gives up')
       }
       this.writeStatus()
     })
-    this.connection.on('blocked', (detail) => {
-      // A refused key is a state to show, not to die from: the SDK's client
-      // stays up in `blocked` and tries a fresh hello every 10–15 min; `status`
-      // reads `socket blocked` with this line as the last error until one is
-      // accepted, or the user signs in with another key (a new connection).
-      this.lastError = detail
+    this.realtime.on('blocked', (info) => {
+      // A refused key is a state to show, not to die from: the SDK stays
+      // `blocked` and tries a fresh hello every 10–15 min.
+      this.lastError = blockedDetail(info)
+      log.error(`socket blocked (auth): ${this.lastError}`)
       this.writeStatus()
+    })
+    this.loop = new kit.ReceiveLoop({
+      client: this.api,
+      texts: this.texts,
+      mode: 'singleRun',
+      socket: this.realtime,
+      handle: cfg.handle,
+      startRun: (request) => this.startRun(request),
+      onEvent: (event) => this.onEvent(event),
+      ...(options.quietMs !== undefined ? { quietMs: options.quietMs } : {}),
+      ...(options.maxMs !== undefined ? { maxMs: options.maxMs } : {}),
     })
   }
 
   async start(): Promise<void> {
     // Bounded: a preflight that never answers must not hold the supervisor
     // (and with it the shutdown path) forever.
-    let timer: ReturnType<typeof setTimeout> | null = null
-    const pre = await Promise.race([
-      this.options.runner.preflight(),
-      new Promise<{ ok: false; detail: string }>((resolve) => {
-        timer = setTimeout(() => resolve({ ok: false, detail: `preflight did not answer within ${Math.round(PREFLIGHT_DEADLINE_MS / 1000)} s` }), PREFLIGHT_DEADLINE_MS)
-        timer.unref()
-      }),
-    ]).finally(() => {
-      if (timer !== null) clearTimeout(timer)
-    })
-    if (!pre.ok) {
-      throw new Error(`runtime (${this.options.runner.name}) not ready: ${pre.detail ?? 'unknown'}`)
-    }
+    const pre = await withDeadline(this.options.runner.preflight(), PREFLIGHT_DEADLINE_MS, () => ({
+      ok: false,
+      detail: `preflight did not answer within ${Math.round(PREFLIGHT_DEADLINE_MS / 1000)} s`,
+    }))
+    if (!pre.ok) throw new Error(`runtime (${this.options.runner.name}) not ready: ${pre.detail ?? 'unknown'}`)
     log.info(
       `integration up as @${this.options.cfg.handle} via ${this.options.runner.name} (${this.options.client.runtime} ${this.options.client.version}), profile ${this.options.profile}; fetching the served texts, then holding the socket`,
     )
-    // The start-time fetch settles before the socket opens, so the first wake
-    // has the freshest text; a failure logs once and the cache (if any) serves.
+    // The texts settle before the socket opens, so the first wake has the
+    // freshest text; a failure is logged and the cached copy (if any) serves.
     await this.texts.start()
     if (this.stopping) return
-    this.connection.start()
+    // The skill file follows the announced manual from now on; a download
+    // never holds up the socket.
+    void this.manual?.start()
+    await this.loop.start()
     this.heartbeatTimer = setInterval(() => {
-      if (this.connection.connected) beat(this.options.cfg.home)
+      if (this.socket === 'ready') beat(this.options.cfg.home)
     }, HEARTBEAT_MS)
     this.heartbeatTimer.unref()
     this.statusTimer = setInterval(() => this.writeStatus(), STATUS_MS)
@@ -171,8 +243,8 @@ export class Integration {
   }
 
   /**
-   * Stop holding the socket and interrupt a run in flight (its process group
-   * is SIGTERMed by the runner). Synchronous; `settled()` or `stopAndWait()`
+   * Stop holding the socket and interrupt a run in flight (its signal aborts;
+   * the runner SIGTERMs its process group). `settled()` / `stopAndWait()`
    * tell when the run has actually ended.
    */
   stop(): void {
@@ -180,26 +252,21 @@ export class Integration {
     this.stopping = true
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer)
     if (this.statusTimer) clearInterval(this.statusTimer)
-    this.invoker.stop()
+    this.stopped = this.loop.stop()
     this.texts.stop()
     this.manual?.stop()
-    this.connection.stop()
+    this.socket = 'closed'
     idle(this.options.cfg.home)
     this.writeStatus()
   }
 
-  /**
-   * `stop()`, then wait up to `graceMs` for the interrupted run to end. What a
-   * shutdown awaits before the process exits, so a launchd/systemd stop
-   * reaches the child and the restarted daemon does not find a run still
-   * going. Resolves true when nothing is running any more.
-   */
+  /** `stop()`, then wait up to `graceMs` for the interrupted run to end. Resolves true when nothing runs any more. */
   async stopAndWait(graceMs: number): Promise<boolean> {
     this.stop()
     let timer: ReturnType<typeof setTimeout> | null = null
     try {
       return await Promise.race([
-        this.invoker.settled().then(() => true),
+        (this.stopped ?? Promise.resolve()).then(() => true),
         new Promise<boolean>((resolve) => {
           timer = setTimeout(() => resolve(false), graceMs)
         }),
@@ -209,16 +276,18 @@ export class Integration {
     }
   }
 
-  /** A run in flight finishes on its own; this resolves when it has. */
+  /** Resolves when the running cycle (and its run) has finished. */
   settled(): Promise<void> {
-    return this.invoker.settled()
+    return this.loop.settled()
+  }
+
+  /** A wake heard outside the socket (a test, a webhook the integration received). */
+  wake(): void {
+    this.loop.wake()
   }
 
   snapshot(): IntegrationStatus {
-    const c = this.invoker.counters()
-    // Stopping reads `closed` whatever the socket was doing; a refusal stays
-    // visible to `status` and `doctor` as the last error.
-    const socket: SocketState = this.stopping ? 'closed' : this.connection.state
+    const status = this.loop.status()
     const texts = this.texts.current()
     return {
       version: 2,
@@ -227,19 +296,20 @@ export class Integration {
       runtime: this.options.runner.name,
       handle: this.options.cfg.handle,
       profile: this.options.profile,
-      socket,
-      wakes: c.wakes,
-      wakes_absorbed: c.absorbed,
-      invites: c.invites,
-      runs_started: c.runsStarted,
-      runs_ok: c.runsOk,
-      runs_failed: c.runsFailed,
-      runs_timed_out: c.runsTimedOut,
-      runs_not_started: c.runsNotStarted,
-      runs_skipped_empty: c.runsSkippedEmpty,
-      last_run: c.lastRun,
-      retry_rung: c.retryRung,
-      retry_due_at: c.retryDueAt === null ? null : new Date(c.retryDueAt).toISOString(),
+      socket: this.stopping ? 'closed' : this.socket,
+      wakes: status.coalescer.wakes,
+      wakes_absorbed: status.coalescer.absorbed,
+      invites: this.invites,
+      runs_started: this.runsStarted,
+      runs_ok: this.runsOk,
+      runs_failed: this.runsFailed,
+      runs_timed_out: this.runsTimedOut,
+      runs_not_started: this.runsNotStarted,
+      runs_skipped_empty: this.runsSkippedEmpty,
+      last_run: this.lastRun,
+      // No local retry ladder (the server re-wakes, D3); kept for older readers.
+      retry_rung: 0,
+      retry_due_at: null,
       last_error: this.lastError,
       texts: {
         source: this.texts.source,
@@ -247,51 +317,116 @@ export class Integration {
         version: texts?.version ?? null,
         manual_version: texts?.manual.version ?? null,
       },
+      capabilities: status.socket === null ? null : status.socket.capabilities,
     }
   }
 
-  /**
-   * After every change in the texts in hand: the status file, and the skill
-   * file brought to the manual they announce. Exposed for an injected store's
-   * `onChange` (tests); the store this class builds calls it itself.
-   */
-  textsChanged(): void {
+  // ─── the one run ────────────────────────────────────────────────────────
+
+  private async startRun(request: kit.RunRequest): Promise<kit.RunEnd> {
+    // Invites alone: the served invite prompt. Anything else: a wake run.
+    const kind: RunKind = request.cards === 0 && (request.invites ?? 0) > 0 ? 'invite' : 'wake'
+    const runId = crypto.randomUUID()
+    const startedAt = Date.now()
+    const budgetMs = this.options.budgetMs
+    const slackMs = this.options.runnerDeadlineSlackMs ?? RUNNER_DEADLINE_SLACK_MS
+    this.runsStarted += 1
     this.writeStatus()
-    if (this.manual !== null && !this.stopping) void this.manual.follow(this.texts.current()?.manual ?? null)
-  }
+    log.info(`run start kind=${kind} id=${runId} budget=${Math.round(budgetMs / 1000)}s (tray: ${request.cards ?? '?'} card(s), ${request.invites ?? '?'} invite(s))`)
 
-  /** The served texts plus the pointer line, or null while no text is in hand. */
-  private async runPrompts(): Promise<RunPrompts | null> {
-    const texts = await this.texts.ensure()
-    return texts === null ? null : buildRunPrompts(texts, this.options.manualPointer)
-  }
-
-  /**
-   * The connect-time catch-up: one wake (the invoker counts the tray before
-   * any run, so an empty tray costs a count, not a run) and the pending invites.
-   */
-  private async catchUp(): Promise<void> {
-    if (this.stopping) return
-    log.info('wake — connect (a run starts only if the tray has something unread)')
-    this.invoker.wake('connect')
+    // The run's own stop signal: the loop stopping, or the deadline below.
+    const controller = new AbortController()
+    const onAbort = (): void => controller.abort()
+    if (request.signal.aborted) controller.abort()
+    else request.signal.addEventListener('abort', onAbort, { once: true })
+    let outcome: RunOutcome
     try {
-      const invites = await this.api.listGroupInvites()
-      if (this.stopping) return
-      let surfaced = 0
-      for (const row of invites) {
-        const invite: InviteWake = {
-          inviteId: row.id,
-          groupId: row.group_id ?? null,
-          groupName: row.group_name ?? null,
-          inviterHandle: row.inviter_handle ?? null,
-        }
-        if (this.invoker.invite(invite)) surfaced += 1
-      }
-      if (surfaced > 0) log.info(`wake — ${surfaced} pending group invite(s) surfaced on connect`)
+      outcome = await withDeadline(
+        this.options.runner.start({
+          kind,
+          prompt: `${request.prompt}\n\n${this.options.manualPointer}`,
+          runId,
+          budgetMs,
+          signal: controller.signal,
+        }),
+        budgetMs + slackMs,
+        () => {
+          controller.abort()
+          return {
+            state: 'timed_out',
+            exitCode: null,
+            durationMs: Date.now() - startedAt,
+            detail: `the runner did not return within ${Math.round((budgetMs + slackMs) / 1000)} s (budget plus ${Math.round(slackMs / 1000)} s) — abandoned so the next wake can run`,
+          }
+        },
+      )
     } catch (err) {
-      log.warn(`connect-time invite list failed (${err instanceof Error ? err.message : String(err)}) — live invite frames are unaffected`)
+      // The runner contract is "never throws"; a throw is a bug in the runner.
+      outcome = { state: 'not_started', exitCode: null, durationMs: Date.now() - startedAt, detail: `runner threw: ${err instanceof Error ? err.message : String(err)}` }
+    } finally {
+      request.signal.removeEventListener('abort', onAbort)
+    }
+
+    this.lastRun = {
+      kind,
+      started_at: new Date(startedAt).toISOString(),
+      ended_at: new Date().toISOString(),
+      state: outcome.state,
+      exit_code: outcome.exitCode,
+      duration_ms: outcome.durationMs,
+      detail: outcome.detail ?? null,
+    }
+    switch (outcome.state) {
+      case 'ok':
+        this.runsOk += 1
+        log.info(`run ok kind=${kind} id=${runId} ${Math.round(outcome.durationMs / 1000)}s (output discarded; any send was the agent's own hosted-tool call)`)
+        break
+      case 'failed':
+        this.runsFailed += 1
+        break
+      case 'timed_out':
+        this.runsTimedOut += 1
+        break
+      case 'not_started':
+        this.runsNotStarted += 1
+        break
+    }
+    if (outcome.state !== 'ok') {
+      log.warn(`run ${outcome.state} kind=${kind} id=${runId}${outcome.detail ? `: ${outcome.detail}` : ''} — the cards stay on the tray; the next wake (or the server's re-wake) finds them`)
     }
     this.writeStatus()
+    return outcome.state === 'ok'
+      ? { status: 'completed' }
+      : { status: outcome.state === 'not_started' ? 'not_started' : 'failed', ...(outcome.detail !== undefined ? { detail: outcome.detail } : {}) }
+  }
+
+  private onEvent(event: kit.ReceiveLoopEvent): void {
+    switch (event.type) {
+      case 'wake':
+        if (event.source === 'invite') this.invites += 1
+        log.info(`wake — ${event.source}${event.conversationId ? ` conv=${event.conversationId}` : ''}`)
+        break
+      case 'echo':
+        log.debug(`own echo${event.conversationId ? ` in ${event.conversationId}` : ''} — not a wake`)
+        break
+      case 'cycle': {
+        const { outcome, cards, invites } = event.summary
+        if (outcome === 'empty' || outcome === 'nothing_owed') {
+          this.runsSkippedEmpty += 1
+          log.info(`wake: ${outcome === 'empty' ? 'the tray is empty' : 'nothing owed (muted cards only)'} — no run (${cards} card(s), ${invites} invite(s))`)
+        } else if (outcome === 'texts_missing') {
+          this.runsNotStarted += 1
+          log.warn('no served texts in hand: GET /v1/texts has not answered yet and nothing is cached in the identity home — no run this time')
+        }
+        this.writeStatus()
+        break
+      }
+      case 'error':
+        if (!this.stopping) log.warn(`receive loop: ${event.error.message}`)
+        break
+      default:
+        break
+    }
   }
 
   private writeStatus(): void {

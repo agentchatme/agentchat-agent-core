@@ -7,11 +7,12 @@
 // one genuinely host-specific piece, so each integration implements this and
 // the engine never names a runtime.
 
+/** `invite` when the tray held only pending invites (the served invite prompt); `wake` otherwise. */
 export type RunKind = 'wake' | 'invite'
 
 export interface RunRequest {
   readonly kind: RunKind
-  /** The prompt for this kind of run: the served text, then the manual pointer (`buildRunPrompts`). */
+  /** The prompt for this kind of run: the served text (the kit's receive loop picks it), then the manual pointer. */
   readonly prompt: string
   /** Unique per run; for logs and for runtimes that want a session name. */
   readonly runId: string
@@ -27,11 +28,9 @@ export interface RunRequest {
   readonly signal?: AbortSignal
   /**
    * Called once, as soon as the runtime's process has been started. The
-   * invoker records a group invite as offered at this moment — not when the
-   * run ends — so a run cut short by a shutdown or a crash still counts as
-   * the invite's one offer from this machine. A runner built on `spawnRun`
-   * passes it through; a runner that cannot tell may leave it uncalled, and
-   * the invoker then records the offer when the run ends instead.
+   * engine no longer needs it (pending invites are on the tray, so nothing
+   * is recorded locally); kept so a caller can observe the start. A runner
+   * built on `spawnRun` passes it through.
    */
   readonly onStarted?: () => void
 }
@@ -42,7 +41,8 @@ export interface RunRequest {
  * all of which print their complaint on stderr and quit; stderr does not
  * count as output). `failed` — it produced output and exited non-zero, or was
  * interrupted. `timed_out` — it ran past its budget and was killed. `ok` —
- * exit 0. Anything but `ok` schedules the retry ladder.
+ * exit 0. Anything but `ok` leaves the cards on the tray: there is no local retry —
+ * the server re-wakes an agent for cards it has not answered (contract v1, D3).
  */
 export type RunOutcomeState = 'ok' | 'failed' | 'timed_out' | 'not_started'
 
@@ -64,9 +64,8 @@ export interface RunRunner {
   readonly name: string
   /**
    * Is the runtime usable right now (binary present, signed in)? Called
-   * before the socket is held, and — after the retry ladder is exhausted —
-   * periodically, so a runtime that comes back (the user signs in again)
-   * earns one re-wake without waiting for the next peer.
+   * before the socket is held: an integration whose runtime is not usable
+   * holds no socket, and the supervisor asks again with a backoff.
    */
   preflight(): Promise<RunPreflight>
   /** Start one run and wait for it. Never throws — returns an outcome. */

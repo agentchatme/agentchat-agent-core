@@ -21,33 +21,32 @@
 // An integration holds only runtime code (docs/architecture.md, rule 4): the
 // lifecycle, how to start a turn, config, logs. Everything that talks to
 // AgentChat is the SDK's — the socket that acks on receipt, the tray, the
-// served texts — and every text an agent sees is the server's, fetched and
-// placed, never copied (rule 3). What stays here is what must NOT drift
-// between integrations: the identity flows, the credential format, the wake
-// coalescer and retry ladder, the texts cache, the manual's placement (the
-// served one, kept current; the bundled copy only as a fallback), the service
-// plumbing. What belongs to each integration: where
-// its home is, which file its anchor lives in, how to start one headless run
-// of its runtime, and where its runtime keeps skills.
+// served texts, and the integration kit (`integration` in `agentchatme`: the
+// receive loop, wake coalescing, the texts cache, the manual sync) — and every
+// text an agent sees is the server's, fetched and placed, never copied (rule
+// 3). What stays here is what must NOT drift between this package's
+// integrations and is not the kit's: the identity flows, the credential
+// format, the resident supervisor and the runner seam, the status file, the
+// manual's bundled fallback, the service plumbing — and the `agentchat` CLI
+// (`src/cli`) with the presets it and the integrations share (`src/presets`).
+// What belongs to each integration: where its home is, which file its anchor
+// lives in, and where its runtime keeps skills.
 
 export { clientIdentityOf, clientHeadersOf, clientNameOf, type IntegrationClient } from './client-identity.js'
 export { VERSION } from './version.js'
 
-// Counts on the tray (through the SDK), for `status` and the wake guard.
-export { traySummary, trayHasWaiting, type TraySummary, type TrayClient } from './integration/tray.js'
+// Counts on the tray (through the SDK), for `status`.
+export { traySummary, type TraySummary, type TrayClient } from './integration/tray.js'
 
-// The served texts: fetched, cached in the identity home, never copied.
+// The served texts for a CLI command: one fetch, the identity-home copy as
+// fallback (the resident integration holds the SDK kit's TextsCache).
 export {
   loadTexts,
   fetchServedTexts,
   fetchIdentityLine,
   readCachedTexts,
-  writeCachedTexts,
   textsCachePath,
   TEXTS_CACHE_FILE,
-  TEXTS_REFRESH_MS,
-  TEXTS_RETRY_MS,
-  TextsStore,
   type CachedTexts,
   type FetchIdentityLineOptions,
   type FetchServedTextsOptions,
@@ -55,9 +54,7 @@ export {
   type LoadTextsOptions,
   type TextsClient,
   type TextsSource,
-  type TextsStoreOptions,
 } from './integration/texts.js'
-export { buildRunPrompts, type RunPrompts } from './integration/prompts.js'
 
 // Identity — credential + pending storage, always scoped to a given home.
 export {
@@ -92,10 +89,10 @@ export {
 export { MANUAL, MANUAL_URL, MANUAL_SKILL_NAME, MANUAL_FILENAME, manualFrontMatter, manualVersion, manualPointer } from './skill/manual.js'
 export {
   syncManual,
+  fromKitResult,
   checkManual,
   describeManualSync,
   readManualVersion,
-  ManualFollower,
   MANUAL_MAX_BYTES,
   MANUAL_FETCH_TIMEOUT_MS,
   MANUAL_MAX_REDIRECTS,
@@ -107,7 +104,6 @@ export {
   type ManualCheck,
   type ManualCheckState,
   type CheckManualOptions,
-  type ManualFollowerOptions,
 } from './skill/served-manual.js'
 export { identityLineOf, normalizeHandle } from './skill/identity-line.js'
 export { renderUnregisteredBlock, renderDeclinedBlock, type HostCopy } from './anchor/offer.js'

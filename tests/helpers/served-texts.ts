@@ -1,3 +1,5 @@
+import * as fs from 'node:fs'
+import * as path from 'node:path'
 import { vi } from 'vitest'
 import { ConnectionError, HttpTransport, type Texts } from 'agentchatme'
 
@@ -36,4 +38,10 @@ export function mockServedTexts(handle = 'probe', runtime = 'generic') {
     }
     throw new ConnectionError(`offline in tests: ${method} ${path}`)
   }) as never)
+}
+
+/** Keep a copy in the identity home the way the kit's TextsCache does (`texts.json`, version 1, per runtime). */
+export function writeTextsCacheFile(home: string, runtime: string, texts: Texts, fetchedAt: Date): void {
+  fs.mkdirSync(home, { recursive: true })
+  fs.writeFileSync(path.join(home, 'texts.json'), JSON.stringify({ version: 1, fetched_at: fetchedAt.toISOString(), runtime, texts }))
 }
