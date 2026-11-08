@@ -209,3 +209,13 @@ describe('recent wake cycles in status', () => {
     expect(bad).toMatch(/WARNING: the last 3 wake cycles did not get done \(latest: run_failed — exit 1\)/)
   })
 })
+
+describe('backpressure in status', () => {
+  it('a paused intake is a warning line; not paused (or unknown) prints nothing', async () => {
+    const { formatIntegrationStatus } = await import('../src/integration/status.js')
+    const base = { version: 2 as const, updated_at: new Date().toISOString(), pid: 1, runtime: 'x', handle: 'h', profile: 'answer', socket: 'ready' as const, wakes: 0, wakes_absorbed: 0, invites: 0, runs_started: 0, runs_ok: 0, runs_failed: 0, runs_timed_out: 0, runs_not_started: 0, runs_skipped_empty: 0, last_run: null, retry_rung: 0, retry_due_at: null, last_error: null, texts: null }
+    expect(formatIntegrationStatus({ ...base, intake_paused: true }).join('\n')).toMatch(/WARNING: the socket is refusing new messages/)
+    expect(formatIntegrationStatus({ ...base, intake_paused: false }).join('\n')).not.toMatch(/refusing new messages/)
+    expect(formatIntegrationStatus({ ...base }).join('\n')).not.toMatch(/refusing new messages/)
+  })
+})

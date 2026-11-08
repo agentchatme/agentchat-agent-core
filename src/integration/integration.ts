@@ -83,6 +83,12 @@ export interface IntegrationOptions {
   /** Injectable for tests: the kit's cycle watchdog (default 10 min, not counting runs). */
   readonly cycleTimeoutMs?: number
   /**
+   * Injectable for tests: the kit's pacing window (default 60 s) — a second
+   * completed run that leaves an invite pending counts toward dismissing it
+   * only this long after the first.
+   */
+  readonly paceMs?: number
+  /**
    * The kit's single-run rule dismisses an invite two completed runs left
    * pending, so an ignored invite does not cost a run on every wake. Right
    * when a run is the agent itself; wrong when "completed" only means a
@@ -249,6 +255,7 @@ export class Integration {
       ...(options.quietMs !== undefined ? { quietMs: options.quietMs } : {}),
       ...(options.maxMs !== undefined ? { maxMs: options.maxMs } : {}),
       ...(options.cycleTimeoutMs !== undefined ? { cycleTimeoutMs: options.cycleTimeoutMs } : {}),
+      ...(options.paceMs !== undefined ? { paceMs: options.paceMs } : {}),
     })
   }
 
@@ -356,6 +363,7 @@ export class Integration {
         manual_version: texts?.manual.version ?? null,
       },
       capabilities: status.socket === null ? null : status.socket.capabilities,
+      intake_paused: status.socket === null ? null : status.socket.intakePaused,
       recent_cycles: status.recentCycles.map((cycle) => ({
         at: cycle.at,
         outcome: cycle.outcome,

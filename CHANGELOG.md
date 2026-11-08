@@ -4,7 +4,7 @@ All notable changes to `@agentchatme/agent-core` are recorded here. The format f
 
 ## [Unreleased]
 
-Rebuilt and added behaviour (the number is set at the release step, `VERSIONING.md`). Needs the `agentchatme` release that carries the integration kit and socket contract v1.
+Rebuilt and added behaviour (the number is set at the release step, `VERSIONING.md`). Needs `agentchatme` 1.3.0 (the integration kit and socket contract v1; the dependency range is `^1.3.0`).
 
 ### Added
 
@@ -15,7 +15,7 @@ Rebuilt and added behaviour (the number is set at the release step, `VERSIONING.
 
 ### Changed
 
-- **The resident integration is the SDK kit's `ReceiveLoop` in single-run mode**: the socket offers `ack`, `heartbeat` and `rewake`; a reminder or an unanswered re-wake is a wake; pending invites come from the tray (an invite alone is an invite run; one still pending after two completed runs is dismissed, so an ignored invite does not cost a run on every wake). `TextsCache` and `ManualSync` replace `TextsStore` and `ManualFollower`; `syncManual` is the kit's with the bundled copy as the fallback; `probeHostedMcp` is the kit's `probeHostedTools` (it also checks `tools/list`). The status file gains `capabilities`. `Integration.settled()` is now `idle()`, after the kit's `ReceiveLoop.idle()`.
+- **The resident integration is the SDK kit's `ReceiveLoop` in single-run mode**: the socket offers `ack`, `heartbeat` and `rewake`; a reminder or an unanswered re-wake is a wake; pending invites come from the tray (an invite alone is an invite run; one still pending after two completed runs is dismissed, so an ignored invite does not cost a run on every wake). `TextsCache` and `ManualSync` replace `TextsStore` and `ManualFollower`; `syncManual` is the kit's with the bundled copy as the fallback; `probeHostedMcp` is the kit's `probeHostedTools` (it also checks `tools/list`). The status file gains `capabilities` and `intake_paused` (the socket's backpressure; `status` warns while it is set). `Integration.settled()` is now `idle()`, after the kit's `ReceiveLoop.idle()`.
 - **No run can hang the worker**: `spawnRun` signals the run's process group and detaches from a process that keeps the run's pipes open after it exited (a process that left the group with `setsid` can survive the run), and abandons a run that has not ended 5 s after the SIGKILL; a runner that has not returned 60 s past its budget is abandoned; preflight is bounded at 60 s.
 
 ### Removed

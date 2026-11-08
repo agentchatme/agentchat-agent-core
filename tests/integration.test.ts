@@ -190,10 +190,11 @@ describe('Integration — single-run mode on the kit', () => {
     expect(i.snapshot().invites).toBe(1)
   }, 10_000)
 
-  it('an invite two completed runs left pending is dismissed once (the kit\'s single-run rule); then it costs no run', async () => {
+  it('an invite two completed runs left pending is dismissed once (the kit\'s single-run rule, paced); then it costs no run', async () => {
     double = await startServerDouble({ tray: { waiting: 0, invites: ['gri_1'] } })
     const runner = new FakeRunner(() => double)
-    const i = await integration(runner)
+    // The kit counts the second silent run only a pacing window after the first (60 s by default).
+    const i = await integration(runner, { paceMs: 1 })
     await until(() => runner.requests.length === 1, 5_000)
     await pause(200)
     expect(double.dismissed).toEqual([])
@@ -285,7 +286,8 @@ describe('Integration — what the run is told, and what is recorded', () => {
   it('dismissIgnoredInvites: false — two completed runs leave an invite pending and nothing is dismissed', async () => {
     double = await startServerDouble({ tray: { waiting: 0, invites: ['gri_3'] } })
     const runner = new FakeRunner(() => double)
-    await integration(runner, { dismissIgnoredInvites: false })
+    // A pacing window this short would let the rule dismiss on the second run; the option must stop it.
+    await integration(runner, { dismissIgnoredInvites: false, paceMs: 1 })
     await until(() => runner.requests.length === 1, 5_000)
     double.send({ type: 'group.invite.received', payload: { invite_id: 'gri_3' } })
     await until(() => runner.requests.length === 2, 5_000)

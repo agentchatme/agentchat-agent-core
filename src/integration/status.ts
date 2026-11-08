@@ -80,6 +80,8 @@ export interface IntegrationStatus {
   capabilities?: string[] | null
   /** The receive loop's most recent wake cycles, oldest first (the kit's `status().recentCycles`, reduced); null from an older daemon. */
   recent_cycles?: IntegrationCycle[] | null
+  /** The socket's backpressure: true while it refuses new messages because handlers are behind (the kit's `intakePaused`); null from an older daemon. */
+  intake_paused?: boolean | null
 }
 
 /** One wake cycle as the status file keeps it: what it found and how it ended. Counts and outcomes only. */
@@ -169,6 +171,7 @@ const StatusSchema = z
       .array(z.object({ at: z.string(), outcome: z.string(), cards: z.number(), invites: z.number(), failure: z.string().nullable() }))
       .nullable()
       .optional(),
+    intake_paused: z.boolean().nullable().optional(),
   })
   .passthrough()
 
@@ -199,6 +202,7 @@ function normalize(raw: z.infer<typeof StatusSchema>): IntegrationStatus {
     texts: raw.texts,
     capabilities: raw.capabilities ?? null,
     recent_cycles: raw.recent_cycles ?? null,
+    intake_paused: raw.intake_paused ?? null,
   }
 }
 
@@ -294,6 +298,9 @@ export function formatIntegrationStatus(status: IntegrationStatus | null, now = 
     )
   } else {
     lines.push('  last run: none yet')
+  }
+  if (status.intake_paused === true) {
+    lines.push('  WARNING: the socket is refusing new messages (backpressure: earlier ones are still being handled); they stay on the server and arrive when it catches up')
   }
   const cycles = status.recent_cycles ?? []
   if (cycles.length > 0) {

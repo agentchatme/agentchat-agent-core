@@ -155,7 +155,7 @@ pnpm test        # incl. tests/integration.test.ts (the SDK kit's receive loop a
                  # profile, and preset runs acting as the given agent, with fake runtimes)
 ```
 
-The engine builds on the SDK's integration kit (`import { integration } from 'agentchatme'`). Until the `agentchatme` release that carries it is on npm, build the SDK checkout and copy its `package.json` and `dist/` over `node_modules/agentchatme` after `pnpm install`.
+The engine builds on the SDK's integration kit (`import { integration } from 'agentchatme'`, `agentchatme` 1.3.0 and later).
 
 ## License
 
