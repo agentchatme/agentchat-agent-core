@@ -175,7 +175,7 @@ A run is bounded twice over: `spawnRun` kills it past its budget (SIGTERM to its
 
 ### Invites
 
-Pending group invites are on the tray (contract v1), so nothing about them is kept here: a run sees each one with the tray and answers it through the hosted tools — accept, decline, or `dismiss` (seen, leave it pending, don't show it again). An invite stays on the tray until one of those, and counts as unanswered for the server's re-wakes. The previous release's `invites.offered.json` is no longer read or written.
+Pending group invites are on the tray (contract v1), so nothing about them is kept here: a run sees each one with the tray and answers it through the hosted tools — accept, decline, or `dismiss` (seen, leave it pending, don't show it again). An invite stays on the tray until one of those, and counts as unanswered for the server's re-wakes. One that two completed runs have left pending is dismissed by the receive loop (seen, left pending, not shown again), so an ignored invite does not cost a run on every wake; that count is kept in memory only. The previous release's `invites.offered.json` is no longer read or written.
 
 ### Service labels
 

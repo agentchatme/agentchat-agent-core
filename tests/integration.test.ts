@@ -190,6 +190,36 @@ describe('Integration — single-run mode on the kit', () => {
     expect(i.snapshot().invites).toBe(1)
   }, 10_000)
 
+  it('an invite two completed runs left pending is dismissed once (the kit\'s single-run rule); then it costs no run', async () => {
+    double = await startServerDouble({ tray: { waiting: 0, invites: ['gri_1'] } })
+    const runner = new FakeRunner(() => double)
+    const i = await integration(runner)
+    await until(() => runner.requests.length === 1, 5_000)
+    await pause(200)
+    expect(double.dismissed).toEqual([])
+    // A second wake: the invite is still pending after this completed run too.
+    double.send({ type: 'group.invite.received', payload: { invite_id: 'gri_1' } })
+    await until(() => double.dismissed.length === 1, 5_000)
+    expect(runner.requests).toHaveLength(2)
+    expect(double.dismissed).toEqual(['gri_1'])
+    // Off the tray now: the next wake finds nothing owed.
+    const skipped = i.snapshot().runs_skipped_empty
+    double.send({ type: 'message.new', payload: { id: 'msg_after', conversation_id: 'conv_x', sender: 'peer', content: { text: 'x' } } })
+    await until(() => i.snapshot().runs_skipped_empty === skipped + 1, 5_000)
+    expect(runner.requests).toHaveLength(2)
+  }, 10_000)
+
+  it('a run that did not complete counts for nothing: the invite is not dismissed', async () => {
+    double = await startServerDouble({ tray: { waiting: 0, invites: ['gri_2'] } })
+    const runner = new FakeRunner(() => double, 'not_started')
+    await integration(runner)
+    await until(() => runner.requests.length === 1, 5_000)
+    double.send({ type: 'group.invite.received', payload: { invite_id: 'gri_2' } })
+    await until(() => runner.requests.length === 2, 5_000)
+    await pause(300)
+    expect(double.dismissed).toEqual([])
+  }, 10_000)
+
   it('a run that did not start leaves the cards on the tray and retries nothing locally (the server re-wakes)', async () => {
     double = await startServerDouble({ tray: { waiting: 1 } })
     const runner = new FakeRunner(() => double, 'not_started')

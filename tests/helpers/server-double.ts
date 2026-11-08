@@ -89,6 +89,8 @@ export interface ServerDouble {
   setManual(manual: ServedManualDouble): void
   /** The Authorization header of every `/skill.md` request (undefined: none sent). */
   readonly manualAuth: Array<string | undefined>
+  /** Invite ids dismissed through `POST /v1/groups/invites/{id}/dismiss`, in order (each leaves the tray). */
+  readonly dismissed: string[]
   /** Push a frame to the most recent live socket. */
   send(frame: unknown): void
   /** Acks recorded across every connection. */
@@ -105,6 +107,7 @@ export async function startServerDouble(options: ServerDoubleOptions = {}): Prom
   const caps = options.helloCapabilities ?? ['ack']
   let manual = options.manual ?? null
   const manualAuth: Array<string | undefined> = []
+  const dismissed: string[] = []
   const served: Served[] = []
   const requests: string[] = []
 
@@ -135,6 +138,14 @@ export async function startServerDouble(options: ServerDoubleOptions = {}): Prom
           waited_ms: null,
         }),
       )
+      return
+    }
+    const dismiss = /^\/v1\/groups\/invites\/([^/]+)\/dismiss$/.exec(url.pathname)
+    if (dismiss !== null && req.method === 'POST') {
+      const id = decodeURIComponent(dismiss[1] ?? '')
+      dismissed.push(id)
+      tray = { ...tray, invites: (tray.invites ?? []).filter((i) => i !== id) }
+      res.end(JSON.stringify({ dismissed: true }))
       return
     }
     if (url.pathname === '/v1/groups/invites') {
@@ -195,6 +206,7 @@ export async function startServerDouble(options: ServerDoubleOptions = {}): Prom
       manual = next
     },
     manualAuth,
+    dismissed,
     send: (frame) => {
       const last = served[served.length - 1]
       if (!last) throw new Error('no live socket to send on')
