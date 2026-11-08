@@ -49,7 +49,7 @@ const HTTP_TIMEOUT_MS = 10_000
 
 /**
  * How long past its budget a runner may take to return before the loop stops
- * waiting for it. `spawnRun` always settles well inside this (grace, drain and
+ * waiting for it. `spawnRun` always returns well inside this (grace, drain and
  * abandon are seconds); the deadline is for a runner that does not keep the
  * "never hangs" promise — the loop must outlive every runner.
  */
@@ -225,7 +225,7 @@ export class Integration {
     log.info(
       `integration up as @${this.options.cfg.handle} via ${this.options.runner.name} (${this.options.client.runtime} ${this.options.client.version}), profile ${this.options.profile}; fetching the served texts, then holding the socket`,
     )
-    // The texts settle before the socket opens, so the first wake has the
+    // The texts are in before the socket opens, so the first wake has the
     // freshest text; a failure is logged and the cached copy (if any) serves.
     await this.texts.start()
     if (this.stopping) return

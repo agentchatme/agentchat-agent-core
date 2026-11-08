@@ -110,7 +110,7 @@ function killProcessTree(child: ChildProcess, signal: NodeJS.Signals): void {
   }
 }
 
-/** Start the command, wait for it, classify. Never throws, and always settles. */
+/** Start the command, wait for it, classify. Never throws, and always resolves. */
 export function spawnRun(spec: SpawnRunSpec): Promise<RunOutcome> {
   const started = Date.now()
   const graceMs = spec.graceMs ?? DEFAULT_GRACE_MS
