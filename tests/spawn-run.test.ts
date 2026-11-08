@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
-import { redactDiagnostic, spawnRun } from '../src/integration/spawn-run.js'
+import { describeWindowsSweep, redactDiagnostic, spawnRun, sweepWindowsDescendants } from '../src/integration/spawn-run.js'
 import { until } from './helpers/server-double.js'
 
 // ─── One headless run: bounded, classified, output discarded ────────────────
@@ -152,6 +152,149 @@ describe('spawnRun', () => {
     )
     expect(outcome.state).toBe('ok')
   })
+})
+
+describe('spawnRun — never hangs the worker', () => {
+  /** A run that starts a holder inheriting its stdio, writes the holder's pid, and exits 0. */
+  function runWithHolder(pidFile: string): string {
+    return script(
+      [
+        "const { spawn } = require('node:child_process')",
+        "const g = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: ['ignore', 'inherit', 'inherit'] })",
+        `require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(g.pid))`,
+        "process.stdout.write('done\\n')",
+        'process.exit(0)',
+      ].join('\n'),
+    )
+  }
+  const reap = (pid: number): void => {
+    try {
+      process.kill(pid, 'SIGKILL')
+    } catch {
+      /* gone */
+    }
+  }
+
+  it('a run that exits while a process it started may still hold its output: classified by its own exit, the worker free within the drain', async () => {
+    const pidFile = path.join(dir, 'holder.pid')
+    const started = Date.now()
+    const outcome = await run(runWithHolder(pidFile), { drainMs: 300 })
+    const holder = Number(fs.readFileSync(pidFile, 'utf-8'))
+    try {
+      expect(outcome.state).toBe('ok')
+      expect(Date.now() - started).toBeLessThan(5_000)
+      if (process.platform === 'win32') {
+        // Windows closes the run's pipes at its exit even with a child that
+        // inherited them (seen in CI), so `close` comes on its own; when it
+        // does not, the drain path says so.
+        expect(outcome.detail === undefined || /kept its output open/.test(outcome.detail)).toBe(true)
+      } else {
+        expect(outcome.detail).toMatch(/kept its output open/)
+      }
+    } finally {
+      reap(holder)
+    }
+  }, 10_000)
+
+  it.skipIf(process.platform === 'win32')('POSIX only (process groups): the leftover holding the pipes is signalled with the run\'s group', async () => {
+    const pidFile = path.join(dir, 'holder-group.pid')
+    await run(runWithHolder(pidFile), { drainMs: 300 })
+    const holder = Number(fs.readFileSync(pidFile, 'utf-8'))
+    try {
+      await until(() => !alive(holder), 3_000)
+    } finally {
+      reap(holder)
+    }
+  }, 10_000)
+
+  it.runIf(process.platform === 'win32')('Windows only (no process groups): the sweep kills a dead run\'s orphaned child, and spares one born outside its lifetime', async () => {
+    // A parent that starts a child (no shared stdio) and exits: the child is
+    // an orphan that keeps the parent's pid as its ParentProcessId.
+    const pidFile = path.join(dir, 'orphan.pid')
+    const parent = script(
+      [
+        "const { spawn } = require('node:child_process')",
+        "const g = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore', detached: true })",
+        `require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(g.pid))`,
+        'g.unref()',
+        'process.exit(0)',
+      ].join('\n'),
+    )
+    const { spawn } = await import('node:child_process')
+    const startedAt = Date.now()
+    const p = spawn(process.execPath, [parent], { stdio: 'ignore' })
+    const parentPid = p.pid ?? 0
+    await new Promise((r) => p.once('exit', r))
+    const exitedAt = Date.now()
+    await until(() => fs.existsSync(pidFile) && fs.readFileSync(pidFile, 'utf-8').length > 0, 5_000)
+    const orphan = Number(fs.readFileSync(pidFile, 'utf-8'))
+    try {
+      expect(alive(orphan)).toBe(true)
+      // A window that ended before the orphan was born spares it. A cold
+      // PowerShell on a CI runner can take tens of seconds to start.
+      const spared = await sweepWindowsDescendants(parentPid, startedAt - 60_000, startedAt - 30_000, { timeoutMs: 30_000 })
+      const sparedLine = spared === null ? 'no sweep' : describeWindowsSweep(spared)
+      console.log(`[sweep diagnostics, spare] ${sparedLine}`)
+      expect(spared?.killed ?? [], sparedLine).toEqual([])
+      expect(alive(orphan), sparedLine).toBe(true)
+      const swept = await sweepWindowsDescendants(parentPid, startedAt, exitedAt, { timeoutMs: 30_000 })
+      const sweptLine = swept === null ? 'no sweep' : describeWindowsSweep(swept)
+      console.log(`[sweep diagnostics, kill] ${sweptLine} (orphan ${orphan}, parent ${parentPid})`)
+      expect(swept?.killed.map((k) => k.pid) ?? [], sweptLine).toContain(orphan)
+      await until(() => !alive(orphan), 5_000).catch(() => {
+        throw new Error(`the orphan ${orphan} is still alive after the sweep: ${sweptLine}`)
+      })
+    } finally {
+      reap(orphan)
+    }
+  }, 90_000)
+
+  it.skipIf(process.platform === 'win32')(
+    'POSIX only (setsid / process groups): a process that escaped the group and holds the pipes past SIGKILL: the run is abandoned, never awaited forever',
+    async () => {
+      // `detached: true` makes the grandchild its own group leader, so the
+      // group kill never reaches it, and it holds the run's pipes. The run
+      // itself ignores SIGTERM to force the SIGKILL leg.
+      const pidFile = path.join(dir, 'escaped.pid')
+      const child = script(
+        [
+          "const { spawn } = require('node:child_process')",
+          "const g = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: ['ignore', 'inherit', 'inherit'], detached: true })",
+          `require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(g.pid))`,
+          "process.on('SIGTERM', () => {})",
+          "process.stdout.write('started\\n')",
+          'setInterval(() => {}, 1000)',
+        ].join('\n'),
+      )
+      const started = Date.now()
+      const outcome = await run(child, { budgetMs: 300, graceMs: 200, drainMs: 300, abandonMs: 300 })
+      const escaped = Number(fs.readFileSync(pidFile, 'utf-8'))
+      try {
+        expect(outcome.state).toBe('timed_out')
+        expect(Date.now() - started).toBeLessThan(5_000)
+      } finally {
+        try {
+          process.kill(escaped, 'SIGKILL')
+        } catch {
+          /* gone */
+        }
+      }
+    },
+    10_000,
+  )
+
+  it('a run that exits inside its budget is never reclassified by the budget timer while its pipes drain', async () => {
+    const child = script(
+      [
+        "const { spawn } = require('node:child_process')",
+        "spawn(process.execPath, ['-e', 'setTimeout(() => {}, 3000)'], { stdio: ['ignore', 'inherit', 'inherit'] })",
+        "process.stdout.write('x')",
+        'process.exit(0)',
+      ].join('\n'),
+    )
+    const outcome = await run(child, { budgetMs: 200, drainMs: 600 })
+    expect(outcome.state).toBe('ok')
+  }, 10_000)
 })
 
 describe('redactDiagnostic', () => {

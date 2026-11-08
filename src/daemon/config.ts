@@ -44,6 +44,8 @@ export interface ResolveDaemonOpts {
   workdir: string
   /** How to identify to the server when the handle has to be asked for. */
   client: IntegrationClient
+  /** Whether `AGENTCHAT_API_KEY` may override the home's credentials (default true; see `resolveIdentity`). */
+  envKey?: boolean
 }
 
 /**
@@ -56,7 +58,7 @@ export interface ResolveDaemonOpts {
  */
 export async function resolveDaemonConfig(opts: ResolveDaemonOpts): Promise<DaemonConfig> {
   const home = path.resolve(opts.home)
-  const id = resolveIdentity(home)
+  const id = resolveIdentity(home, { envKey: opts.envKey !== false })
   if (id === null) {
     throw new Error(`no AgentChat identity in ${home} — register this agent first`)
   }

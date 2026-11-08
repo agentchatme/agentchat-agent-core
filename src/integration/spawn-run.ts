@@ -1,6 +1,7 @@
 import type { ChildProcess } from 'node:child_process'
 import { spawnCommand, spawnCommandSync } from '../util/spawn.js'
 import type { RunOutcome } from './runner.js'
+import { log } from '../util/log.js'
 
 // ─── Spawning one headless run ──────────────────────────────────────────────
 //
@@ -23,7 +24,32 @@ import type { RunOutcome } from './runner.js'
 // (`signal`) — a daemon that exits with a run still going orphans a model call
 // that nobody will read and that the restarted daemon would run again.
 
+// A run must never hang the worker that started it. Two ways a child can
+// outlive its own classification, both seen with real runtimes:
+//
+//   * the run's process exits, but something it started still holds its
+//     stdout/stderr (a helper spawned with inherited pipes, an MCP server
+//     that daemonised): Node's `close` waits for every holder of the pipes,
+//     so it never comes. After `exit`, `close` gets DRAIN_MS; then the
+//     run's process group is signalled (SIGKILL), the pipes are dropped, and
+//     the run is classified by the exit it did make. A process that left the
+//     group (`setsid`, a daemonising helper) is not reached by that signal
+//     and can survive the run; the pipes are let go either way. Windows has
+//     no process groups: there the run's orphaned children are swept
+//     (`sweepWindowsDescendants`, best effort). Observed on Windows: a child
+//     that inherited the run's stdio does not keep it open past the run's
+//     exit, so `close` usually comes and this path is the fallback.
+//   * a SIGKILL that does not end it (a process that escaped the group with
+//     `setsid` and still holds the pipes; a process stuck in the kernel):
+//     ABANDON_MS after the SIGKILL the pipes are dropped, the child is
+//     unref'd, and the run is classified `timed_out` / `failed` as the
+//     budget or the interrupt said — the worker moves on.
+
 const DEFAULT_GRACE_MS = 5_000
+/** After the run's process exited: how long its pipes get to close before the run is detached from them. */
+const DEFAULT_DRAIN_MS = 2_000
+/** After the SIGKILL: how long before a run that still has not ended is abandoned. */
+const DEFAULT_ABANDON_MS = 5_000
 const STDERR_TAIL_CHARS = 400
 
 export interface SpawnRunSpec {
@@ -31,12 +57,22 @@ export interface SpawnRunSpec {
   readonly args: readonly string[]
   readonly cwd: string
   readonly env: NodeJS.ProcessEnv
+  /**
+   * Run `command` through the platform shell (`/bin/sh -c`, `cmd.exe /d /s /c`)
+   * with no `args`: for a command line the OWNER configured. Nothing derived
+   * from a wake or a message is ever part of it.
+   */
+  readonly shell?: boolean
   /** Written to the child's stdin and closed; `null` closes stdin at once. */
   readonly stdin: string | null
   /** Kill past this. */
   readonly budgetMs: number
   /** SIGTERM first; SIGKILL this long after. */
   readonly graceMs?: number
+  /** After the process exited, how long its pipes may stay open before the run is detached from them. */
+  readonly drainMs?: number
+  /** After the SIGKILL, how long before a run that has still not ended is abandoned. */
+  readonly abandonMs?: number
   /**
    * Aborting it SIGTERMs the run's process group (SIGKILL after `graceMs`);
    * the outcome is `failed` with an "interrupted" detail.
@@ -60,13 +96,20 @@ export function redactDiagnostic(value: string, max = STDERR_TAIL_CHARS): string
     .slice(-max)
 }
 
+/** Bounds every synchronous kill: a stuck `taskkill` must not hold the worker it protects. */
+const KILL_TIMEOUT_MS = 5_000
+
 function killProcessTree(child: ChildProcess, signal: NodeJS.Signals): void {
   if (child.pid === undefined) return
   try {
     if (process.platform === 'win32') {
+      // The tree under a live root. A root that has exited is not found by
+      // taskkill (Windows keeps no tree for it); `sweepWindowsDescendants`
+      // covers that case.
       spawnCommandSync('taskkill', ['/pid', String(child.pid), '/T', '/F'], {
         windowsHide: true,
         stdio: 'ignore',
+        timeout: KILL_TIMEOUT_MS,
       })
     } else {
       // Negative pid = the process group the child leads (spawned detached).
@@ -81,26 +124,192 @@ function killProcessTree(child: ChildProcess, signal: NodeJS.Signals): void {
   }
 }
 
-/** Start the command, wait for it, classify. Never throws. */
+/** Epoch ms → a Windows FILETIME (100 ns ticks since 1601), for PowerShell's `[DateTime]::FromFileTime`. */
+function fileTime(ms: number): string {
+  return String((BigInt(Math.round(ms)) + 11_644_473_600_000n) * 10_000n)
+}
+
+/** What one Windows sweep saw and did, for the log line and for tests. */
+export interface WindowsSweep {
+  /** PowerShell's exit code; null when it was killed past its deadline or could not start. */
+  readonly exitCode: number | null
+  readonly timedOut: boolean
+  /** Every child of the root the sweep saw, as `<pid> <created ISO>`, in or out of the window. */
+  readonly candidates: string[]
+  /** Pids it ran `taskkill /T /F` on, with taskkill's exit code. */
+  readonly killed: Array<{ pid: number; code: number }>
+  /** The window it used, ISO. */
+  readonly window: string | null
+  /** stderr, bounded. */
+  readonly stderr: string
+}
+
+/** A cold PowerShell on a busy runner takes seconds to start (seen: ~30 s on windows-latest the first time); past this the sweep is given up. */
+export const WINDOWS_SWEEP_TIMEOUT_MS = 60_000
+
+/**
+ * Windows: kill the processes an exited run left behind — its direct
+ * children, which keep the dead run's pid as their `ParentProcessId` (Windows
+ * does not reparent), created while the run was alive (so a reused pid cannot
+ * pick up a stranger's children), each with its own tree. Best effort, and
+ * never waited for by the run: `spawnRun` only logs the result. A
+ * `powershell -EncodedCommand` (no quoting to get wrong), bounded by
+ * `timeoutMs`. Resolves null off Windows.
+ */
+export function sweepWindowsDescendants(
+  rootPid: number,
+  aliveFromMs: number,
+  aliveUntilMs: number,
+  options: { timeoutMs?: number } = {},
+): Promise<WindowsSweep | null> {
+  if (process.platform !== 'win32' || !Number.isInteger(rootPid) || rootPid <= 0) return Promise.resolve(null)
+  const script = [
+    "$ErrorActionPreference = 'Continue'",
+    // Progress records ('Preparing modules for first use') would reach stderr as CLIXML.
+    "$ProgressPreference = 'SilentlyContinue'",
+    `$from = [DateTime]::FromFileTime(${fileTime(aliveFromMs - 1_000)})`,
+    `$until = [DateTime]::FromFileTime(${fileTime(aliveUntilMs + 1_000)})`,
+    "Write-Output ('window ' + $from.ToUniversalTime().ToString('o') + ' ' + $until.ToUniversalTime().ToString('o'))",
+    `foreach ($p in @(Get-CimInstance Win32_Process -Filter 'ParentProcessId=${rootPid}')) {`,
+    "  Write-Output ('candidate ' + $p.ProcessId + ' ' + $p.CreationDate.ToUniversalTime().ToString('o'))",
+    '  if ($p.CreationDate -ge $from -and $p.CreationDate -le $until) {',
+    '    & taskkill.exe /T /F /PID $p.ProcessId 2>&1 | Out-Null',
+    "    Write-Output ('kill ' + $p.ProcessId + ' ' + $LASTEXITCODE)",
+    '  }',
+    '}',
+  ].join('\n')
+  return new Promise<WindowsSweep>((resolve) => {
+    let stdout = ''
+    let stderr = ''
+    let timedOut = false
+    let done = false
+    const finish = (exitCode: number | null): void => {
+      if (done) return
+      done = true
+      clearTimeout(timer)
+      const lines = stdout.split(/\r?\n/).map((l) => l.trim()).filter((l) => l.length > 0)
+      resolve({
+        exitCode,
+        timedOut,
+        candidates: lines.filter((l) => l.startsWith('candidate ')).map((l) => l.slice('candidate '.length)),
+        killed: lines
+          .filter((l) => l.startsWith('kill '))
+          .map((l) => l.split(' '))
+          .map(([, pid, code]) => ({ pid: Number(pid), code: Number(code) })),
+        window: lines.find((l) => l.startsWith('window '))?.slice('window '.length) ?? null,
+        stderr: redactDiagnostic(stderr),
+      })
+    }
+    let sweeper: ChildProcess
+    try {
+      sweeper = spawnCommand(
+        'powershell.exe',
+        ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')],
+        { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true },
+      )
+    } catch (err) {
+      stderr = String(err)
+      finish(null)
+      return
+    }
+    const timer = setTimeout(() => {
+      timedOut = true
+      try {
+        sweeper.kill()
+      } catch {
+        /* gone */
+      }
+      finish(null)
+    }, options.timeoutMs ?? WINDOWS_SWEEP_TIMEOUT_MS)
+    timer.unref?.()
+    sweeper.stdout?.on('data', (c: Buffer | string) => {
+      stdout = (stdout + String(c)).slice(-16_000)
+    })
+    sweeper.stderr?.on('data', (c: Buffer | string) => {
+      stderr = (stderr + String(c)).slice(-4_000)
+    })
+    sweeper.on('error', (err) => {
+      stderr += String(err)
+      finish(null)
+    })
+    sweeper.on('close', (code) => finish(code))
+  })
+}
+
+/** One line for the log: what a sweep found and did. */
+export function describeWindowsSweep(sweep: WindowsSweep): string {
+  const killed = sweep.killed.map((k) => `${k.pid} (taskkill ${k.code})`).join(', ') || 'none'
+  return `windows leftover sweep: exit ${sweep.exitCode ?? (sweep.timedOut ? 'timed out' : 'none')}; window ${sweep.window ?? '?'}; children seen ${sweep.candidates.length > 0 ? sweep.candidates.join(', ') : 'none'}; killed ${killed}${sweep.stderr ? `; stderr: ${sweep.stderr}` : ''}`
+}
+
+/** Start the command, wait for it, classify. Never throws, and always resolves. */
 export function spawnRun(spec: SpawnRunSpec): Promise<RunOutcome> {
   const started = Date.now()
+  const graceMs = spec.graceMs ?? DEFAULT_GRACE_MS
+  const drainMs = spec.drainMs ?? DEFAULT_DRAIN_MS
+  const abandonMs = spec.abandonMs ?? DEFAULT_ABANDON_MS
   return new Promise<RunOutcome>((resolve) => {
     let settled = false
     let stdoutBytes = 0
     let stderrTail = ''
     let timedOut = false
     let interrupted = false
-    let killTimer: ReturnType<typeof setTimeout> | null = null
-    let graceTimer: ReturnType<typeof setTimeout> | null = null
+    let terminating = false
+    let exited: { code: number | null; signal: NodeJS.Signals | null; at: number } | null = null
+    const timers = new Set<ReturnType<typeof setTimeout>>()
     let onAbort: (() => void) | null = null
+    let child: ChildProcess | null = null
+
+    const later = (ms: number, fn: () => void): void => {
+      const timer = setTimeout(() => {
+        timers.delete(timer)
+        fn()
+      }, ms)
+      timers.add(timer)
+    }
 
     const finish = (outcome: Omit<RunOutcome, 'durationMs'>): void => {
       if (settled) return
       settled = true
-      if (killTimer) clearTimeout(killTimer)
-      if (graceTimer) clearTimeout(graceTimer)
+      for (const timer of timers) clearTimeout(timer)
+      timers.clear()
       if (onAbort) spec.signal?.removeEventListener('abort', onAbort)
       resolve({ ...outcome, durationMs: Date.now() - started })
+    }
+
+    /** Stop waiting on the child's pipes and let the event loop forget it. */
+    const detach = (): void => {
+      if (child === null) return
+      for (const stream of [child.stdin, child.stdout, child.stderr]) {
+        try {
+          stream?.destroy()
+        } catch {
+          /* already gone */
+        }
+      }
+      try {
+        child.unref()
+      } catch {
+        /* already gone */
+      }
+    }
+
+    /** The outcome for an exit the run did make; `note` says why `close` was not waited for. */
+    const classify = (code: number | null, signal: NodeJS.Signals | null, note: string | null): Omit<RunOutcome, 'durationMs'> => {
+      const tail = redactDiagnostic(stderrTail)
+      const extra = `${note ? ` (${note})` : ''}${tail ? `: ${tail}` : ''}`
+      if (timedOut) {
+        return { state: 'timed_out', exitCode: code, detail: `run exceeded its ${Math.round(spec.budgetMs / 1000)} s budget and was killed${extra}` }
+      }
+      if (interrupted) {
+        return { state: 'failed', exitCode: code, detail: `interrupted — the integration was stopping; the tray stays unread for the next run${extra}` }
+      }
+      if (code === 0) return note ? { state: 'ok', exitCode: 0, detail: note } : { state: 'ok', exitCode: 0 }
+      const exit = code === null ? `signal ${signal ?? 'unknown'}` : `exit ${code}`
+      // Nothing on stdout: the runtime did not get going (missing, refused
+      // to start, auth gate). Whatever it complained about is in the tail.
+      if (stdoutBytes === 0) return { state: 'not_started', exitCode: code, detail: `${exit} with nothing on stdout${extra}` }
+      return { state: 'failed', exitCode: code, detail: `${exit}${extra}` }
     }
 
     if (spec.signal?.aborted) {
@@ -108,7 +317,6 @@ export function spawnRun(spec: SpawnRunSpec): Promise<RunOutcome> {
       return
     }
 
-    let child: ChildProcess
     try {
       child = spawnCommand(spec.command, [...spec.args], {
         cwd: spec.cwd,
@@ -116,52 +324,78 @@ export function spawnRun(spec: SpawnRunSpec): Promise<RunOutcome> {
         stdio: [spec.stdin === null ? 'ignore' : 'pipe', 'pipe', 'pipe'],
         detached: process.platform !== 'win32',
         windowsHide: true,
+        ...(spec.shell === true ? { shell: true } : {}),
       })
     } catch (err) {
       finish({ state: 'not_started', exitCode: null, detail: redactDiagnostic(String(err)) })
       return
     }
+    const proc: ChildProcess = child
 
     if (spec.onStarted) {
       const onStarted = spec.onStarted
-      child.once('spawn', () => {
+      proc.once('spawn', () => {
         try {
           onStarted()
         } catch {
-          /* the callback belongs to the invoker; a failure there is not the run's */
+          /* the callback belongs to the caller; a failure there is not the run's */
         }
       })
     }
 
-    child.stdout?.on('data', (chunk: Buffer | string) => {
+    proc.stdout?.on('data', (chunk: Buffer | string) => {
       stdoutBytes += chunk.length // counted, never kept
     })
-    child.stderr?.on('data', (chunk: Buffer | string) => {
+    proc.stderr?.on('data', (chunk: Buffer | string) => {
       stderrTail = (stderrTail + String(chunk)).slice(-4 * STDERR_TAIL_CHARS)
     })
+    // A pipe torn down under us (detach, a dying child) must never surface as
+    // an unhandled 'error' event.
+    proc.stdout?.on('error', () => undefined)
+    proc.stderr?.on('error', () => undefined)
 
-    if (spec.stdin !== null && child.stdin) {
-      child.stdin.on('error', () => {
+    if (spec.stdin !== null && proc.stdin) {
+      proc.stdin.on('error', () => {
         /* the child closed stdin early; the exit code tells the story */
       })
       try {
-        child.stdin.write(spec.stdin)
-        child.stdin.end()
+        proc.stdin.write(spec.stdin)
+        proc.stdin.end()
       } catch {
         /* handled by the close path */
       }
     }
 
     const terminate = (): void => {
-      killProcessTree(child, 'SIGTERM')
-      if (graceTimer) clearTimeout(graceTimer)
-      graceTimer = setTimeout(() => killProcessTree(child, 'SIGKILL'), spec.graceMs ?? DEFAULT_GRACE_MS)
+      if (terminating || settled) return
+      terminating = true
+      killProcessTree(proc, 'SIGTERM')
+      later(graceMs, () => {
+        if (settled) return
+        killProcessTree(proc, 'SIGKILL')
+        later(abandonMs, () => {
+          if (settled) return
+          // Exited but the pipes stayed open: the drain timer owns that case.
+          if (exited !== null) return
+          detach()
+          const tail = redactDiagnostic(stderrTail)
+          const why = `the run did not end ${Math.round((graceMs + abandonMs) / 1000)} s after it was signalled (SIGKILL included) — abandoned so the next wake can run${tail ? `: ${tail}` : ''}`
+          finish(
+            timedOut
+              ? { state: 'timed_out', exitCode: null, detail: `run exceeded its ${Math.round(spec.budgetMs / 1000)} s budget; ${why}` }
+              : { state: 'failed', exitCode: null, detail: `interrupted — ${why}` },
+          )
+        })
+      })
     }
 
-    killTimer = setTimeout(() => {
+    later(spec.budgetMs, () => {
+      // A run that already exited ended inside its budget; only its pipes
+      // are late, and the drain timer owns that.
+      if (exited !== null) return
       timedOut = true
       terminate()
-    }, spec.budgetMs)
+    })
 
     if (spec.signal) {
       onAbort = (): void => {
@@ -172,40 +406,40 @@ export function spawnRun(spec: SpawnRunSpec): Promise<RunOutcome> {
       spec.signal.addEventListener('abort', onAbort, { once: true })
     }
 
-    child.on('error', (err) => {
+    proc.on('error', (err) => {
       finish({ state: 'not_started', exitCode: null, detail: redactDiagnostic(String(err)) })
     })
 
-    child.on('close', (code, signal) => {
-      const tail = redactDiagnostic(stderrTail)
-      if (timedOut) {
-        finish({
-          state: 'timed_out',
-          exitCode: code,
-          detail: `run exceeded its ${Math.round(spec.budgetMs / 1000)} s budget and was killed${tail ? `: ${tail}` : ''}`,
-        })
-        return
-      }
-      if (interrupted) {
-        finish({
-          state: 'failed',
-          exitCode: code,
-          detail: `interrupted — the integration was stopping; the tray stays unread for the next run${tail ? `: ${tail}` : ''}`,
-        })
-        return
-      }
-      if (code === 0) {
-        finish({ state: 'ok', exitCode: 0 })
-        return
-      }
-      const exit = code === null ? `signal ${signal ?? 'unknown'}` : `exit ${code}`
-      if (stdoutBytes === 0) {
-        // Nothing on stdout: the runtime did not get going (missing, refused
-        // to start, auth gate). Whatever it complained about is in the tail.
-        finish({ state: 'not_started', exitCode: code, detail: `${exit} with nothing on stdout${tail ? `: ${tail}` : ''}` })
-        return
-      }
-      finish({ state: 'failed', exitCode: code, detail: `${exit}${tail ? `: ${tail}` : ''}` })
+    proc.on('exit', (code, signal) => {
+      exited = { code, signal, at: Date.now() }
+      // `close` follows once every holder of the pipes is gone. A process the
+      // run started that still holds them must not hold the worker.
+      later(drainMs, () => {
+        if (settled || exited === null) return
+        // The run is over; what is left of it is a leftover: its process
+        // group on POSIX; on Windows its orphaned children (no groups there).
+        killProcessTree(proc, 'SIGKILL')
+        if (proc.pid !== undefined) {
+          // Never awaited: the run's outcome does not wait for the sweep.
+          void sweepWindowsDescendants(proc.pid, started, exited.at).then((sweep) => {
+            if (sweep !== null) (sweep.exitCode === 0 ? log.info : log.warn)(describeWindowsSweep(sweep))
+          })
+        }
+        detach()
+        finish(
+          classify(
+            exited.code,
+            exited.signal,
+            process.platform === 'win32'
+              ? 'a process the run started kept its output open after it exited; its children were swept (taskkill) and the run detached from it — a process the sweep cannot see can survive'
+              : 'a process the run started kept its output open after it exited; the run\'s process group was signalled (SIGKILL) and the run detached from it — a process that left the group can survive',
+          ),
+        )
+      })
+    })
+
+    proc.on('close', (code, signal) => {
+      finish(classify(code, signal, null))
     })
   })
 }

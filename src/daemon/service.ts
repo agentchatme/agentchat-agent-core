@@ -676,14 +676,15 @@ function statusLaunchd(label: string, home: string): string {
 // Windows has no systemd/launchd. For "runs whenever you're logged in" — the
 // consumer case, no admin needed — we drop a hidden, restart-on-exit VBScript
 // into the user's Startup folder. Two hosts land here:
-//   * native Windows → the .vbs runs `node <daemon> start …` directly.
+//   * native Windows → the .vbs runs `node <entry> --home <home>` directly.
 //   * WSL2           → the daemon lives in Linux, but the WSL VM shuts down when
 //                      the last terminal closes, so a Linux service can't stay
 //                      up. Instead the launcher goes in the WINDOWS Startup
 //                      folder (reached from WSL via /mnt/c) and runs
 //                      `wsl.exe -e bash <script>`, which boots the VM at Windows
 //                      login and runs the daemon inside it.
-// A "master" copy under ~/.agentchat/daemon is the installed-marker; the copy in
+// A "master" copy in the user's ~/.agentchat/daemon (whatever identity home the
+// service serves — the label carries that) is the installed-marker; the copy in
 // Startup is the enabled state (disable removes it, keeps the master — same
 // toggle semantics as systemd enable/disable).
 //

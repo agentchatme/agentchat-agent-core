@@ -13,27 +13,9 @@
 // genuinely differs per host, so each integration implements `RunRunner` itself.
 
 export { runIntegration, type RunIntegrationOpts } from './integration/run.js'
-export { Integration, type IntegrationOptions } from './integration/integration.js'
-export {
-  IntegrationConnection,
-  socketStateOf,
-  type IntegrationConnectionOptions,
-  type IntegrationConnectionEvents,
-  type Wake,
-  type MessageWake,
-  type ReminderWake,
-  type InviteWake,
-} from './integration/connection.js'
-export {
-  IntegrationInvoker,
-  RETRY_LADDER_MS,
-  PREFLIGHT_WATCH_MS,
-  type IntegrationInvokerOptions,
-  type InvokerCounters,
-} from './integration/invoker.js'
-export { WakeCoalescer, DEFAULT_WAKE_DEBOUNCE_MS, type WakeCoalescerOptions } from './integration/wake.js'
-export { OfferedInvites, OFFERED_INVITES_FILE, offeredInvitesPath, type OfferedInviteStore } from './integration/invites.js'
-export { spawnRun, redactDiagnostic, type SpawnRunSpec } from './integration/spawn-run.js'
+export { Integration, RUNNER_DEADLINE_SLACK_MS, PREFLIGHT_DEADLINE_MS, type IntegrationOptions } from './integration/integration.js'
+export { socketStateOf, blockedDetail } from './integration/socket-state.js'
+export { spawnRun, redactDiagnostic, sweepWindowsDescendants, describeWindowsSweep, WINDOWS_SWEEP_TIMEOUT_MS, type SpawnRunSpec, type WindowsSweep } from './integration/spawn-run.js'
 export type {
   RunRunner,
   RunRequest,
@@ -41,5 +23,10 @@ export type {
   RunOutcomeState,
   RunKind,
   RunPreflight,
+  RunnerIdentity,
+  RunnerFactory,
+  RunnerSource,
+  RunWake,
 } from './integration/runner.js'
+
 export { resolveDaemonConfig, wsBaseFor, wsUrlFor, type DaemonConfig, type ResolveDaemonOpts } from './daemon/config.js'

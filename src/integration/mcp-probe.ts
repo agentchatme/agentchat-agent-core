@@ -1,21 +1,19 @@
-import { clientHeadersOf, type IntegrationClient } from '../client-identity.js'
+import { integration as kit } from 'agentchatme'
+import { clientIdentityOf, type IntegrationClient } from '../client-identity.js'
 
-// ─── Is the hosted tool server reachable with this key? ─────────────────────
+// ─── Can this key reach the hosted tools? ───────────────────────────────────
 //
-// `status` and `doctor` send ONE MCP `initialize` over Streamable HTTP with
-// the bearer key — the same first request a runtime makes on connect — and
-// read the answer. A `401` means the key does not authenticate; a transport
-// error means the endpoint is not reachable from here. Nothing else is called.
-// (The one request this package still makes outside the SDK: the SDK has no
-// MCP client, and this is a probe, not a tool call.)
+// `status` and `doctor` ask the SDK kit's `probeHostedTools`: one MCP
+// `initialize` over Streamable HTTP with the bearer key — the same first
+// request a runtime makes on connect — then `tools/list`, which must show the
+// tools a run needs (`agentchat_inbox`, `agentchat_decide`). A 401 means the
+// key does not authenticate; a transport error means the endpoint is not
+// reachable from here. No tool is called.
 
-export const HOSTED_MCP_PATH = '/mcp'
-
-/** The MCP protocol revision this probe speaks; the server answers with the one it serves. */
-const MCP_PROTOCOL_VERSION = '2025-06-18'
+export const HOSTED_MCP_PATH = kit.HOSTED_MCP_PATH
 
 export function hostedMcpUrl(apiBase: string): string {
-  return `${apiBase.replace(/\/+$/, '')}${HOSTED_MCP_PATH}`
+  return kit.hostedMcpUrl(apiBase)
 }
 
 export interface McpProbeResult {
@@ -24,93 +22,34 @@ export interface McpProbeResult {
   readonly serverName?: string
   readonly serverVersion?: string
   readonly protocolVersion?: string
+  /** Every tool the server listed for this key. */
+  readonly tools?: readonly string[]
+  /** Tools a run needs that were not listed. */
+  readonly missing?: readonly string[]
   readonly error?: string
 }
 
 export async function probeHostedMcp(params: {
   apiKey: string
   apiBase: string
-  /** How this integration identifies to the server (headers on the probe). */
+  /** How this integration identifies to the server. */
   client: IntegrationClient
-  /** MCP `clientInfo.name`; defaults to the runtime name. */
+  /**
+   * Accepted for compatibility and ignored: the probe identifies as `client`
+   * (headers and `clientInfo` alike), so the server's analytics see the
+   * integration, never a free-text name it would file as unknown.
+   */
   clientName?: string
-  /** MCP `clientInfo.version`; defaults to the integration's version. */
+  /** Accepted for compatibility and ignored (see `clientName`). */
   clientVersion?: string
   timeoutMs?: number
   fetch?: typeof fetch
 }): Promise<McpProbeResult> {
-  const fetchImpl = params.fetch ?? fetch
-  const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), params.timeoutMs ?? 10_000)
-  try {
-    const res = await fetchImpl(hostedMcpUrl(params.apiBase), {
-      method: 'POST',
-      headers: {
-        authorization: `Bearer ${params.apiKey}`,
-        'content-type': 'application/json',
-        accept: 'application/json, text/event-stream',
-        ...clientHeadersOf(params.client),
-      },
-      body: JSON.stringify({
-        jsonrpc: '2.0',
-        id: 1,
-        method: 'initialize',
-        params: {
-          protocolVersion: MCP_PROTOCOL_VERSION,
-          capabilities: {},
-          clientInfo: {
-            name: params.clientName ?? params.client.runtime,
-            version: params.clientVersion ?? params.client.version,
-          },
-        },
-      }),
-      signal: controller.signal,
-    })
-    if (!res.ok) {
-      return {
-        ok: false,
-        status: res.status,
-        error:
-          res.status === 401
-            ? 'the key does not authenticate against the hosted MCP server'
-            : `HTTP ${res.status}`,
-      }
-    }
-    const result = readInitializeResult(await res.text())
-    if (!result) return { ok: false, status: res.status, error: 'no initialize result in the answer' }
-    const serverInfo = (result.serverInfo ?? {}) as Record<string, unknown>
-    return {
-      ok: true,
-      status: res.status,
-      ...(typeof serverInfo.name === 'string' ? { serverName: serverInfo.name } : {}),
-      ...(typeof serverInfo.version === 'string' ? { serverVersion: serverInfo.version } : {}),
-      ...(typeof result.protocolVersion === 'string' ? { protocolVersion: result.protocolVersion } : {}),
-    }
-  } catch (err) {
-    return { ok: false, error: err instanceof Error ? err.message : String(err) }
-  } finally {
-    clearTimeout(timer)
-  }
-}
-
-/** The initialize result from a JSON body or an SSE body (`data: {...}` lines). */
-function readInitializeResult(text: string): Record<string, unknown> | null {
-  const candidates: string[] = []
-  const trimmed = text.trim()
-  if (trimmed.startsWith('{')) candidates.push(trimmed)
-  for (const line of text.split(/\r?\n/)) {
-    if (line.startsWith('data:')) candidates.push(line.slice(5).trim())
-  }
-  for (const candidate of candidates) {
-    try {
-      const parsed = JSON.parse(candidate) as Record<string, unknown>
-      const result = parsed.result
-      if (result && typeof result === 'object' && !Array.isArray(result)) {
-        return result as Record<string, unknown>
-      }
-    } catch {
-      // not JSON — try the next candidate
-    }
-  }
-  return null
+  return kit.probeHostedTools({
+    apiBase: params.apiBase,
+    apiKey: params.apiKey,
+    clientIdentity: clientIdentityOf(params.client),
+    ...(params.timeoutMs !== undefined ? { timeoutMs: params.timeoutMs } : {}),
+    ...(params.fetch !== undefined ? { fetch: params.fetch } : {}),
+  })
 }

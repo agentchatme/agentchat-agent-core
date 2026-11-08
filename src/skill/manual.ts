@@ -9,7 +9,9 @@ import { MANUAL_TEXT } from './manual-text.js'
 // drifted into three explanations of one network. The main line now writes
 // the manual once and serves it at one address; an integration's only job is
 // to put the SERVED bytes where its runtime keeps skills and keep them current
-// (`syncManual`, `ManualFollower` in ./served-manual.ts).
+// (`syncManual` in ./served-manual.ts — the SDK kit's, with this copy as the
+// fallback; the resident integration follows the texts with the kit's
+// `ManualSync`).
 //
 // What is bundled here is the fallback for a skill file that does not exist
 // yet and cannot be downloaded (a first install offline, or with no account

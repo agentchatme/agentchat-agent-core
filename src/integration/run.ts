@@ -8,7 +8,7 @@ import { idle } from '../daemon/health.js'
 import type { IntegrationClient } from '../client-identity.js'
 import { Integration } from './integration.js'
 import { integrationDisabledBy, resolveRunBudgetMs, resolveRunProfile, type RunProfile } from './profile.js'
-import type { RunRunner } from './runner.js'
+import { isRunnerFactory, type RunnerSource } from './runner.js'
 import { writeIntegrationStatus } from './status.js'
 
 // ─── The resident supervisor ────────────────────────────────────────────────
@@ -56,8 +56,8 @@ const KEEP_LOG_BYTES = 1024 * 1024
 export interface RunIntegrationOpts {
   /** THE identity home for the agent this daemon serves. */
   home: string
-  /** How to start one headless run of this integration's coding agent. */
-  runner: RunRunner
+  /** How to start one headless run: a runner, or a factory that builds one per identity (`RunnerFactory`). */
+  runner: RunnerSource
   /** How this integration names itself to the server: the texts runtime and its own version. */
   client: IntegrationClient
   /** The one pointer line a run prompt ends with: how THIS runtime reaches its copy of the manual (`manualPointer(...)`). */
@@ -80,6 +80,14 @@ export interface RunIntegrationOpts {
   env?: NodeJS.ProcessEnv
   /** Test seam: what a signal-initiated shutdown calls last. Defaults to `process.exit`. */
   exit?: (code: number) => void
+  /**
+   * Serve only the agent the home's `credentials` hold: `AGENTCHAT_API_KEY`
+   * in the environment is ignored (default false: it overrides, as for every
+   * integration). The `agentchat` listener sets it.
+   */
+  credentialsFromHomeOnly?: boolean
+  /** See `IntegrationOptions.dismissIgnoredInvites` (default true). */
+  dismissIgnoredInvites?: boolean
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
@@ -89,8 +97,8 @@ const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms
  * a different agent. Comparing it is how the supervisor notices without caring
  * why.
  */
-function fingerprint(home: string): string | null {
-  const id = resolveIdentity(home)
+function fingerprint(home: string, envKey: boolean): string | null {
+  const id = resolveIdentity(home, { envKey })
   return id === null ? null : `${id.apiKey}:${id.handle ?? ''}`
 }
 
@@ -138,6 +146,8 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
   const lock = acquireLeaderLock(home)
   if (lock === null) return 1
 
+  const envKey = opts.credentialsFromHomeOnly !== true
+  const identityOf = () => resolveIdentity(home, { envKey })
   const disabledBy = integrationDisabledBy(env)
   const disabled = disabledBy !== null
   let live: Integration | null = null
@@ -225,14 +235,14 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
 
   for (;;) {
     if (shuttingDown || opts.signal?.aborted) break
-    const fp = fingerprint(home)
+    const fp = fingerprint(home, envKey)
     const identityChanged = fp !== observedFingerprint
     if (identityChanged) {
       disconnect(fp === null ? 'signed out' : 'identity changed')
       observedFingerprint = fp
       failures = 0
       lastFailure = null
-      if (fp === null || disabled) offStatus(fp === null ? null : resolveIdentity(home)?.handle ?? null)
+      if (fp === null || disabled) offStatus(fp === null ? null : identityOf()?.handle ?? null)
     }
 
     if (fp === null) {
@@ -241,15 +251,17 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
       // Signed in, switched off. Resident, silent.
     } else if (fp !== liveFingerprint) {
       try {
-        const cfg = await resolveDaemonConfig({ home, workdir, client: opts.client })
+        const cfg = await resolveDaemonConfig({ home, workdir, client: opts.client, envKey })
+        const runner = isRunnerFactory(opts.runner) ? opts.runner.create(cfg) : opts.runner
         const candidate = new Integration({
           cfg,
-          runner: opts.runner,
+          runner,
           client: opts.client,
           manualPointer: opts.manualPointer,
           ...(opts.manualPath !== undefined ? { manualPath: opts.manualPath } : {}),
           profile,
           budgetMs,
+          ...(opts.dismissIgnoredInvites !== undefined ? { dismissIgnoredInvites: opts.dismissIgnoredInvites } : {}),
         })
         await candidate.start()
         live = candidate
@@ -265,7 +277,7 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
         if (msg !== lastFailure) {
           log.warn(`not connecting yet: ${msg}`)
           lastFailure = msg
-          offStatus(resolveIdentity(home)?.handle ?? null)
+          offStatus(identityOf()?.handle ?? null)
         }
         failures += 1
         live = null

@@ -1,0 +1,71 @@
+// ─── @agentchatme/agent-core/presets ────────────────────────────────────────
+//
+// How to start one headless run of a known coding agent, shared by the
+// `agentchat listen --preset <name>` listener and each runtime's own
+// integration package (one copy of the flags, never two). The only module of
+// this package that names a coding agent; the engine never imports it.
+
+import { claudeCodePreset } from './claude-code.js'
+import { codexPreset } from './codex.js'
+import type { Preset } from './types.js'
+
+export type { Preset, PresetContext, PresetInspection } from './types.js'
+export { semverAtLeast } from './semver.js'
+export {
+  CLAUDE_CODE_PRESET,
+  MIN_CLAUDE_CODE_VERSION,
+  CLAUDE_MCP_SERVER_NAME,
+  AGENTCHAT_TOOL_ALLOW,
+  ANSWER_TOOLS,
+  WORK_TOOLS,
+  PARENT_ENV_KEYS,
+  claudeConfigDirFrom,
+  claudeHomeFor,
+  claudeUserStatePathFor,
+  buildClaudeEnv,
+  claudeIsLoggedIn,
+  inspectClaudeRuntime,
+  deniedAncestorOf,
+  claudeProfileArgs,
+  readDenyRules,
+  inexpressibleDenyPaths,
+  claudeRunArgs,
+  claudeMcpConfig,
+  claudeMcpConfigPath,
+  ClaudeRunner,
+  claudeCodePreset,
+  type ClaudeRunArgOptions,
+  type ClaudeRunnerOptions,
+} from './claude-code.js'
+export {
+  CODEX_PRESET,
+  MIN_CODEX_VERSION,
+  CODEX_MCP_SERVER_NAME,
+  LISTENER_KEY_ENV,
+  CODEX_PROMPT_FROM_STDIN,
+  codexHomeFrom,
+  inspectCodexRuntime,
+  codexIsLoggedIn,
+  codexProfileArgs,
+  codexMcpOverrideArgs,
+  codexRunArgs,
+  agentchatTableKeys,
+  CodexRunner,
+  codexPreset,
+  type CodexMcpOverride,
+  type CodexRunnerOptions,
+} from './codex.js'
+
+/** Every preset, by the name a user types. */
+export const PRESETS: Readonly<Record<string, Preset>> = Object.freeze({
+  [claudeCodePreset.name]: claudeCodePreset,
+  [codexPreset.name]: codexPreset,
+})
+
+export function presetNamed(name: string): Preset | null {
+  return Object.prototype.hasOwnProperty.call(PRESETS, name) ? (PRESETS[name] ?? null) : null
+}
+
+export function presetNames(): string[] {
+  return Object.keys(PRESETS)
+}

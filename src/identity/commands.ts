@@ -19,7 +19,7 @@ import { identityLineOf } from '../skill/identity-line.js'
 import type { ServedManual } from '../skill/served-manual.js'
 import { anchorLabelOf, type DoctorCheck, type HostProfile, type StatusContext, type Verdict } from './host-profile.js'
 import { clientIdentityOf } from '../client-identity.js'
-import { formatIntegrationStatus, readIntegrationStatus } from '../integration/status.js'
+import { REPEATED_FAILED_CYCLES, failedCyclesInARow, formatIntegrationStatus, readIntegrationStatus } from '../integration/status.js'
 
 // ─── Identity commands, for exactly one agent ───────────────────────────────
 //
@@ -251,6 +251,7 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
 
   /** Write THIS agent's anchor. Only ever touches `profile.anchorFile()`. */
   function writeOurAnchor(handle: string, identityLine: string | null): string[] {
+    if (profile.anchorFile === undefined) return []
     const file = profile.anchorFile()
     const label = anchorLabelOf(profile)
     // A host that wires itself separately must not be handed an identity block
@@ -586,7 +587,7 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
 
   async function runStatus(opts: { json?: boolean }): Promise<number> {
     const home = profile.home()
-    const anchorFile = profile.anchorFile()
+    const anchorFile = profile.anchorFile?.() ?? null
     const identity = resolveIdentity(home)
     const pending = readPending(home)
     const integration = readIntegrationStatus(home)
@@ -640,7 +641,7 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
             key_source: identity.source,
             api_base: identity.apiBase,
             home,
-            anchor: hasAnchorAt(anchorFile),
+            anchor: anchorFile === null ? null : hasAnchorAt(anchorFile),
             integration,
             doorbell: integration,
           }),
@@ -671,7 +672,7 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
     const tray = await traySummary(client).catch(() => null)
     const texts = await served(identity.apiKey, identity.apiBase)
     const identityLine = texts.identityLine
-    const anchorCurrent = identityLine === null ? null : anchorIsCurrentAt(anchorFile, identityLine)
+    const anchorCurrent = identityLine === null || anchorFile === null ? null : anchorIsCurrentAt(anchorFile, identityLine)
 
     if (opts.json) {
       console.log(
@@ -684,8 +685,8 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
           key_source: identity.source,
           api_base: identity.apiBase,
           home,
-          anchor: hasAnchorAt(anchorFile),
-          /** null: the served texts were unavailable, so currency could not be checked. */
+          anchor: anchorFile === null ? null : hasAnchorAt(anchorFile),
+          /** null: the served texts were unavailable (or there is no instruction file), so currency could not be checked. */
           anchor_current: anchorCurrent,
           integration,
           doorbell: integration,
@@ -702,7 +703,11 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
           trayLine,
           `Key source: ${identity.source} (${identity.source === 'file' ? credentialsPath(home) : 'AGENTCHAT_API_KEY'})`,
           `API: ${identity.apiBase}`,
-          `Identity line: ${hasAnchorAt(anchorFile) ? (anchorCurrent === null ? 'present (served texts unavailable — not checked)' : anchorCurrent ? 'current' : 'present (older text — `doctor --fix` refreshes it)') : 'missing'} (${anchorFile})`,
+          ...(anchorFile === null
+            ? []
+            : [
+                `Identity line: ${hasAnchorAt(anchorFile) ? (anchorCurrent === null ? 'present (served texts unavailable — not checked)' : anchorCurrent ? 'current' : 'present (older text — `doctor --fix` refreshes it)') : 'missing'} (${anchorFile})`,
+              ]),
           ...formatIntegrationStatus(integration),
         ].join('\n'),
       )
@@ -719,7 +724,7 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
    */
   function runLogout(): number {
     const home = profile.home()
-    const anchorFile = profile.anchorFile()
+    const anchorFile = profile.anchorFile?.() ?? null
     const reports: string[] = []
     let any = false
 
@@ -732,7 +737,7 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
       any = true
       reports.push('  credentials deleted')
     }
-    if (removeAnchorAt(anchorFile) === 'removed') {
+    if (anchorFile !== null && removeAnchorAt(anchorFile) === 'removed') {
       any = true
       reports.push(`  ${anchorLabelOf(profile)} identity line removed`)
     }
@@ -761,9 +766,43 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
     return 0
   }
 
+  /** The doctor's identity-line check (and its `--fix`), for a host that has an instruction file. */
+  async function identityLineCheck(
+    anchorFile: string,
+    creds: { handle: string; api_key: string },
+    apiBase: string,
+    identityLine: string | null,
+    fix: boolean,
+  ): Promise<DoctorCheck> {
+    const claimed = readAnchorHandleAt(anchorFile)
+    const current = identityLine === null ? null : anchorIsCurrentAt(anchorFile, identityLine)
+    if (claimed === creds.handle && current === true) {
+      return { name: 'identity-line', verdict: 'PASS', detail: `@${claimed} in ${anchorFile}` }
+    }
+    if (claimed === creds.handle && current === null) {
+      return { name: 'identity-line', verdict: 'WARN', detail: `@${claimed} in ${anchorFile} (currency not checked: served texts unavailable)` }
+    }
+    const why =
+      claimed === null
+        ? `no identity line in ${anchorFile}`
+        : claimed !== creds.handle
+          ? `${anchorFile} says @${claimed} but this agent is @${creds.handle}`
+          : `${anchorFile} carries an older identity text for @${claimed}`
+    if (fix) {
+      const report = await placeIdentity(creds.handle, creds.api_key, apiBase)
+      const failed = report.some((l) => l.includes('FAILED') || l.includes('not written'))
+      return {
+        name: 'identity-line',
+        verdict: failed ? 'FAIL' : 'PASS',
+        detail: failed ? `could not repair: ${report.join('; ')}` : `repaired → @${creds.handle}`,
+      }
+    }
+    return { name: 'identity-line', verdict: 'WARN', detail: `${why} — repair with \`${invocation()} doctor --fix\`` }
+  }
+
   async function runDoctor(opts: DoctorOpts = {}): Promise<number> {
     const home = profile.home()
-    const anchorFile = profile.anchorFile()
+    const anchorFile = profile.anchorFile?.() ?? null
     const checks: DoctorCheck[] = []
     let identityLine: string | null = null
     let manual: ServedManual | null = null
@@ -810,40 +849,31 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
       // end up with an instruction file announcing the OTHER agent's handle.
       const apiBase = identity?.apiBase ?? creds.api_base ?? DEFAULT_API_BASE
       ;({ identityLine, manual } = await served(creds.api_key, apiBase))
-      const claimed = readAnchorHandleAt(anchorFile)
-      const current = identityLine === null ? null : anchorIsCurrentAt(anchorFile, identityLine)
       checks.push(
         identityLine === null
           ? { name: 'texts', verdict: 'WARN', detail: 'GET /v1/texts could not be reached and nothing is cached — the identity line cannot be checked or placed until it can' }
           : { name: 'texts', verdict: 'PASS', detail: 'served texts in hand' },
       )
-      if (claimed === creds.handle && current === true) {
-        checks.push({ name: 'identity-line', verdict: 'PASS', detail: `@${claimed} in ${anchorFile}` })
-      } else if (claimed === creds.handle && current === null) {
-        checks.push({ name: 'identity-line', verdict: 'WARN', detail: `@${claimed} in ${anchorFile} (currency not checked: served texts unavailable)` })
-      } else {
-        const why =
-          claimed === null
-            ? `no identity line in ${anchorFile}`
-            : claimed !== creds.handle
-              ? `${anchorFile} says @${claimed} but this agent is @${creds.handle}`
-              : `${anchorFile} carries an older identity text for @${claimed}`
-        if (opts.fix === true) {
-          const report = await placeIdentity(creds.handle, creds.api_key, apiBase)
-          const failed = report.some((l) => l.includes('FAILED') || l.includes('not written'))
-          checks.push({
-            name: 'identity-line',
-            verdict: failed ? 'FAIL' : 'PASS',
-            detail: failed ? `could not repair: ${report.join('; ')}` : `repaired → @${creds.handle}`,
-          })
-        } else {
-          checks.push({
-            name: 'identity-line',
-            verdict: 'WARN',
-            detail: `${why} — repair with \`${invocation()} doctor --fix\``,
-          })
-        }
-      }
+      if (anchorFile !== null) checks.push(await identityLineCheck(anchorFile, creds, apiBase, identityLine, opts.fix === true))
+    }
+
+    // The receive loop's own record: repeated cycles that did not get done
+    // (a runtime that fails, texts that never arrive, a cycle abandoned by
+    // its watchdog) are a pattern to fix, even while the socket looks fine.
+    const integration = readIntegrationStatus(home)
+    const cycles = integration?.recent_cycles ?? []
+    if (cycles.length > 0) {
+      const failing = failedCyclesInARow(integration)
+      const last = cycles[cycles.length - 1]!
+      checks.push(
+        failing !== null && failing.count >= REPEATED_FAILED_CYCLES
+          ? {
+              name: 'wake-cycles',
+              verdict: 'WARN',
+              detail: `the last ${failing.count} wake cycles did not get done (latest: ${failing.latest.outcome}${failing.latest.failure ? ` — ${failing.latest.failure}` : ''}); the cards stay on the tray`,
+            }
+          : { name: 'wake-cycles', verdict: 'PASS', detail: `last cycle ${last.outcome} at ${last.at} (${cycles.length} recent)` },
+      )
     }
 
     if (profile.extraDoctorChecks !== undefined) checks.push(...(await profile.extraDoctorChecks({ ...opts, identityLine, manual })))

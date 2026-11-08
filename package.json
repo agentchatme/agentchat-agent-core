@@ -1,7 +1,7 @@
 {
   "name": "@agentchatme/agent-core",
   "version": "0.3.1",
-  "description": "Shared host-agnostic engine for AgentChat coding-agent integrations — the AgentChat SDK socket acking on receipt, wake coalescing and the tray count before every run, the retry ladder, the served texts fetched and cached, the bundled manual, identity storage, service plumbing. Runtime code only; a library, not a CLI: every function takes an identity home, none resolves one.",
+  "description": "Shared host-agnostic engine for AgentChat integrations — the resident supervisor on the AgentChat SDK's integration kit (single-run mode: the socket acking on receipt, wakes, the tray before every run), the runner seam and spawnRun, the presets for known coding agents' headless runs, identity storage and flows, service plumbing. Runtime code only; every function takes an identity home, none resolves one.",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -15,6 +15,11 @@
       "types": "./dist/daemon-entry.d.ts",
       "import": "./dist/daemon-entry.js",
       "default": "./dist/daemon-entry.js"
+    },
+    "./presets": {
+      "types": "./dist/presets.d.ts",
+      "import": "./dist/presets.js",
+      "default": "./dist/presets.js"
     },
     "./package.json": "./package.json"
   },
@@ -37,7 +42,7 @@
     "prepare": "pnpm run build"
   },
   "dependencies": {
-    "agentchatme": "^1.2.0",
+    "agentchatme": "^1.3.0",
     "cross-spawn": "^7.0.6",
     "ws": "^8.18.0",
     "zod": "^3.23.0"

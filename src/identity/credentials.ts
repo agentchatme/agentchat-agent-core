@@ -63,8 +63,24 @@ export function readCredentials(home: string): Credentials | null {
  * `AGENTCHAT_API_KEY` overrides the file; `AGENTCHAT_API_BASE` overrides the
  * base URL. Neither is host-specific, so both are read from the environment.
  */
-export function resolveIdentity(home: string): ResolvedIdentity | null {
-  const envKey = process.env['AGENTCHAT_API_KEY']
+export interface ResolveIdentityOptions {
+  /**
+   * Whether `AGENTCHAT_API_KEY` may override the home's credentials (default
+   * true). A resident listener passes false: the agent it serves is the one
+   * its home holds, whatever happens to be exported in the shell that
+   * started it.
+   */
+  readonly envKey?: boolean
+}
+
+/** `AGENTCHAT_API_KEY` from the environment when it is set and well-formed, else null. */
+export function envApiKey(env: NodeJS.ProcessEnv = process.env): string | null {
+  const raw = env['AGENTCHAT_API_KEY']?.trim()
+  return raw !== undefined && raw.length >= 20 ? raw : null
+}
+
+export function resolveIdentity(home: string, options: ResolveIdentityOptions = {}): ResolvedIdentity | null {
+  const envKey = options.envKey === false ? undefined : process.env['AGENTCHAT_API_KEY']
   const envBase = process.env['AGENTCHAT_API_BASE']
   const file = readCredentials(home)
 
