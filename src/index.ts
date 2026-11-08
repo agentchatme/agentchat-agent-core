@@ -27,8 +27,8 @@
 // 3). What stays here is what must NOT drift between this package's
 // integrations and is not the kit's: the identity flows, the credential
 // format, the resident supervisor and the runner seam, the status file, the
-// manual's bundled fallback, the service plumbing — and the `agentchat` CLI
-// (`src/cli`) with the presets it and the integrations share (`src/presets`).
+// manual's bundled fallback, the service plumbing — and the presets the
+// integrations and the `agentchat` CLI (@agentchatme/cli) share (`./presets`).
 // What belongs to each integration: where its home is, which file its anchor
 // lives in, and where its runtime keeps skills.
 
@@ -174,45 +174,6 @@ export type {
   RunnerSource,
 } from './integration/runner.js'
 export { isRunnerFactory } from './integration/runner.js'
-
-// An MCP client of the hosted tool server: protocol only, no tool of its own.
-export {
-  McpHttpClient,
-  McpError,
-  messagesInBody,
-  MCP_CLIENT_PROTOCOL_VERSION,
-  MCP_REQUEST_TIMEOUT_MS,
-  MCP_CALL_TIMEOUT_MS,
-  type McpTool,
-  type McpToolResult,
-  type McpContentItem,
-  type McpServerInfo,
-  type McpHttpClientOptions,
-} from './mcp/client.js'
-
-// The listener: what an installed one runs, and the forwarder's wire.
-export {
-  LISTENER_CONFIG_FILE,
-  ListenerConfigSchema,
-  listenerConfigPath,
-  readListenerConfig,
-  writeListenerConfig,
-  describeListenerConfig,
-  type ListenerConfig,
-  type ListenerConfigInput,
-  type ListenerConfigRead,
-} from './listener/config.js'
-export {
-  FORWARD_SECRET_FILE,
-  FORWARD_TIMEOUT_MS,
-  forwardSecretPath,
-  ensureForwardSecret,
-  readForwardSecret,
-  forwardUrlProblem,
-  buildWakePayload,
-  wakeSummary,
-  type WakePayloadV1,
-} from './listener/forward.js'
 
 // The identity command set. An integration describes itself once (HostProfile)
 // and gets register/login/recover/status/logout/doctor back.

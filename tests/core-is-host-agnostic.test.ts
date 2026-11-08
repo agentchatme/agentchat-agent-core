@@ -19,11 +19,10 @@ import * as path from 'node:path'
 //
 // `presets/` is the one module that names coding agents: how to start a
 // known runtime's headless run, shared by the `agentchat listen --preset`
-// listener and each runtime's own integration. A preset selects a run
-// command, never an identity home. It is exempt here, and the engine — every
-// file outside `presets/` and `cli/` — may not import it (asserted below), so
-// no engine function can reach host knowledge. The CLI selects a preset by
-// name through the presets registry and names none itself.
+// listener (@agentchatme/cli) and each runtime's own integration. A preset
+// selects a run command, never an identity home. It is exempt here, and the
+// engine — every file outside `presets/` — may not import it (asserted
+// below), so no engine function can reach host knowledge.
 
 const SRC = path.join(__dirname, '..', 'src')
 
@@ -102,19 +101,18 @@ describe('agent-core names no coding agent', () => {
     expect(offenders, `no host-selecting parameter may exist here:\n${offenders.join('\n')}`).toEqual([])
   })
 
-  it('the engine never imports the presets or the CLI', () => {
+  it('the engine never imports the presets', () => {
     const offenders: string[] = []
     for (const file of files) {
       const rel = path.relative(SRC, file)
-      if (rel.startsWith(`cli${path.sep}`)) continue
       stripComments(fs.readFileSync(file, 'utf-8'))
         .split(/\r?\n/)
         .forEach((line, i) => {
-          if (/(?:from|import\()\s*['"](?:\.\.?\/)+(?:presets|cli)\//.test(line)) {
+          if (/(?:from|import\()\s*['"](?:\.\.?\/)+presets\//.test(line)) {
             offenders.push(`${rel}:${i + 1}: ${line.trim()}`)
           }
         })
     }
-    expect(offenders, `the engine may not import presets/ or cli/:\n${offenders.join('\n')}`).toEqual([])
+    expect(offenders, `the engine may not import presets/:\n${offenders.join('\n')}`).toEqual([])
   })
 })

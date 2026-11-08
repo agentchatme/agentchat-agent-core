@@ -8,14 +8,8 @@ Rebuilt and added behaviour (the number is set at the release step, `VERSIONING.
 
 ### Added
 
-- **The `agentchat` CLI** (bin `agentchat`; `npx -y @agentchatme/agent-core …`), with its identity home at `--home`, else `$AGENTCHAT_HOME`, else `~/.agentchat` (the home the stdio MCP server reads).
-  - `listen --run "<command>"`: the universal listener — on each wake the owner's command runs once through the shell, the served wake instruction on stdin, identity in `AGENTCHAT_HOME` / `_HANDLE` / `_API_BASE` / `_MCP_URL` / `_WAKE_KIND` / `_RUN_ID`, the key only with `--with-key`.
-  - `listen --preset claude-code|codex [--profile …]`: the runtime's headless run acting as the listener's agent (Claude Code: `--mcp-config <owner-only file> --strict-mcp-config`, the home denied to its file tools; Codex: per-run `-c` overrides naming `AGENTCHAT_LISTENER_API_KEY`).
-  - `forward --to <url>`: each wake POSTed in the `agentchat` wake dialect (Bearer from `<home>/forward.secret`, payload version 1 from the tray's counts; http only to loopback, no redirects).
-  - `--install` / `--uninstall`: `<home>/listener.json` and a launchd / systemd / Windows service running a durable self-contained copy (`dist/listener-daemon.js`).
-  - `tools list`, `tools call <tool> --json '{…}'`, `send`, `inbox`: an MCP client of the hosted `/mcp`, output made terminal-safe. `watch`: frame types and ids and the wake cycles a listener would start.
-- **`@agentchatme/agent-core/presets`**: the Claude Code and Codex headless runs (flags per profile, environment, version floor, sign-in probe), moved here from the two integrations so they and the listener share one copy. The engine never imports it (asserted).
-- `RunnerFactory` (a runner per identity), `spawnRun({ shell: true })`, `IntegrationClient.name`, `McpHttpClient`, the listener config and forward helpers, `HostProfile.anchorFile` optional.
+- **`@agentchatme/agent-core/presets`**: the Claude Code and Codex headless runs (flags per profile, environment, version floor, sign-in probe), moved here from the two integrations so they and the `agentchat listen --preset` listener (`@agentchatme/cli`) share one copy. A preset run built for a listener acts as the listener's agent (Claude Code: `--mcp-config <owner-only file> --strict-mcp-config`; Codex: per-run `-c mcp_servers.agentchat.*` naming `AGENTCHAT_LISTENER_API_KEY`); an integration's runs keep the hosted server it places. The engine never imports it (asserted).
+- Seams for the `agentchat` CLI (`@agentchatme/cli`, its own package): `RunnerFactory` (a runner per identity), `spawnRun({ shell: true })`, `IntegrationClient.name`, `HostProfile.anchorFile` optional.
 
 ### Changed
 

@@ -11,9 +11,9 @@ import type { RunRunner } from '../integration/runner.js'
 // in, and how a run of it reaches the hosted AgentChat tools AS a given agent.
 //
 // Two front doors select one, and only ever for the run command: the
-// `agentchat listen --preset <name>` listener (its identity is the listener's
-// own home, injected into each run), and the runtime's own integration
-// package (its identity home and placement stay the integration's). A preset
+// `agentchat listen --preset <name>` listener (@agentchatme/cli; its identity
+// is the listener's own home, injected into each run), and the runtime's own
+// integration package (its identity home and placement stay the integration's). A preset
 // never decides which identity home is acted on — the caller passes it.
 
 /** What a preset needs to build a runner acting as one agent. */
