@@ -244,7 +244,7 @@ export class Integration {
 
   /**
    * Stop holding the socket and interrupt a run in flight (its signal aborts;
-   * the runner SIGTERMs its process group). `settled()` / `stopAndWait()`
+   * the runner SIGTERMs its process group). `idle()` / `stopAndWait()`
    * tell when the run has actually ended.
    */
   stop(): void {
@@ -276,9 +276,9 @@ export class Integration {
     }
   }
 
-  /** Resolves when the running cycle (and its run) has finished. */
-  settled(): Promise<void> {
-    return this.loop.settled()
+  /** Resolves when no cycle (and so no run) is running: the kit's `ReceiveLoop.idle()`. */
+  idle(): Promise<void> {
+    return this.loop.idle()
   }
 
   /** A wake heard outside the socket (a test, a webhook the integration received). */
