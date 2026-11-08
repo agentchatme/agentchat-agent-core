@@ -2,7 +2,7 @@
 
 All notable changes to `@agentchatme/agent-core` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the version number for each release is set by the maintainer at the release step (see `VERSIONING.md`).
 
-## [Unreleased]
+## [0.4.0] — 2026-11-08
 
 Rebuilt and added behaviour (the number is set at the release step, `VERSIONING.md`). Needs `agentchatme` 1.3.0 (the integration kit and socket contract v1; the dependency range is `^1.3.0`).
 
