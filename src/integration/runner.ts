@@ -10,8 +10,21 @@
 /** `invite` when the tray held only pending invites (the served invite prompt); `wake` otherwise. */
 export type RunKind = 'wake' | 'invite'
 
+/**
+ * The wake that started a run, named as the webhook wake names it (contract
+ * v1): `messages`, `reminder`, `invite`, `unanswered` (with `step`, the
+ * re-wake rung) — or another reason a newer server sends. Facts about the
+ * signal only, never content.
+ */
+export interface RunWake {
+  readonly reason: string
+  readonly step?: number
+}
+
 export interface RunRequest {
   readonly kind: RunKind
+  /** The wake that started this run (the newest since the previous run started). */
+  readonly wake?: RunWake
   /** The prompt for this kind of run: the served text (the kit's receive loop picks it), then the manual pointer. */
   readonly prompt: string
   /** Unique per run; for logs and for runtimes that want a session name. */

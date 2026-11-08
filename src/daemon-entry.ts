@@ -26,6 +26,7 @@ export type {
   RunnerIdentity,
   RunnerFactory,
   RunnerSource,
+  RunWake,
 } from './integration/runner.js'
 
 export { resolveDaemonConfig, wsBaseFor, wsUrlFor, type DaemonConfig, type ResolveDaemonOpts } from './daemon/config.js'

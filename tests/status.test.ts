@@ -188,3 +188,24 @@ describe('profile and switches', () => {
     expect(resolveRunBudgetMs({ AGENTCHAT_RUN_BUDGET_MS: String(10 * 3_600_000) })).toBe(2 * 3_600_000)
   })
 })
+
+describe('recent wake cycles in status', () => {
+  const cycle = (outcome: string, failure: string | null = null) => ({ at: new Date().toISOString(), outcome, cards: 1, invites: 0, failure })
+  it('counts the failed cycles in a row at the end; one success breaks the run', async () => {
+    const { failedCyclesInARow, REPEATED_FAILED_CYCLES } = await import('../src/integration/status.js')
+    expect(failedCyclesInARow({ recent_cycles: [] })).toBeNull()
+    expect(failedCyclesInARow({ recent_cycles: [cycle('run_failed'), cycle('run_completed')] })).toBeNull()
+    expect(failedCyclesInARow({ recent_cycles: [cycle('run_completed'), cycle('run_failed'), cycle('abandoned', 'past its deadline')] })).toMatchObject({ count: 2, latest: { outcome: 'abandoned' } })
+    expect(REPEATED_FAILED_CYCLES).toBe(3)
+  })
+
+  it('status prints the last cycle, and a warning after three failed in a row', async () => {
+    const { formatIntegrationStatus } = await import('../src/integration/status.js')
+    const base = { version: 2 as const, updated_at: new Date().toISOString(), pid: 1, runtime: 'x', handle: 'h', profile: 'answer', socket: 'ready' as const, wakes: 3, wakes_absorbed: 0, invites: 0, runs_started: 3, runs_ok: 0, runs_failed: 3, runs_timed_out: 0, runs_not_started: 0, runs_skipped_empty: 0, last_run: null, retry_rung: 0, retry_due_at: null, last_error: null, texts: null }
+    const ok = formatIntegrationStatus({ ...base, recent_cycles: [cycle('run_completed')] }).join('\n')
+    expect(ok).toMatch(/cycles: 1 recent; the last one run_completed/)
+    expect(ok).not.toMatch(/WARNING/)
+    const bad = formatIntegrationStatus({ ...base, recent_cycles: [cycle('run_failed'), cycle('run_failed'), cycle('run_failed', 'exit 1')] }).join('\n')
+    expect(bad).toMatch(/WARNING: the last 3 wake cycles did not get done \(latest: run_failed — exit 1\)/)
+  })
+})

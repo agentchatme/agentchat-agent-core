@@ -263,6 +263,50 @@ describe('Integration — single-run mode on the kit', () => {
   }, 10_000)
 })
 
+describe('Integration — what the run is told, and what is recorded', () => {
+  it('each run carries the wake that started it: messages, reminder, unanswered with its step, invite', async () => {
+    double = await startServerDouble({ tray: { waiting: 0 }, helloCapabilities: ['ack', 'heartbeat', 'rewake'] })
+    const runner = new FakeRunner(() => double)
+    const i = await integration(runner)
+    await until(() => i.snapshot().runs_skipped_empty === 1, 5_000)
+    double.setTray({ waiting: 1 })
+    double.send({ type: 'message.new', payload: { id: 'msg_w1', conversation_id: 'conv_0', sender: 'peer', content: { text: 'x' } } })
+    await until(() => runner.requests.length === 1, 5_000)
+    double.send({ type: 'wake', payload: { reason: 'reminder', conversation_id: 'conv_0', anchor_message_id: 'msg_0', step: 1, at: new Date().toISOString() } })
+    await until(() => runner.requests.length === 2, 5_000)
+    double.send({ type: 'wake', payload: { reason: 'unanswered', conversation_ids: ['conv_0'], step: 3, at: new Date().toISOString() } })
+    await until(() => runner.requests.length === 3, 5_000)
+    double.setTray({ waiting: 0, invites: ['gri_9'] })
+    double.send({ type: 'group.invite.received', payload: { invite_id: 'gri_9' } })
+    await until(() => runner.requests.length === 4, 5_000)
+    expect(runner.requests.map((r) => r.wake)).toEqual([{ reason: 'messages' }, { reason: 'reminder' }, { reason: 'unanswered', step: 3 }, { reason: 'invite' }])
+  }, 15_000)
+
+  it('dismissIgnoredInvites: false — two completed runs leave an invite pending and nothing is dismissed', async () => {
+    double = await startServerDouble({ tray: { waiting: 0, invites: ['gri_3'] } })
+    const runner = new FakeRunner(() => double)
+    await integration(runner, { dismissIgnoredInvites: false })
+    await until(() => runner.requests.length === 1, 5_000)
+    double.send({ type: 'group.invite.received', payload: { invite_id: 'gri_3' } })
+    await until(() => runner.requests.length === 2, 5_000)
+    double.send({ type: 'group.invite.received', payload: { invite_id: 'gri_3' } })
+    await until(() => runner.requests.length === 3, 5_000)
+    await pause(300)
+    expect(double.dismissed).toEqual([])
+  }, 15_000)
+
+  it('the status file keeps the recent wake cycles: outcomes and counts, a bounded failure line', async () => {
+    double = await startServerDouble({ tray: { waiting: 1 } })
+    const runner = new FakeRunner(() => double, 'not_started')
+    const i = await integration(runner)
+    await until(() => (i.snapshot().recent_cycles ?? []).length >= 1, 5_000)
+    const status = readIntegrationStatus(home)
+    expect(status?.recent_cycles?.[0]).toMatchObject({ outcome: 'run_not_started', cards: 1, invites: 0 })
+    expect((status?.recent_cycles?.[0]?.failure ?? '').length).toBeLessThanOrEqual(240)
+    expect(JSON.stringify(status?.recent_cycles)).not.toContain('PREVIEW')
+  }, 10_000)
+})
+
 describe('Integration — the served texts', () => {
   it('with the texts unreachable and nothing cached, a wake starts no run; once the server answers, the next wake runs with the served text', async () => {
     double = await startServerDouble({ tray: { waiting: 1 }, textsStatus: 503 })

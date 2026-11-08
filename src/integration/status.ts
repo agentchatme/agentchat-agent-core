@@ -78,7 +78,47 @@ export interface IntegrationStatus {
   texts: TextsStatus | null
   /** The socket capabilities the server accepted (`ack`, `heartbeat`, `rewake`); null before a hello, or from an older daemon. */
   capabilities?: string[] | null
+  /** The receive loop's most recent wake cycles, oldest first (the kit's `status().recentCycles`, reduced); null from an older daemon. */
+  recent_cycles?: IntegrationCycle[] | null
 }
+
+/** One wake cycle as the status file keeps it: what it found and how it ended. Counts and outcomes only. */
+export interface IntegrationCycle {
+  at: string
+  /** The kit's cycle outcome: `empty`, `nothing_owed`, `run_completed`, `run_failed`, `abandoned`, … */
+  outcome: string
+  cards: number
+  invites: number
+  /** Why it did not finish, bounded; null when it did. */
+  failure: string | null
+}
+
+/** Cycle outcomes that mean a wake was owed something and it did not get done. */
+export const FAILED_CYCLE_OUTCOMES: ReadonlySet<string> = new Set([
+  'tray_failed',
+  'texts_missing',
+  'tools_unavailable',
+  'fail_closed',
+  'run_failed',
+  'run_not_started',
+  'abandoned',
+])
+
+/** How many of the newest cycles in a row did not get done, with the newest failure; null when the newest cycle did. */
+export function failedCyclesInARow(status: Pick<IntegrationStatus, 'recent_cycles'> | null): { count: number; latest: IntegrationCycle } | null {
+  const cycles = status?.recent_cycles ?? []
+  let count = 0
+  for (let i = cycles.length - 1; i >= 0; i--) {
+    const cycle = cycles[i]
+    if (cycle === undefined || !FAILED_CYCLE_OUTCOMES.has(cycle.outcome)) break
+    count += 1
+  }
+  const latest = cycles[cycles.length - 1]
+  return count === 0 || latest === undefined ? null : { count, latest }
+}
+
+/** This many failed cycles in a row is a warning in `status` and `doctor`: one is a hiccup, three is a pattern. */
+export const REPEATED_FAILED_CYCLES = 3
 
 // What is accepted on read: the current shape (version 2, `wakes`) and the
 // one before it (version 1, `knocks`, `last_run.kind: 'knock'`, `ack_negotiated`).
@@ -125,6 +165,10 @@ const StatusSchema = z
     last_error: z.string().nullable(),
     texts: TextsStatusSchema.nullable().default(null),
     capabilities: z.array(z.string()).nullable().optional(),
+    recent_cycles: z
+      .array(z.object({ at: z.string(), outcome: z.string(), cards: z.number(), invites: z.number(), failure: z.string().nullable() }))
+      .nullable()
+      .optional(),
   })
   .passthrough()
 
@@ -154,6 +198,7 @@ function normalize(raw: z.infer<typeof StatusSchema>): IntegrationStatus {
     last_error: raw.last_error,
     texts: raw.texts,
     capabilities: raw.capabilities ?? null,
+    recent_cycles: raw.recent_cycles ?? null,
   }
 }
 
@@ -249,6 +294,15 @@ export function formatIntegrationStatus(status: IntegrationStatus | null, now = 
     )
   } else {
     lines.push('  last run: none yet')
+  }
+  const cycles = status.recent_cycles ?? []
+  if (cycles.length > 0) {
+    const last = cycles[cycles.length - 1]!
+    lines.push(`  cycles: ${cycles.length} recent; the last one ${last.outcome} (${last.cards} card(s), ${last.invites} invite(s)) ${ago(Math.max(0, now - Date.parse(last.at)))}`)
+    const failing = failedCyclesInARow(status)
+    if (failing !== null && failing.count >= REPEATED_FAILED_CYCLES) {
+      lines.push(`  WARNING: the last ${failing.count} wake cycles did not get done (latest: ${failing.latest.outcome}${failing.latest.failure ? ` — ${failing.latest.failure}` : ''})`)
+    }
   }
   if (status.retry_due_at) {
     const due = Date.parse(status.retry_due_at) - now

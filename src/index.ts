@@ -64,6 +64,7 @@ export {
   statePath,
   readCredentials,
   resolveIdentity,
+  envApiKey,
   writeCredentials,
   clearCredentials,
   readPending,
@@ -71,6 +72,7 @@ export {
   clearPending,
   type Credentials,
   type ResolvedIdentity,
+  type ResolveIdentityOptions,
   type PendingRegistration,
 } from './identity/credentials.js'
 
@@ -154,6 +156,10 @@ export {
   formatIntegrationStatus,
   type IntegrationStatus,
   type IntegrationLastRun,
+  type IntegrationCycle,
+  FAILED_CYCLE_OUTCOMES,
+  REPEATED_FAILED_CYCLES,
+  failedCyclesInARow,
   type TextsStatus,
   type SocketState,
 } from './integration/status.js'
@@ -172,6 +178,7 @@ export type {
   RunnerIdentity,
   RunnerFactory,
   RunnerSource,
+  RunWake,
 } from './integration/runner.js'
 export { isRunnerFactory } from './integration/runner.js'
 

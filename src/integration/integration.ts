@@ -5,7 +5,7 @@ import type { DaemonConfig } from '../daemon/config.js'
 import { beat, idle } from '../daemon/health.js'
 import { clientIdentityOf, type IntegrationClient } from '../client-identity.js'
 import type { RunProfile } from './profile.js'
-import type { RunKind, RunOutcome, RunRunner } from './runner.js'
+import type { RunKind, RunOutcome, RunRunner, RunWake } from './runner.js'
 import { writeIntegrationStatus, type IntegrationLastRun, type IntegrationStatus, type SocketState } from './status.js'
 import { blockedDetail, socketStateOf } from './socket-state.js'
 import { textsCachePath } from './texts.js'
@@ -80,6 +80,33 @@ export interface IntegrationOptions {
   /** Injectable for tests: the coalescing window. */
   readonly quietMs?: number
   readonly maxMs?: number
+  /** Injectable for tests: the kit's cycle watchdog (default 10 min, not counting runs). */
+  readonly cycleTimeoutMs?: number
+  /**
+   * The kit's single-run rule dismisses an invite two completed runs left
+   * pending, so an ignored invite does not cost a run on every wake. Right
+   * when a run is the agent itself; wrong when "completed" only means a
+   * receiver accepted a POST (the `agentchat forward` mode): there it is
+   * false, and no invite is ever dismissed on the agent's behalf.
+   */
+  readonly dismissIgnoredInvites?: boolean
+}
+
+/** Most of a failure line: enough to diagnose, bounded for the status file. */
+const CYCLE_FAILURE_CHARS = 240
+
+/** The webhook wake's reason for a kit wake source (contract v1); null when the source names none. */
+function reasonOf(source: kit.WakeSource, frameReason: string | undefined): string | null {
+  switch (source) {
+    case 'message':
+      return 'messages'
+    case 'invite':
+      return 'invite'
+    case 'wake_frame':
+      return frameReason ?? 'reminder'
+    default:
+      return null
+  }
 }
 
 /** `work`, or `onTimeout()` once `ms` have passed — whichever first. A late result is dropped. */
@@ -134,6 +161,10 @@ export class Integration {
   private runsNotStarted = 0
   private runsSkippedEmpty = 0
   private lastRun: IntegrationLastRun | null = null
+  /** The newest wake since the last run started (for `RunRequest.wake`). */
+  private pendingWake: RunWake | null = null
+  /** The rung of the newest `unanswered` wake frame (the kit's wake event does not carry it). */
+  private lastUnansweredStep: number | null = null
 
   constructor(private readonly options: IntegrationOptions) {
     const { cfg, client } = options
@@ -201,8 +232,12 @@ export class Integration {
       log.error(`socket blocked (auth): ${this.lastError}`)
       this.writeStatus()
     })
+    this.realtime.on('wake', (frame) => {
+      const payload = (frame.payload ?? {}) as { reason?: unknown; step?: unknown }
+      if (payload.reason === 'unanswered' && typeof payload.step === 'number') this.lastUnansweredStep = payload.step
+    })
     this.loop = new kit.ReceiveLoop({
-      client: this.api,
+      client: options.dismissIgnoredInvites === false ? withoutInviteDismissal(this.api) : this.api,
       texts: this.texts,
       mode: 'singleRun',
       socket: this.realtime,
@@ -211,6 +246,7 @@ export class Integration {
       onEvent: (event) => this.onEvent(event),
       ...(options.quietMs !== undefined ? { quietMs: options.quietMs } : {}),
       ...(options.maxMs !== undefined ? { maxMs: options.maxMs } : {}),
+      ...(options.cycleTimeoutMs !== undefined ? { cycleTimeoutMs: options.cycleTimeoutMs } : {}),
     })
   }
 
@@ -318,6 +354,13 @@ export class Integration {
         manual_version: texts?.manual.version ?? null,
       },
       capabilities: status.socket === null ? null : status.socket.capabilities,
+      recent_cycles: status.recentCycles.map((cycle) => ({
+        at: cycle.at,
+        outcome: cycle.outcome,
+        cards: cycle.cards,
+        invites: cycle.invites,
+        failure: cycle.failure === null ? null : cycle.failure.slice(0, CYCLE_FAILURE_CHARS),
+      })),
     }
   }
 
@@ -326,6 +369,10 @@ export class Integration {
   private async startRun(request: kit.RunRequest): Promise<kit.RunEnd> {
     // Invites alone: the served invite prompt. Anything else: a wake run.
     const kind: RunKind = request.cards === 0 && (request.invites ?? 0) > 0 ? 'invite' : 'wake'
+    // What woke it: the newest named wake since the previous run; a connect
+    // (or a follow-on) names none, and the tray says what it found.
+    const wake: RunWake = this.pendingWake ?? { reason: kind === 'invite' ? 'invite' : 'messages' }
+    this.pendingWake = null
     const runId = crypto.randomUUID()
     const startedAt = Date.now()
     const budgetMs = this.options.budgetMs
@@ -344,6 +391,7 @@ export class Integration {
       outcome = await withDeadline(
         this.options.runner.start({
           kind,
+          wake,
           prompt: `${request.prompt}\n\n${this.options.manualPointer}`,
           runId,
           budgetMs,
@@ -402,10 +450,15 @@ export class Integration {
 
   private onEvent(event: kit.ReceiveLoopEvent): void {
     switch (event.type) {
-      case 'wake':
+      case 'wake': {
         if (event.source === 'invite') this.invites += 1
-        log.info(`wake — ${event.source}${event.conversationId ? ` conv=${event.conversationId}` : ''}`)
+        const reason = reasonOf(event.source, event.reason)
+        if (reason !== null) {
+          this.pendingWake = reason === 'unanswered' && this.lastUnansweredStep !== null ? { reason, step: this.lastUnansweredStep } : { reason }
+        }
+        log.info(`wake — ${event.source}${event.reason ? ` (${event.reason})` : ''}${event.conversationId ? ` conv=${event.conversationId}` : ''}`)
         break
+      }
       case 'echo':
         log.debug(`own echo${event.conversationId ? ` in ${event.conversationId}` : ''} — not a wake`)
         break
@@ -414,6 +467,8 @@ export class Integration {
         if (outcome === 'empty' || outcome === 'nothing_owed') {
           this.runsSkippedEmpty += 1
           log.info(`wake: ${outcome === 'empty' ? 'the tray is empty' : 'nothing owed (muted cards only)'} — no run (${cards} card(s), ${invites} invite(s))`)
+        } else if (outcome === 'abandoned') {
+          log.warn(`wake cycle abandoned by the watchdog: ${event.summary.failure ?? 'it ran past its deadline'} — the next wake starts a new one`)
         } else if (outcome === 'texts_missing') {
           this.runsNotStarted += 1
           log.warn('no served texts in hand: GET /v1/texts has not answered yet and nothing is cached in the identity home — no run this time')
@@ -432,4 +487,15 @@ export class Integration {
   private writeStatus(): void {
     writeIntegrationStatus(this.options.cfg.home, this.snapshot())
   }
+}
+
+/**
+ * The loop's client with `groups.dismissInvite` answered here, never sent:
+ * for a mode whose "completed run" is no proof the agent saw an invite.
+ * Everything else is the real client's.
+ */
+function withoutInviteDismissal(api: AgentChatClient): kit.ReceiveLoopClient {
+  const groups = Object.create(api.groups) as AgentChatClient['groups']
+  groups.dismissInvite = async () => ({ dismissed: false })
+  return { inbox: api.inbox, decisions: api.decisions, groups, ...(typeof api.baseUrl === 'string' ? { baseUrl: api.baseUrl } : {}) }
 }

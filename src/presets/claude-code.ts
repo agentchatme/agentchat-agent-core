@@ -236,12 +236,26 @@ export interface ClaudeRunArgOptions {
   readonly mcpConfigPath?: string | undefined
 }
 
-/** `/Users/x/.claude/agentchat` → `Read(//Users/x/.claude/agentchat/**)` and `Read(//Users/x/.claude/agentchat)`. */
+/** Whether a path can be carried by a `Read(//<path>)` rule in a comma/space-separated list: absolute POSIX, no comma, no whitespace. */
+function expressible(raw: string): boolean {
+  return raw.startsWith('/') && !/[,\s]/.test(raw)
+}
+
+/**
+ * The deny paths no rule can carry: on Windows all of them (the rule syntax
+ * for drive paths is undocumented), elsewhere a relative path or one with a
+ * comma or whitespace. A run would be able to read these.
+ */
+export function inexpressibleDenyPaths(paths: readonly string[]): string[] {
+  return process.platform === 'win32' ? [...paths] : paths.filter((p) => !expressible(p))
+}
+
+/** `/Users/x/.claude/agentchat` → `Read(//Users/x/.claude/agentchat/**)` and `Read(//Users/x/.claude/agentchat)`. Paths no rule can carry are left out (`inexpressibleDenyPaths`). */
 export function readDenyRules(paths: readonly string[]): string[] {
   if (process.platform === 'win32') return []
   const rules: string[] = []
   for (const raw of paths) {
-    if (!raw.startsWith('/') || raw.includes(',') || raw.includes(' ')) continue // not expressible in a comma/space list
+    if (!expressible(raw)) continue
     const clean = raw.replace(/\/+$/, '')
     rules.push(`Read(/${clean})`, `Read(/${clean}/**)`)
   }
@@ -298,6 +312,12 @@ export interface ClaudeRunnerOptions {
   readonly mcpConfigPath?: string
   /** The one-line fix printed when the workdir sits inside a denied path. */
   readonly workdirAdvice?: string
+  /**
+   * A deny path no rule can carry (a comma or whitespace in it; every path on
+   * Windows): `warn` (default) logs it once and runs — the run can then read
+   * that path; `refuse` fails preflight with the reason, so no run starts.
+   */
+  readonly inexpressibleDeny?: 'warn' | 'refuse'
   /** Test seam: the binary to run. */
   readonly command?: string
   readonly env?: NodeJS.ProcessEnv
@@ -308,6 +328,7 @@ export class ClaudeRunner implements RunRunner {
   private readonly command: string
   /** The workdir warning is one line per process, not one per preflight (preflight repeats every few minutes). */
   private warnedWorkdir = false
+  private warnedDeny = false
 
   constructor(private readonly options: ClaudeRunnerOptions) {
     this.command = options.command ?? 'claude'
@@ -333,6 +354,18 @@ export class ClaudeRunner implements RunRunner {
       log.warn(
         `the run workdir ${this.options.workdir} is inside ${denied}, which every run's file tools are denied: runs cannot read their own working directory.${this.options.workdirAdvice ? ` ${this.options.workdirAdvice}` : ''}`,
       )
+    }
+    const uncovered = inexpressibleDenyPaths(this.options.denyReadPaths)
+    if (uncovered.length > 0) {
+      const why =
+        process.platform === 'win32'
+          ? `Claude Code's rule syntax for Windows paths is undocumented, so no read-deny rule is given for ${uncovered.join(', ')}`
+          : `no read-deny rule can carry ${uncovered.join(', ')} (a comma or whitespace in the path)`
+      if (this.options.inexpressibleDeny === 'refuse') return { ok: false, detail: `${why}: a run could read the key there. Use an identity home whose path has no comma or whitespace (--home).` }
+      if (!this.warnedDeny) {
+        this.warnedDeny = true
+        log.warn(`${why}: runs can read those paths.`)
+      }
     }
     if (this.options.mcpConfigPath !== undefined && !fs.existsSync(this.options.mcpConfigPath)) {
       return { ok: false, detail: `the hosted tool config ${this.options.mcpConfigPath} is missing` }
@@ -378,6 +411,12 @@ export function claudeMcpConfigPath(home: string): string {
 
 export const claudeCodePreset: Preset = {
   name: CLAUDE_CODE_PRESET,
+  describeMcp({ home, apiBase }) {
+    return [
+      `--mcp-config ${claudeMcpConfigPath(home)} (owner-only): ${CLAUDE_MCP_SERVER_NAME} → ${hostedMcpUrl(apiBase)}, Authorization: Bearer <this home's key>`,
+      '--strict-mcp-config: no other MCP server (user, project or plugin) is loaded in these runs',
+    ]
+  },
   label: 'Claude Code',
   runtime: 'claude-code',
   // Every run's file tools are denied the identity home.
@@ -407,6 +446,9 @@ export const claudeCodePreset: Preset = {
       denyReadPaths: [ctx.home, claudeUserStatePathFor(configDir), path.join(claudeHomeFor(configDir), 'agentchat')],
       mcpConfigPath,
       workdirAdvice: 'Start the listener from a directory outside it, or pass --workdir.',
+      // On POSIX a listener's run must not start with its key readable; on
+      // Windows no rule exists at all (documented), so it warns.
+      inexpressibleDeny: process.platform === 'win32' ? 'warn' : 'refuse',
       ...(ctx.command !== undefined ? { command: ctx.command } : {}),
       env,
     })

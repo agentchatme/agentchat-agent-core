@@ -211,8 +211,44 @@ export class CodexRunner implements RunRunner {
   }
 }
 
+/**
+ * The keys of `[mcp_servers.agentchat]` in a config.toml, or null when the
+ * table is absent. Keys only — a value can be a secret. A line scan, not a
+ * TOML parser: enough to say what a run's `-c` overrides merge over.
+ */
+export function agentchatTableKeys(configToml: string): string[] | null {
+  const lines = configToml.split(/\r?\n/)
+  const header = new RegExp(`^\\s*\\[mcp_servers\\.${CODEX_MCP_SERVER_NAME}\\]\\s*(#.*)?$`)
+  const start = lines.findIndex((line) => header.test(line))
+  if (start < 0) return null
+  const keys: string[] = []
+  for (const line of lines.slice(start + 1)) {
+    if (/^\s*\[/.test(line)) break
+    const match = /^\s*([A-Za-z0-9_.-]+)\s*=/.exec(line)
+    if (match?.[1] !== undefined) keys.push(match[1])
+  }
+  return keys
+}
+
 export const codexPreset: Preset = {
   name: CODEX_PRESET,
+  describeMcp({ apiBase, env = process.env }) {
+    const file = path.join(codexHomeFrom(env), 'config.toml')
+    let own: string[] | null = null
+    try {
+      own = agentchatTableKeys(fs.readFileSync(file, 'utf-8'))
+    } catch {
+      own = null
+    }
+    return [
+      `-c mcp_servers.${CODEX_MCP_SERVER_NAME}.url="${hostedMcpUrl(apiBase)}"`,
+      `-c mcp_servers.${CODEX_MCP_SERVER_NAME}.bearer_token_env_var="${LISTENER_KEY_ENV}" (the key set in the run's environment, never on argv)`,
+      `-c mcp_servers.${CODEX_MCP_SERVER_NAME}.default_tools_approval_mode="approve"`,
+      own === null
+        ? `${file}: no [mcp_servers.${CODEX_MCP_SERVER_NAME}] of its own — the run sees only the overrides above`
+        : `${file}: [mcp_servers.${CODEX_MCP_SERVER_NAME}] also sets ${own.length > 0 ? own.join(', ') : 'nothing'}; the overrides above replace their keys, the others still apply (how codex merges -c over an existing table is not verified on a real codex)`,
+    ]
+  },
   label: 'Codex',
   runtime: 'codex',
   // A read-only sandbox reads the whole filesystem.

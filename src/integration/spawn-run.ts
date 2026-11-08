@@ -30,8 +30,10 @@ import type { RunOutcome } from './runner.js'
 //     stdout/stderr (a helper spawned with inherited pipes, an MCP server
 //     that daemonised): Node's `close` waits for every holder of the pipes,
 //     so it never comes. After `exit`, `close` gets DRAIN_MS; then the
-//     leftovers of the run's process group are killed, the pipes are
-//     dropped, and the run is classified by the exit it did make.
+//     run's process group is signalled (SIGKILL), the pipes are dropped, and
+//     the run is classified by the exit it did make. A process that left the
+//     group (`setsid`, a daemonising helper) is not reached by that signal
+//     and can survive the run; the pipes are let go either way.
 //   * a SIGKILL that does not end it (a process that escaped the group with
 //     `setsid` and still holds the pipes; a process stuck in the kernel):
 //     ABANDON_MS after the SIGKILL the pipes are dropped, the child is
@@ -287,7 +289,7 @@ export function spawnRun(spec: SpawnRunSpec): Promise<RunOutcome> {
         // The run is over; what is left of its process group is a leftover.
         killProcessTree(proc, 'SIGKILL')
         detach()
-        finish(classify(exited.code, exited.signal, 'a process the run started kept its output open after it exited; it was killed and the run detached from it'))
+        finish(classify(exited.code, exited.signal, 'a process the run started kept its output open after it exited; the run\'s process group was signalled (SIGKILL) and the run detached from it — a process that left the group can survive'))
       })
     })
 

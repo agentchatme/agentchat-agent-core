@@ -19,7 +19,7 @@ import { identityLineOf } from '../skill/identity-line.js'
 import type { ServedManual } from '../skill/served-manual.js'
 import { anchorLabelOf, type DoctorCheck, type HostProfile, type StatusContext, type Verdict } from './host-profile.js'
 import { clientIdentityOf } from '../client-identity.js'
-import { formatIntegrationStatus, readIntegrationStatus } from '../integration/status.js'
+import { REPEATED_FAILED_CYCLES, failedCyclesInARow, formatIntegrationStatus, readIntegrationStatus } from '../integration/status.js'
 
 // ─── Identity commands, for exactly one agent ───────────────────────────────
 //
@@ -855,6 +855,25 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
           : { name: 'texts', verdict: 'PASS', detail: 'served texts in hand' },
       )
       if (anchorFile !== null) checks.push(await identityLineCheck(anchorFile, creds, apiBase, identityLine, opts.fix === true))
+    }
+
+    // The receive loop's own record: repeated cycles that did not get done
+    // (a runtime that fails, texts that never arrive, a cycle abandoned by
+    // its watchdog) are a pattern to fix, even while the socket looks fine.
+    const integration = readIntegrationStatus(home)
+    const cycles = integration?.recent_cycles ?? []
+    if (cycles.length > 0) {
+      const failing = failedCyclesInARow(integration)
+      const last = cycles[cycles.length - 1]!
+      checks.push(
+        failing !== null && failing.count >= REPEATED_FAILED_CYCLES
+          ? {
+              name: 'wake-cycles',
+              verdict: 'WARN',
+              detail: `the last ${failing.count} wake cycles did not get done (latest: ${failing.latest.outcome}${failing.latest.failure ? ` — ${failing.latest.failure}` : ''}); the cards stay on the tray`,
+            }
+          : { name: 'wake-cycles', verdict: 'PASS', detail: `last cycle ${last.outcome} at ${last.at} (${cycles.length} recent)` },
+      )
     }
 
     if (profile.extraDoctorChecks !== undefined) checks.push(...(await profile.extraDoctorChecks({ ...opts, identityLine, manual })))

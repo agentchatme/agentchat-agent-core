@@ -4,7 +4,7 @@ import { defineConfig } from 'tsup'
 //   dist/index.js         the main entry (no socket layer)
 //   dist/daemon-entry.js  `./daemon` — the resident engine; pulls in `ws` via the SDK
 //   dist/presets.js       `./presets` — how to start a known coding agent's headless run
-// The `agentchat` CLI is built separately (tsup.cli.config.ts) as standalone bundles.
+// The `agentchat` CLI is its own package (@agentchatme/cli), which bundles this one.
 export default defineConfig({
   entry: { index: 'src/index.ts', 'daemon-entry': 'src/daemon-entry.ts', presets: 'src/presets/index.ts' },
   format: ['esm'],
