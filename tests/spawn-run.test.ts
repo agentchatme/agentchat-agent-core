@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
-import { redactDiagnostic, spawnRun } from '../src/integration/spawn-run.js'
+import { redactDiagnostic, spawnRun, sweepWindowsDescendants } from '../src/integration/spawn-run.js'
 import { until } from './helpers/server-double.js'
 
 // ─── One headless run: bounded, classified, output discarded ────────────────
@@ -155,11 +155,9 @@ describe('spawnRun', () => {
 })
 
 describe('spawnRun — never hangs the worker', () => {
-  it('a run that exits while a process it started still holds its output: classified by the exit, the leftover is killed', async () => {
-    // The leftover inherits stdout/stderr and lives on; Node's `close` would
-    // wait for it forever.
-    const pidFile = path.join(dir, 'holder.pid')
-    const child = script(
+  /** A run that starts a holder inheriting its stdio, writes the holder's pid, and exits 0. */
+  function runWithHolder(pidFile: string): string {
+    return script(
       [
         "const { spawn } = require('node:child_process')",
         "const g = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: ['ignore', 'inherit', 'inherit'] })",
@@ -168,24 +166,83 @@ describe('spawnRun — never hangs the worker', () => {
         'process.exit(0)',
       ].join('\n'),
     )
+  }
+  const reap = (pid: number): void => {
+    try {
+      process.kill(pid, 'SIGKILL')
+    } catch {
+      /* gone */
+    }
+  }
+
+  it('a run that exits while a process it started may still hold its output: classified by its own exit, the worker free within the drain', async () => {
+    const pidFile = path.join(dir, 'holder.pid')
     const started = Date.now()
-    const outcome = await run(child, { drainMs: 300 })
-    expect(outcome.state).toBe('ok')
-    expect(outcome.detail).toMatch(/kept its output open/)
-    expect(Date.now() - started).toBeLessThan(5_000)
+    const outcome = await run(runWithHolder(pidFile), { drainMs: 300 })
     const holder = Number(fs.readFileSync(pidFile, 'utf-8'))
-    if (process.platform !== 'win32') await until(() => !alive(holder), 3_000)
-    else {
-      try {
-        process.kill(holder)
-      } catch {
-        /* gone */
+    try {
+      expect(outcome.state).toBe('ok')
+      expect(Date.now() - started).toBeLessThan(5_000)
+      if (process.platform === 'win32') {
+        // Windows closes the run's pipes at its exit even with a child that
+        // inherited them (seen in CI), so `close` comes on its own; when it
+        // does not, the drain path says so.
+        expect(outcome.detail === undefined || /kept its output open/.test(outcome.detail)).toBe(true)
+      } else {
+        expect(outcome.detail).toMatch(/kept its output open/)
       }
+    } finally {
+      reap(holder)
     }
   }, 10_000)
 
+  it.skipIf(process.platform === 'win32')('POSIX only (process groups): the leftover holding the pipes is signalled with the run\'s group', async () => {
+    const pidFile = path.join(dir, 'holder-group.pid')
+    await run(runWithHolder(pidFile), { drainMs: 300 })
+    const holder = Number(fs.readFileSync(pidFile, 'utf-8'))
+    try {
+      await until(() => !alive(holder), 3_000)
+    } finally {
+      reap(holder)
+    }
+  }, 10_000)
+
+  it.runIf(process.platform === 'win32')('Windows only (no process groups): the sweep kills a dead run\'s orphaned child, and spares one born outside its lifetime', async () => {
+    // A parent that starts a child (no shared stdio) and exits: the child is
+    // an orphan that keeps the parent's pid as its ParentProcessId.
+    const pidFile = path.join(dir, 'orphan.pid')
+    const parent = script(
+      [
+        "const { spawn } = require('node:child_process')",
+        "const g = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore', detached: true })",
+        `require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(g.pid))`,
+        'g.unref()',
+        'process.exit(0)',
+      ].join('\n'),
+    )
+    const { spawn } = await import('node:child_process')
+    const startedAt = Date.now()
+    const p = spawn(process.execPath, [parent], { stdio: 'ignore' })
+    const parentPid = p.pid ?? 0
+    await new Promise((r) => p.once('exit', r))
+    const exitedAt = Date.now()
+    await until(() => fs.existsSync(pidFile) && fs.readFileSync(pidFile, 'utf-8').length > 0, 5_000)
+    const orphan = Number(fs.readFileSync(pidFile, 'utf-8'))
+    try {
+      expect(alive(orphan)).toBe(true)
+      // A window that ended before the orphan was born spares it.
+      sweepWindowsDescendants(parentPid, startedAt - 60_000, startedAt - 30_000)
+      await new Promise((r) => setTimeout(r, 4_000))
+      expect(alive(orphan)).toBe(true)
+      sweepWindowsDescendants(parentPid, startedAt, exitedAt)
+      await until(() => !alive(orphan), 20_000)
+    } finally {
+      reap(orphan)
+    }
+  }, 40_000)
+
   it.skipIf(process.platform === 'win32')(
-    'a process that escaped the group and holds the pipes past SIGKILL: the run is abandoned, never awaited forever',
+    'POSIX only (setsid / process groups): a process that escaped the group and holds the pipes past SIGKILL: the run is abandoned, never awaited forever',
     async () => {
       // `detached: true` makes the grandchild its own group leader, so the
       // group kill never reaches it, and it holds the run's pipes. The run

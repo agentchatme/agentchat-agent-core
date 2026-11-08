@@ -15,7 +15,7 @@
 export { runIntegration, type RunIntegrationOpts } from './integration/run.js'
 export { Integration, RUNNER_DEADLINE_SLACK_MS, PREFLIGHT_DEADLINE_MS, type IntegrationOptions } from './integration/integration.js'
 export { socketStateOf, blockedDetail } from './integration/socket-state.js'
-export { spawnRun, redactDiagnostic, type SpawnRunSpec } from './integration/spawn-run.js'
+export { spawnRun, redactDiagnostic, sweepWindowsDescendants, type SpawnRunSpec } from './integration/spawn-run.js'
 export type {
   RunRunner,
   RunRequest,

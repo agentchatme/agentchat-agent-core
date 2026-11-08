@@ -33,7 +33,11 @@ import type { RunOutcome } from './runner.js'
 //     run's process group is signalled (SIGKILL), the pipes are dropped, and
 //     the run is classified by the exit it did make. A process that left the
 //     group (`setsid`, a daemonising helper) is not reached by that signal
-//     and can survive the run; the pipes are let go either way.
+//     and can survive the run; the pipes are let go either way. Windows has
+//     no process groups: there the run's orphaned children are swept
+//     (`sweepWindowsDescendants`, best effort). Observed on Windows: a child
+//     that inherited the run's stdio does not keep it open past the run's
+//     exit, so `close` usually comes and this path is the fallback.
 //   * a SIGKILL that does not end it (a process that escaped the group with
 //     `setsid` and still holds the pipes; a process stuck in the kernel):
 //     ABANDON_MS after the SIGKILL the pipes are dropped, the child is
@@ -91,13 +95,20 @@ export function redactDiagnostic(value: string, max = STDERR_TAIL_CHARS): string
     .slice(-max)
 }
 
+/** Bounds every synchronous kill: a stuck `taskkill` must not hold the worker it protects. */
+const KILL_TIMEOUT_MS = 5_000
+
 function killProcessTree(child: ChildProcess, signal: NodeJS.Signals): void {
   if (child.pid === undefined) return
   try {
     if (process.platform === 'win32') {
+      // The tree under a live root. A root that has exited is not found by
+      // taskkill (Windows keeps no tree for it); `sweepWindowsDescendants`
+      // covers that case.
       spawnCommandSync('taskkill', ['/pid', String(child.pid), '/T', '/F'], {
         windowsHide: true,
         stdio: 'ignore',
+        timeout: KILL_TIMEOUT_MS,
       })
     } else {
       // Negative pid = the process group the child leads (spawned detached).
@@ -109,6 +120,43 @@ function killProcessTree(child: ChildProcess, signal: NodeJS.Signals): void {
     } catch {
       /* already gone */
     }
+  }
+}
+
+/** Epoch ms → a Windows FILETIME (100 ns ticks since 1601), for PowerShell's `[DateTime]::FromFileTime`. */
+function fileTime(ms: number): string {
+  return String((BigInt(Math.round(ms)) + 11_644_473_600_000n) * 10_000n)
+}
+
+/**
+ * Windows: kill the processes an exited run left behind — its direct
+ * children, which keep the dead run's pid as their `ParentProcessId` (Windows
+ * does not reparent), created while the run was alive (so a reused pid cannot
+ * pick up a stranger's children), each with its own tree. Best effort and
+ * fire-and-forget: a detached `powershell -EncodedCommand` (no quoting to get
+ * wrong), never waited for, so it cannot hold the worker either. A process
+ * that was already re-parented further down, or that the sweep cannot see,
+ * survives; the run's pipes are released either way.
+ */
+export function sweepWindowsDescendants(rootPid: number, aliveFromMs: number, aliveUntilMs: number): void {
+  if (process.platform !== 'win32' || !Number.isInteger(rootPid) || rootPid <= 0) return
+  const script = [
+    `$from = [DateTime]::FromFileTime(${fileTime(aliveFromMs - 1_000)})`,
+    `$until = [DateTime]::FromFileTime(${fileTime(aliveUntilMs + 1_000)})`,
+    `Get-CimInstance Win32_Process -Filter 'ParentProcessId=${rootPid}' |`,
+    '  Where-Object { $_.CreationDate -ge $from -and $_.CreationDate -le $until } |',
+    '  ForEach-Object { & taskkill.exe /T /F /PID $_.ProcessId 2>$null | Out-Null }',
+  ].join('\n')
+  try {
+    const sweeper = spawnCommand(
+      'powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')],
+      { detached: true, stdio: 'ignore', windowsHide: true },
+    )
+    sweeper.on('error', () => undefined)
+    sweeper.unref()
+  } catch {
+    /* best effort */
   }
 }
 
@@ -125,7 +173,7 @@ export function spawnRun(spec: SpawnRunSpec): Promise<RunOutcome> {
     let timedOut = false
     let interrupted = false
     let terminating = false
-    let exited: { code: number | null; signal: NodeJS.Signals | null } | null = null
+    let exited: { code: number | null; signal: NodeJS.Signals | null; at: number } | null = null
     const timers = new Set<ReturnType<typeof setTimeout>>()
     let onAbort: (() => void) | null = null
     let child: ChildProcess | null = null
@@ -281,15 +329,25 @@ export function spawnRun(spec: SpawnRunSpec): Promise<RunOutcome> {
     })
 
     proc.on('exit', (code, signal) => {
-      exited = { code, signal }
+      exited = { code, signal, at: Date.now() }
       // `close` follows once every holder of the pipes is gone. A process the
       // run started that still holds them must not hold the worker.
       later(drainMs, () => {
         if (settled || exited === null) return
-        // The run is over; what is left of its process group is a leftover.
+        // The run is over; what is left of it is a leftover: its process
+        // group on POSIX; on Windows its orphaned children (no groups there).
         killProcessTree(proc, 'SIGKILL')
+        if (proc.pid !== undefined) sweepWindowsDescendants(proc.pid, started, exited.at)
         detach()
-        finish(classify(exited.code, exited.signal, 'a process the run started kept its output open after it exited; the run\'s process group was signalled (SIGKILL) and the run detached from it — a process that left the group can survive'))
+        finish(
+          classify(
+            exited.code,
+            exited.signal,
+            process.platform === 'win32'
+              ? 'a process the run started kept its output open after it exited; its children were swept (taskkill) and the run detached from it — a process the sweep cannot see can survive'
+              : 'a process the run started kept its output open after it exited; the run\'s process group was signalled (SIGKILL) and the run detached from it — a process that left the group can survive',
+          ),
+        )
       })
     })
 
