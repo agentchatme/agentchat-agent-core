@@ -3,7 +3,9 @@ import * as fs from 'node:fs'
 import * as http from 'node:http'
 import * as os from 'node:os'
 import * as path from 'node:path'
+import { spawn } from 'node:child_process'
 import { runListen } from '../src/cli/listen.js'
+import { writeListenerConfig } from '../src/listener/config.js'
 import { runWatch, describeFrame } from '../src/cli/watch.js'
 import { readIntegrationStatus } from '../src/integration/status.js'
 import { claudeMcpConfigPath } from '../src/presets/index.js'
@@ -166,4 +168,31 @@ describe('agentchat watch', () => {
     expect(describeFrame('group.invite.received', { invite_id: 'inv_1', group_id: 'grp_1', inviter_handle: 'x', group_name: 'NAME NEVER SHOWN' }, 'me')).toMatchObject({ wake: true, text: 'group.invite.received invite=inv_1 group=grp_1 from=@x' })
     expect(describeFrame('presence.update', { handle: 'x', status: 'online' }, 'me')).toMatchObject({ wake: false })
   })
+})
+
+const BUNDLE = path.join(__dirname, '..', 'dist', 'listener-daemon.js')
+
+describe('the installed listener: the self-contained bundle a service runs', () => {
+  it.skipIf(!fs.existsSync(BUNDLE))('copied to a bare directory, it reads listener.json, connects and runs the command on a wake', async () => {
+    const bare = path.join(tmp, 'bare')
+    fs.mkdirSync(bare)
+    fs.copyFileSync(BUNDLE, path.join(bare, 'agentchat-listener.mjs'))
+    const record = path.join(tmp, 'service-run.txt')
+    const script = path.join(tmp, 'agent.cjs')
+    fs.writeFileSync(script, `let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{require('node:fs').writeFileSync(${JSON.stringify(record)}, d);process.stdout.write('ok')})`)
+    writeListenerConfig(home, { version: 1, mode: 'run', command: `"${process.execPath}" "${script}"`, workdir: path.join(tmp, 'work'), updated_at: new Date().toISOString() })
+    const child = spawn(process.execPath, [path.join(bare, 'agentchat-listener.mjs'), '--home', home], { cwd: bare, stdio: ['ignore', 'pipe', 'pipe'] })
+    let log = ''
+    child.stdout.on('data', (c) => (log += String(c)))
+    child.stderr.on('data', (c) => (log += String(c)))
+    try {
+      await until(() => fs.existsSync(record), 20_000)
+      expect(fs.readFileSync(record, 'utf-8')).toContain('SERVED WAKE INSTRUCTION for generic')
+      expect(log).toContain('listener resident')
+      expect(log).not.toMatch(/Dynamic require|Cannot find module/)
+    } finally {
+      child.kill('SIGTERM')
+      await new Promise((r) => child.once('exit', r))
+    }
+  }, 40_000)
 })

@@ -25,3 +25,28 @@ jobs:
       - run: pnpm type-check
       - run: pnpm build
       - run: pnpm test
+
+      # The `agentchat` CLI ships as two self-contained bundles: the bin, and the
+      # listener the service runs from a durable copy with no node_modules
+      # beside it. Both must start from a bare directory, and the listener is
+      # RESIDENT (it waits for listener.json and an identity), so the run is
+      # bounded instead of waited for.
+      - name: the CLI bundles run on their own
+        if: runner.os == 'Linux'
+        run: |
+          bare="$(mktemp -d)"; home="$(mktemp -d)"; out="$(mktemp)"
+          cp dist/cli.js dist/listener-daemon.js "$bare/"
+          v="$(cd "$bare" && node cli.js --version)"
+          [ "$v" = "$(node -p "require('./package.json').version")" ] || { echo "::error::cli --version printed '$v'"; exit 1; }
+          (cd "$bare" && node cli.js --home "$home" status) | grep -q "No AgentChat identity" || { echo "::error::cli status did not run"; exit 1; }
+          ( cd "$bare" && node listener-daemon.js --home "$home" >"$out" 2>&1 ) &
+          pid=$!
+          sleep 6
+          alive=0; kill -0 $pid 2>/dev/null && alive=1
+          kill $pid 2>/dev/null || true
+          wait $pid 2>/dev/null || true
+          cat "$out"
+          [ "$alive" = "1" ] || { echo "::error::the listener exited instead of waiting"; exit 1; }
+          grep -q "listener resident" "$out" || { echo "::error::the listener did not come up"; exit 1; }
+          if grep -qE "Dynamic require|Cannot find module|ERR_MODULE_NOT_FOUND" "$out"; then echo "::error::the listener is not self-contained"; exit 1; fi
+          echo "CLI bundles run standalone ✓"
