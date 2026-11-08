@@ -8,7 +8,7 @@ import { idle } from '../daemon/health.js'
 import type { IntegrationClient } from '../client-identity.js'
 import { Integration } from './integration.js'
 import { integrationDisabledBy, resolveRunBudgetMs, resolveRunProfile, type RunProfile } from './profile.js'
-import type { RunRunner } from './runner.js'
+import { isRunnerFactory, type RunnerSource } from './runner.js'
 import { writeIntegrationStatus } from './status.js'
 
 // ─── The resident supervisor ────────────────────────────────────────────────
@@ -56,8 +56,8 @@ const KEEP_LOG_BYTES = 1024 * 1024
 export interface RunIntegrationOpts {
   /** THE identity home for the agent this daemon serves. */
   home: string
-  /** How to start one headless run of this integration's coding agent. */
-  runner: RunRunner
+  /** How to start one headless run: a runner, or a factory that builds one per identity (`RunnerFactory`). */
+  runner: RunnerSource
   /** How this integration names itself to the server: the texts runtime and its own version. */
   client: IntegrationClient
   /** The one pointer line a run prompt ends with: how THIS runtime reaches its copy of the manual (`manualPointer(...)`). */
@@ -242,9 +242,10 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
     } else if (fp !== liveFingerprint) {
       try {
         const cfg = await resolveDaemonConfig({ home, workdir, client: opts.client })
+        const runner = isRunnerFactory(opts.runner) ? opts.runner.create(cfg) : opts.runner
         const candidate = new Integration({
           cfg,
-          runner: opts.runner,
+          runner,
           client: opts.client,
           manualPointer: opts.manualPointer,
           ...(opts.manualPath !== undefined ? { manualPath: opts.manualPath } : {}),

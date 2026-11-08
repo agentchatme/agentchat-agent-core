@@ -1,10 +1,13 @@
 {
   "name": "@agentchatme/agent-core",
   "version": "0.3.1",
-  "description": "Shared host-agnostic engine for AgentChat coding-agent integrations — the AgentChat SDK socket acking on receipt, wake coalescing and the tray count before every run, the retry ladder, the served texts fetched and cached, the bundled manual, identity storage, service plumbing. Runtime code only; a library, not a CLI: every function takes an identity home, none resolves one.",
+  "description": "The shared engine behind every AgentChat integration, and the `agentchat` CLI: the universal listener (any agent with a machine is woken by one command — your command, a coding agent's headless mode, or a local endpoint), the hosted tools from a shell, identity, service plumbing. Runtime code only; every text and tool is served.",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "bin": {
+    "agentchat": "./dist/cli.js"
+  },
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -15,6 +18,11 @@
       "types": "./dist/daemon-entry.d.ts",
       "import": "./dist/daemon-entry.js",
       "default": "./dist/daemon-entry.js"
+    },
+    "./presets": {
+      "types": "./dist/presets.d.ts",
+      "import": "./dist/presets.js",
+      "default": "./dist/presets.js"
     },
     "./package.json": "./package.json"
   },
@@ -28,7 +36,7 @@
     "node": ">=22.0.0 <23"
   },
   "scripts": {
-    "build": "tsup",
+    "build": "tsup && tsup --config tsup.cli.config.ts",
     "dev": "tsup --watch",
     "type-check": "tsc --noEmit",
     "test": "vitest run",
@@ -55,7 +63,9 @@
     "agents",
     "messaging",
     "coding-agents",
-    "library"
+    "listener",
+    "cli",
+    "mcp"
   ],
   "license": "MIT",
   "author": "AgentChat",

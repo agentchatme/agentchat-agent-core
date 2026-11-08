@@ -52,8 +52,12 @@ export interface HostProfile {
   client: IntegrationClient
   /** THE identity home for this agent. */
   home(): string
-  /** This host's always-loaded instruction file. */
-  anchorFile(): string
+  /**
+   * This host's always-loaded instruction file. Absent for a front door whose
+   * runtime has none it can place a line in (the `agentchat` listener runs an
+   * owner's command): no identity line is placed, checked or removed.
+   */
+  anchorFile?(): string
   /** Exactly what a user types to reach this integration. */
   invocation(): string
   /** Render the anchor block body this host wants from the served identity line (normally `renderAnchorBlock`). */
@@ -110,6 +114,7 @@ export interface HostProfile {
 /** The label to use for this host's anchor in user-facing output. */
 export function anchorLabelOf(profile: HostProfile): string {
   if (profile.anchorLabel !== undefined) return profile.anchorLabel
+  if (profile.anchorFile === undefined) return 'identity line'
   const file = profile.anchorFile()
   const slash = Math.max(file.lastIndexOf('/'), file.lastIndexOf('\\'))
   return slash >= 0 ? file.slice(slash + 1) : file

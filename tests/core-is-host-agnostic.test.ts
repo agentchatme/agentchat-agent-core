@@ -16,6 +16,14 @@ import * as path from 'node:path'
 //
 // Prose is exempt: several comments explain the defect they prevent, and that
 // history is worth keeping. Only code is checked.
+//
+// `presets/` is the one module that names coding agents: how to start a
+// known runtime's headless run, shared by the `agentchat listen --preset`
+// listener and each runtime's own integration. A preset selects a run
+// command, never an identity home. It is exempt here, and the engine — every
+// file outside `presets/` and `cli/` — may not import it (asserted below), so
+// no engine function can reach host knowledge. The CLI selects a preset by
+// name through the presets registry and names none itself.
 
 const SRC = path.join(__dirname, '..', 'src')
 
@@ -32,11 +40,12 @@ function stripComments(source: string): string {
 // scripts/embed-manual.mjs) is the main line's text, not this package's code:
 // it lists every runtime the network supports. It is the one file exempt here.
 const EXEMPT = new Set([path.join('skill', 'manual-text.ts')])
+const PRESETS_DIR = 'presets'
 
 function tsFiles(dir: string): string[] {
   return fs.readdirSync(dir, { withFileTypes: true }).flatMap((e) => {
     const full = path.join(dir, e.name)
-    if (e.isDirectory()) return tsFiles(full)
+    if (e.isDirectory()) return path.relative(SRC, full) === PRESETS_DIR ? [] : tsFiles(full)
     if (!e.name.endsWith('.ts')) return []
     return EXEMPT.has(path.relative(SRC, full)) ? [] : [full]
   })
@@ -91,5 +100,21 @@ describe('agent-core names no coding agent', () => {
         })
     }
     expect(offenders, `no host-selecting parameter may exist here:\n${offenders.join('\n')}`).toEqual([])
+  })
+
+  it('the engine never imports the presets or the CLI', () => {
+    const offenders: string[] = []
+    for (const file of files) {
+      const rel = path.relative(SRC, file)
+      if (rel.startsWith(`cli${path.sep}`)) continue
+      stripComments(fs.readFileSync(file, 'utf-8'))
+        .split(/\r?\n/)
+        .forEach((line, i) => {
+          if (/(?:from|import\()\s*['"](?:\.\.?\/)+(?:presets|cli)\//.test(line)) {
+            offenders.push(`${rel}:${i + 1}: ${line.trim()}`)
+          }
+        })
+    }
+    expect(offenders, `the engine may not import presets/ or cli/:\n${offenders.join('\n')}`).toEqual([])
   })
 })

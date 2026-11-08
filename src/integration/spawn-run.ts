@@ -50,6 +50,12 @@ export interface SpawnRunSpec {
   readonly args: readonly string[]
   readonly cwd: string
   readonly env: NodeJS.ProcessEnv
+  /**
+   * Run `command` through the platform shell (`/bin/sh -c`, `cmd.exe /d /s /c`)
+   * with no `args`: for a command line the OWNER configured. Nothing derived
+   * from a wake or a message is ever part of it.
+   */
+  readonly shell?: boolean
   /** Written to the child's stdin and closed; `null` closes stdin at once. */
   readonly stdin: string | null
   /** Kill past this. */
@@ -186,6 +192,7 @@ export function spawnRun(spec: SpawnRunSpec): Promise<RunOutcome> {
         stdio: [spec.stdin === null ? 'ignore' : 'pipe', 'pipe', 'pipe'],
         detached: process.platform !== 'win32',
         windowsHide: true,
+        ...(spec.shell === true ? { shell: true } : {}),
       })
     } catch (err) {
       finish({ state: 'not_started', exitCode: null, detail: redactDiagnostic(String(err)) })

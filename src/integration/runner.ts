@@ -72,3 +72,35 @@ export interface RunRunner {
   /** Start one run and wait for it. Never throws — returns an outcome. */
   start(request: RunRequest): Promise<RunOutcome>
 }
+
+/** The agent a runner's runs act as: what a `RunnerFactory` is given for each identity the integration serves. */
+export interface RunnerIdentity {
+  /** The identity home. */
+  readonly home: string
+  /** Bare handle. */
+  readonly handle: string
+  /** The agent's key. A runner hands it to its runs only as a file or an environment variable, never on argv. */
+  readonly apiKey: string
+  readonly apiBase: string
+  /** The run's working directory. */
+  readonly workdir: string
+}
+
+/**
+ * Builds the runner for one identity. For runners whose runs must be told
+ * which agent they act as (a listener's preset writes the agent's hosted tool
+ * config; a forwarder reads that agent's tray): the resident supervisor calls
+ * `create` again whenever the credential changes.
+ */
+export interface RunnerFactory {
+  /** Short runtime name for logs and status, before any identity is known. */
+  readonly name: string
+  create(identity: RunnerIdentity): RunRunner
+}
+
+/** A runner, or a factory of one per identity. */
+export type RunnerSource = RunRunner | RunnerFactory
+
+export function isRunnerFactory(source: RunnerSource): source is RunnerFactory {
+  return typeof (source as Partial<RunnerFactory>).create === 'function'
+}

@@ -30,7 +30,7 @@
 // its home is, which file its anchor lives in, how to start one headless run
 // of its runtime, and where its runtime keeps skills.
 
-export { clientIdentityOf, clientHeadersOf, type IntegrationClient } from './client-identity.js'
+export { clientIdentityOf, clientHeadersOf, clientNameOf, type IntegrationClient } from './client-identity.js'
 export { VERSION } from './version.js'
 
 // Counts on the tray (through the SDK), for `status` and the wake guard.
@@ -173,7 +173,50 @@ export type {
   RunOutcomeState,
   RunKind,
   RunPreflight,
+  RunnerIdentity,
+  RunnerFactory,
+  RunnerSource,
 } from './integration/runner.js'
+export { isRunnerFactory } from './integration/runner.js'
+
+// An MCP client of the hosted tool server: protocol only, no tool of its own.
+export {
+  McpHttpClient,
+  McpError,
+  messagesInBody,
+  MCP_CLIENT_PROTOCOL_VERSION,
+  MCP_REQUEST_TIMEOUT_MS,
+  MCP_CALL_TIMEOUT_MS,
+  type McpTool,
+  type McpToolResult,
+  type McpContentItem,
+  type McpServerInfo,
+  type McpHttpClientOptions,
+} from './mcp/client.js'
+
+// The listener: what an installed one runs, and the forwarder's wire.
+export {
+  LISTENER_CONFIG_FILE,
+  ListenerConfigSchema,
+  listenerConfigPath,
+  readListenerConfig,
+  writeListenerConfig,
+  describeListenerConfig,
+  type ListenerConfig,
+  type ListenerConfigInput,
+  type ListenerConfigRead,
+} from './listener/config.js'
+export {
+  FORWARD_SECRET_FILE,
+  FORWARD_TIMEOUT_MS,
+  forwardSecretPath,
+  ensureForwardSecret,
+  readForwardSecret,
+  forwardUrlProblem,
+  buildWakePayload,
+  wakeSummary,
+  type WakePayloadV1,
+} from './listener/forward.js'
 
 // The identity command set. An integration describes itself once (HostProfile)
 // and gets register/login/recover/status/logout/doctor back.

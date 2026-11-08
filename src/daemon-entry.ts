@@ -28,6 +28,9 @@ export {
   IntegrationInvoker,
   RETRY_LADDER_MS,
   PREFLIGHT_WATCH_MS,
+  RUNNER_DEADLINE_SLACK_MS,
+  TRAY_COUNT_DEADLINE_MS,
+  PREFLIGHT_DEADLINE_MS,
   type IntegrationInvokerOptions,
   type InvokerCounters,
 } from './integration/invoker.js'
@@ -41,5 +44,13 @@ export type {
   RunOutcomeState,
   RunKind,
   RunPreflight,
+  RunnerIdentity,
+  RunnerFactory,
+  RunnerSource,
 } from './integration/runner.js'
+
+// The listener's runners: the owner's command, and the forwarder.
+export { CommandRunner, commandRunEnv, RUN_ENV, type CommandRunnerOptions } from './listener/command-runner.js'
+export { ForwardRunner, type ForwardRunnerOptions } from './listener/forward.js'
+export type { ListenerConfig } from './listener/config.js'
 export { resolveDaemonConfig, wsBaseFor, wsUrlFor, type DaemonConfig, type ResolveDaemonOpts } from './daemon/config.js'
