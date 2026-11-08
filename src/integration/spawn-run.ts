@@ -144,7 +144,7 @@ export interface WindowsSweep {
   readonly stderr: string
 }
 
-/** A cold PowerShell on a busy runner takes seconds to start; past this the sweep is given up. */
+/** A cold PowerShell on a busy runner takes seconds to start (seen: ~30 s on windows-latest the first time); past this the sweep is given up. */
 export const WINDOWS_SWEEP_TIMEOUT_MS = 60_000
 
 /**
@@ -165,6 +165,8 @@ export function sweepWindowsDescendants(
   if (process.platform !== 'win32' || !Number.isInteger(rootPid) || rootPid <= 0) return Promise.resolve(null)
   const script = [
     "$ErrorActionPreference = 'Continue'",
+    // Progress records ('Preparing modules for first use') would reach stderr as CLIXML.
+    "$ProgressPreference = 'SilentlyContinue'",
     `$from = [DateTime]::FromFileTime(${fileTime(aliveFromMs - 1_000)})`,
     `$until = [DateTime]::FromFileTime(${fileTime(aliveUntilMs + 1_000)})`,
     "Write-Output ('window ' + $from.ToUniversalTime().ToString('o') + ' ' + $until.ToUniversalTime().ToString('o'))",
