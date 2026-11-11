@@ -4,6 +4,7 @@ import * as path from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { AgentChatClient, ConnectionError } from 'agentchatme'
 import { createIdentityCommands } from '../src/identity/commands.js'
+import { renderAnchorBlock } from '../src/anchor/block.js'
 import { writeCredentials } from '../src/identity/credentials.js'
 import type { DoctorContext, HostProfile, StatusContext } from '../src/identity/host-profile.js'
 import type { ServedManual } from '../src/skill/served-manual.js'
@@ -29,7 +30,7 @@ function fixture(extra: Partial<HostProfile>): { home: string; commands: ReturnT
     home: () => home,
     anchorFile: () => path.join(home, 'ANCHOR.md'),
     invocation: () => 'npx -y @agentchatme/example',
-    renderAnchor: (line) => line,
+    renderAnchor: renderAnchorBlock,
     ...extra,
   }
   const request = mockServedTexts('probe')
@@ -112,7 +113,7 @@ describe('the announced manual reaches the host', () => {
     })
     capture()
     await commands.runDoctor({})
-    expect(seen[0]).toMatchObject({ manual: null, identityLine: null })
+    expect(seen[0]).toMatchObject({ manual: null, identityLine: null, identityLineTemplate: null })
   })
 })
 
@@ -131,7 +132,7 @@ describe('status with the server unreachable', () => {
     capture()
     expect(await commands.runStatus({})).toBe(1)
     expect(textsCalls(request)).toBe(0)
-    expect(seen[0]).toEqual({ identityLine: textsFor('probe').identity_line, manual: { url: 'https://agentchat.me/skill.md', version: '9.9.9' } })
+    expect(seen[0]).toEqual({ identityLine: textsFor('probe').identity_line, identityLineTemplate: textsFor('probe').identity_line_template, manual: { url: 'https://agentchat.me/skill.md', version: '9.9.9' } })
   })
 
   it('nothing cached: the host is told nothing is in hand', async () => {
@@ -146,6 +147,6 @@ describe('status with the server unreachable', () => {
     vi.spyOn(AgentChatClient.prototype, 'getMe').mockRejectedValue(new ConnectionError('fetch failed'))
     capture()
     await commands.runStatus({})
-    expect(seen[0]).toEqual({ identityLine: null, manual: null })
+    expect(seen[0]).toEqual({ identityLine: null, identityLineTemplate: null, manual: null })
   })
 })

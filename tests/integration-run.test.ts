@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
@@ -64,12 +64,37 @@ describe('runIntegration', () => {
     expect(r.starts).toBe(0)
   }, 10_000)
 
-  it('the previous spelling, AGENTCHAT_DOORBELL=off, still holds for one release (a service captured it into its unit)', async () => {
+  it('the previous name, AGENTCHAT_DOORBELL=off, still holds until its removal date (a service captured it into its unit), with a warning', async () => {
     signIn()
     const r = runner({ ok: true })
-    await runFor(400, { AGENTCHAT_DOORBELL: 'off' }, r)
+    const written: string[] = []
+    const spy = vi.spyOn(process.stderr, 'write').mockImplementation(((chunk: string | Uint8Array) => {
+      written.push(String(chunk))
+      return true
+    }) as typeof process.stderr.write)
+    try {
+      await runFor(400, { AGENTCHAT_DOORBELL: 'off' }, r)
+    } finally {
+      spy.mockRestore()
+    }
     expect(readIntegrationStatus(home)).toMatchObject({ socket: 'off', handle: 'probe' })
     expect(r.starts).toBe(0)
+    expect(written.join('')).toContain('AGENTCHAT_DOORBELL is the old name of AGENTCHAT_INTEGRATION (agent contract v1 schedules its removal for 2027-02-01)')
+  }, 10_000)
+
+  it('no warning when the current name turned it off', async () => {
+    signIn()
+    const written: string[] = []
+    const spy = vi.spyOn(process.stderr, 'write').mockImplementation(((chunk: string | Uint8Array) => {
+      written.push(String(chunk))
+      return true
+    }) as typeof process.stderr.write)
+    try {
+      await runFor(400, { AGENTCHAT_INTEGRATION: 'off' }, runner({ ok: true }))
+    } finally {
+      spy.mockRestore()
+    }
+    expect(written.join('')).not.toContain('old name')
   }, 10_000)
 
   it('a runtime that fails preflight is reported and retried, never fatal', async () => {

@@ -5,9 +5,10 @@ import { Readable } from 'node:stream'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { AgentChatClient } from 'agentchatme'
 import { createIdentityCommands } from '../src/identity/commands.js'
+import { renderAnchorBlock } from '../src/anchor/block.js'
 import { credentialsPath, readCredentials, writePending } from '../src/identity/credentials.js'
 import type { HostProfile } from '../src/identity/host-profile.js'
-import { mockServedTexts } from './helpers/served-texts.js'
+import { mockServedTexts, textsFor } from './helpers/served-texts.js'
 
 const homes: string[] = []
 
@@ -21,7 +22,7 @@ function fixture(): { home: string; commands: ReturnType<typeof createIdentityCo
     home: () => home,
     anchorFile: () => path.join(home, 'AGENTS.md'),
     invocation: () => 'npx -y @agentchatme/codex',
-    renderAnchor: (line) => line,
+    renderAnchor: renderAnchorBlock,
     isWired: () => false,
   }
   mockServedTexts()
@@ -118,5 +119,30 @@ describe('login reads the key without putting it on argv', () => {
     expect(await commands.runLogin({})).toBe(1)
     expect(errors.join('\n')).toContain('login --api-key -')
     expect(errors.join('\n')).toContain('AGENTCHAT_API_KEY')
+  })
+})
+
+describe('a host without its own placement gets the identity block on sign-in', () => {
+  it('login writes the kit block for the key’s handle into the instruction file, next to the user’s text', async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'agentchat-login-anchor-'))
+    homes.push(home)
+    const anchor = path.join(home, 'AGENTS.md')
+    fs.writeFileSync(anchor, '# my rules\n')
+    const commands = createIdentityCommands({
+      label: 'Example',
+      id: 'example',
+      client: { runtime: 'generic', version: '0.0.0-test' },
+      home: () => home,
+      anchorFile: () => anchor,
+      invocation: () => 'example',
+      renderAnchor: renderAnchorBlock,
+    })
+    mockServedTexts('login-agent')
+    vi.spyOn(AgentChatClient.prototype, 'getMe').mockResolvedValue({ handle: 'login-agent' } as never)
+    const output: string[] = []
+    vi.spyOn(console, 'log').mockImplementation((value) => output.push(String(value)))
+    expect(await commands.runLogin({ apiKey: `ac_${'a'.repeat(32)}` })).toBe(0)
+    expect(output.join('\n')).not.toContain('FAILED')
+    expect(fs.readFileSync(anchor, 'utf-8')).toBe(`# my rules\n\n${renderAnchorBlock(textsFor('login-agent').identity_line, 'login-agent')}\n`)
   })
 })

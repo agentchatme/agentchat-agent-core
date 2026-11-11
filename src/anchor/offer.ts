@@ -8,9 +8,10 @@ import { ANCHOR_START, ANCHOR_END } from './block.js'
 // the identity line, the wake instruction and the gate question are all the
 // main line's and are only placed by an integration.
 //
-// The block is written by `upsertAnchorBlock`, which strips every existing
-// block before writing, so registering REPLACES this with the identity block
-// and logout removes it. It cannot accumulate.
+// The block is written by `writeAnchor` (the kit's `anchor.replace`: the
+// first block of any known shape is replaced in place, every other one is
+// removed), so registering REPLACES this with the identity block and logout
+// removes it. It cannot accumulate.
 
 /**
  * How ONE integration names itself in user-facing copy.

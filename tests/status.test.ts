@@ -170,7 +170,7 @@ describe('profile and switches', () => {
     expect(resolveRunProfile({ AGENTCHAT_RUN_PROFILE: 'yolo' })).toBe('answer')
   })
 
-  it('AGENTCHAT_INTEGRATION=off disables; the old AGENTCHAT_DOORBELL=off still does for one release; anything else does not', () => {
+  it('AGENTCHAT_INTEGRATION=off disables; the old AGENTCHAT_DOORBELL=off still does until its removal date; anything else does not', () => {
     expect(integrationDisabled({ AGENTCHAT_INTEGRATION: 'off' })).toBe(true)
     expect(integrationDisabledBy({ AGENTCHAT_INTEGRATION: 'off' })).toBe('AGENTCHAT_INTEGRATION')
     expect(integrationDisabled({ AGENTCHAT_DOORBELL: 'off' })).toBe(true)

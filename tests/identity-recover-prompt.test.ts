@@ -4,6 +4,7 @@ import * as path from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { HttpTransport } from 'agentchatme'
 import { createIdentityCommands } from '../src/identity/commands.js'
+import { renderAnchorBlock } from '../src/anchor/block.js'
 import { readPending } from '../src/identity/credentials.js'
 import type { HostProfile } from '../src/identity/host-profile.js'
 import { mockServedTexts } from './helpers/served-texts.js'
@@ -43,7 +44,7 @@ function fixture(): { home: string; commands: ReturnType<typeof createIdentityCo
     home: () => home,
     anchorFile: () => path.join(home, 'ANCHOR.md'),
     invocation: () => 'npx -y @agentchatme/example',
-    renderAnchor: (line) => line,
+    renderAnchor: renderAnchorBlock,
     isWired: () => false,
   }
   mockServedTexts()

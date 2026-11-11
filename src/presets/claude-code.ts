@@ -1,6 +1,7 @@
 import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
+import { clientHeadersOf } from '../client-identity.js'
 import { hostedMcpUrl } from '../integration/mcp-probe.js'
 import type { RunProfile } from '../integration/profile.js'
 import type { RunOutcome, RunPreflight, RunRequest, RunRunner } from '../integration/runner.js'
@@ -8,6 +9,7 @@ import { spawnRun } from '../integration/spawn-run.js'
 import { atomicWriteFile } from '../util/fsutil.js'
 import { log } from '../util/log.js'
 import { spawnCommandSync } from '../util/spawn.js'
+import { VERSION } from '../version.js'
 import { semverAtLeast } from './semver.js'
 import { withoutInheritedKey, type Preset, type PresetContext, type PresetInspection } from './types.js'
 
@@ -289,12 +291,17 @@ export function claudeRunArgs(profile: RunProfile, options: ClaudeRunArgOptions 
 }
 
 /** The `--mcp-config` document: the hosted server, by HTTP, with the agent's key. Owner-only on disk. */
-export function claudeMcpConfig(apiBase: string, apiKey: string): string {
-  return `${JSON.stringify(
-    { mcpServers: { [CLAUDE_MCP_SERVER_NAME]: { type: 'http', url: hostedMcpUrl(apiBase), headers: { Authorization: `Bearer ${apiKey}` } } } },
-    null,
-    2,
-  )}\n`
+/**
+ * The `--mcp-config` file a listener's run is given: the hosted tool server
+ * with this agent's key, and the client headers that name the runtime to it
+ * (`X-AgentChat-Client: claude-code`, `-Version`: the front door that placed
+ * the run). The hosted tool server names a client only from these headers:
+ * without them a run is an unknown client and is shown the wake-webhook
+ * tools, a second way of being woken that the listener makes unnecessary.
+ */
+export function claudeMcpConfig(apiBase: string, apiKey: string, clientVersion: string = VERSION): string {
+  const headers = { Authorization: `Bearer ${apiKey}`, ...clientHeadersOf({ runtime: 'claude-code', version: clientVersion }) }
+  return `${JSON.stringify({ mcpServers: { [CLAUDE_MCP_SERVER_NAME]: { type: 'http', url: hostedMcpUrl(apiBase), headers } } }, null, 2)}\n`
 }
 
 export interface ClaudeRunnerOptions {
@@ -413,7 +420,7 @@ export const claudeCodePreset: Preset = {
   name: CLAUDE_CODE_PRESET,
   describeMcp({ home, apiBase }) {
     return [
-      `--mcp-config ${claudeMcpConfigPath(home)} (owner-only): ${CLAUDE_MCP_SERVER_NAME} → ${hostedMcpUrl(apiBase)}, Authorization: Bearer <this home's key>`,
+      `--mcp-config ${claudeMcpConfigPath(home)} (owner-only): ${CLAUDE_MCP_SERVER_NAME} → ${hostedMcpUrl(apiBase)}, Authorization: Bearer <this home's key>, X-AgentChat-Client: claude-code`,
       '--strict-mcp-config: no other MCP server (user, project or plugin) is loaded in these runs',
     ]
   },
@@ -436,7 +443,7 @@ export const claudeCodePreset: Preset = {
     const configDir = claudeConfigDirFrom(env)
     const mcpConfigPath = claudeMcpConfigPath(ctx.home)
     // Rewritten for every identity the listener serves: the runs act as THIS agent.
-    atomicWriteFile(mcpConfigPath, claudeMcpConfig(ctx.apiBase, ctx.apiKey), 0o600)
+    atomicWriteFile(mcpConfigPath, claudeMcpConfig(ctx.apiBase, ctx.apiKey, ctx.clientVersion ?? VERSION), 0o600)
     return new ClaudeRunner({
       configDir,
       workdir: ctx.workdir,

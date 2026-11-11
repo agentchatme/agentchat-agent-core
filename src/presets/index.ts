@@ -48,6 +48,7 @@ export {
   codexIsLoggedIn,
   codexProfileArgs,
   codexMcpOverrideArgs,
+  codexClientHeadersToml,
   codexRunArgs,
   agentchatTableKeys,
   CodexRunner,

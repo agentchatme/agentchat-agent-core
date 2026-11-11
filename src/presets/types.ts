@@ -30,6 +30,14 @@ export interface PresetContext {
   readonly env?: NodeJS.ProcessEnv
   /** Test seam: the runtime's binary. */
   readonly command?: string
+  /**
+   * The version the runs name in `X-AgentChat-Client-Version`: the front door
+   * that placed them (the `agentchat` listener passes its own). Defaults to
+   * this engine's version. The client name is the runtime's (`claude-code`,
+   * `codex`): a run the listener wakes needs no wake-webhook tools, and the
+   * hosted tools spell their names per runtime by it.
+   */
+  readonly clientVersion?: string
 }
 
 export interface PresetInspection {

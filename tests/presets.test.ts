@@ -5,6 +5,7 @@ import * as path from 'node:path'
 import {
   PRESETS,
   claudeCodePreset,
+  claudeMcpConfig,
   claudeMcpConfigPath,
   claudeRunArgs,
   codexPreset,
@@ -15,6 +16,7 @@ import {
   LISTENER_KEY_ENV,
 } from '../src/presets/index.js'
 import { installFakeClaude, installFakeCodex, readFakeRuns, type FakeRuntime } from './helpers/fake-runtimes.js'
+import { VERSION } from '../src/version.js'
 
 // ─── Presets: the exact flags per profile, and runs that act as the given agent ─
 
@@ -99,7 +101,16 @@ describe('Codex flags', () => {
     expect(args).toContain('mcp_servers.agentchat.url="https://api.example/mcp"')
     expect(args).toContain(`mcp_servers.agentchat.bearer_token_env_var="${LISTENER_KEY_ENV}"`)
     expect(args).toContain('mcp_servers.agentchat.default_tools_approval_mode="approve"')
+    expect(args).toContain(`mcp_servers.agentchat.http_headers={ "X-AgentChat-Client" = "codex", "X-AgentChat-Client-Version" = "${VERSION}" }`)
     expect(args[args.length - 1]).toBe('-')
+  })
+
+  it('the client headers carry the version of the front door that placed the run', () => {
+    const args = codexRunArgs('answer', { workdir: '/w', mcp: { url: 'https://api.example/mcp', keyEnv: LISTENER_KEY_ENV, clientVersion: '0.1.1' } })
+    expect(args).toContain('mcp_servers.agentchat.http_headers={ "X-AgentChat-Client" = "codex", "X-AgentChat-Client-Version" = "0.1.1" }')
+    expect(claudeMcpConfig('https://api.example', KEY, '0.1.1')).toContain('"X-AgentChat-Client-Version": "0.1.1"')
+    // An integration's own runs take no override: their hosted server is the one the integration placed.
+    expect(codexRunArgs('answer', { workdir: '/w' }).join(' ')).not.toContain('http_headers')
   })
 })
 
@@ -111,7 +122,12 @@ describe('a listener preset acts as the listener\'s agent', () => {
     const runner = claudeCodePreset.runner({ home, workdir, profile: 'answer', apiKey: KEY, apiBase: 'https://api.example', env })
     const file = claudeMcpConfigPath(home)
     const doc = JSON.parse(fs.readFileSync(file, 'utf-8')) as { mcpServers: Record<string, { type: string; url: string; headers: Record<string, string> }> }
-    expect(doc.mcpServers['agentchat']).toEqual({ type: 'http', url: 'https://api.example/mcp', headers: { Authorization: `Bearer ${KEY}` } })
+    // The client headers name the runtime (no wake-webhook tools for a listener-woken run); the version is the placing front door's, the engine's by default.
+    expect(doc.mcpServers['agentchat']).toEqual({
+      type: 'http',
+      url: 'https://api.example/mcp',
+      headers: { Authorization: `Bearer ${KEY}`, 'X-AgentChat-Client': 'claude-code', 'X-AgentChat-Client-Version': VERSION },
+    })
     if (process.platform !== 'win32') expect(fs.statSync(file).mode & 0o777).toBe(0o600)
 
     expect(await runner.preflight()).toEqual({ ok: true })

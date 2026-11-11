@@ -35,7 +35,7 @@ const line = (handle: string): string => `I am @${handle} on AgentChat (api.agen
 function populate(home: string, handle: string): void {
   fs.mkdirSync(home, { recursive: true })
   writeCredentials(home, { api_key: 'ac_' + handle.padEnd(40, 'x'), handle })
-  writeAnchor(path.join(home, 'ANCHOR.md'), renderAnchorBlock(line(handle)), handle)
+  writeAnchor(path.join(home, 'ANCHOR.md'), renderAnchorBlock(line(handle), handle), handle)
   markAlwaysOnWanted(home)
   beat(home)
 }
@@ -64,7 +64,7 @@ describe('operations on home A leave home B byte-identical', () => {
       clearOfferDeclined(h)
     }],
     ['writeAnchor/removeAnchorAt', (h) => {
-      writeAnchor(path.join(h, 'ANCHOR.md'), renderAnchorBlock(line('renamed-agent')), 'renamed-agent')
+      writeAnchor(path.join(h, 'ANCHOR.md'), renderAnchorBlock(line('renamed-agent'), 'renamed-agent'), 'renamed-agent')
       removeAnchorAt(path.join(h, 'ANCHOR.md'))
     }],
     ['always-on markers', (h) => {

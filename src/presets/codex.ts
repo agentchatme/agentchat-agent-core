@@ -1,12 +1,14 @@
 import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
+import { clientHeadersOf } from '../client-identity.js'
 import { hostedMcpUrl } from '../integration/mcp-probe.js'
 import type { RunProfile } from '../integration/profile.js'
 import type { RunOutcome, RunPreflight, RunRequest, RunRunner } from '../integration/runner.js'
 import { spawnRun } from '../integration/spawn-run.js'
 import { log } from '../util/log.js'
 import { spawnCommandSync } from '../util/spawn.js'
+import { VERSION } from '../version.js'
 import { semverAtLeast } from './semver.js'
 import { withoutInheritedKey, type Preset, type PresetContext, type PresetInspection } from './types.js'
 
@@ -111,6 +113,21 @@ export function codexProfileArgs(profile: RunProfile): string[] {
 export interface CodexMcpOverride {
   readonly url: string
   readonly keyEnv: string
+  /** The version named in `X-AgentChat-Client-Version` (the front door that placed the run). Defaults to this engine's. */
+  readonly clientVersion?: string
+}
+
+/**
+ * `{"X-AgentChat-Client" = "codex", "X-AgentChat-Client-Version" = "<version>"}`:
+ * the client headers that name the runtime to the hosted tool server, as a
+ * TOML inline table for `-c …http_headers=`. Codex parses a `-c` value as
+ * TOML (inline tables included) since before 0.154.0, and sends
+ * `http_headers` on every request to a streamable-HTTP server. Without them
+ * a run is an unknown client and is shown the wake-webhook tools.
+ */
+export function codexClientHeadersToml(clientVersion: string = VERSION): string {
+  const pairs = Object.entries(clientHeadersOf({ runtime: 'codex', version: clientVersion })).map(([name, value]) => `${JSON.stringify(name)} = ${JSON.stringify(value)}`)
+  return `{ ${pairs.join(', ')} }`
 }
 
 /** The `-c` overrides that make `[mcp_servers.agentchat]` this agent's, for one run. TOML values, no key in them. */
@@ -123,6 +140,8 @@ export function codexMcpOverrideArgs(override: CodexMcpOverride): string[] {
     `${table}.bearer_token_env_var=${JSON.stringify(override.keyEnv)}`,
     '-c',
     `${table}.default_tools_approval_mode="approve"`,
+    '-c',
+    `${table}.http_headers=${codexClientHeadersToml(override.clientVersion ?? VERSION)}`,
   ]
 }
 
@@ -244,6 +263,7 @@ export const codexPreset: Preset = {
       `-c mcp_servers.${CODEX_MCP_SERVER_NAME}.url="${hostedMcpUrl(apiBase)}"`,
       `-c mcp_servers.${CODEX_MCP_SERVER_NAME}.bearer_token_env_var="${LISTENER_KEY_ENV}" (the key set in the run's environment, never on argv)`,
       `-c mcp_servers.${CODEX_MCP_SERVER_NAME}.default_tools_approval_mode="approve"`,
+      `-c mcp_servers.${CODEX_MCP_SERVER_NAME}.http_headers={ "X-AgentChat-Client" = "codex", "X-AgentChat-Client-Version" = <the listener's version> } (names the runtime to the hosted tools)`,
       own === null
         ? `${file}: no [mcp_servers.${CODEX_MCP_SERVER_NAME}] of its own — the run sees only the overrides above`
         : `${file}: [mcp_servers.${CODEX_MCP_SERVER_NAME}] also sets ${own.length > 0 ? own.join(', ') : 'nothing'}; the overrides above replace their keys, the others still apply (how codex merges -c over an existing table is not verified on a real codex)`,
@@ -271,7 +291,7 @@ export const codexPreset: Preset = {
       profile: ctx.profile,
       apiKey: () => apiKey,
       keyEnv: LISTENER_KEY_ENV,
-      mcp: { url: hostedMcpUrl(ctx.apiBase), keyEnv: LISTENER_KEY_ENV },
+      mcp: { url: hostedMcpUrl(ctx.apiBase), keyEnv: LISTENER_KEY_ENV, clientVersion: ctx.clientVersion ?? VERSION },
       ...(ctx.command !== undefined ? { command: ctx.command } : {}),
       env,
     })

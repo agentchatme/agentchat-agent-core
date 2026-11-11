@@ -1,4 +1,4 @@
-import type { Texts } from 'agentchatme'
+import { integration as kit, type Texts } from 'agentchatme'
 
 // ─── The identity line: placed, not authored ────────────────────────────────
 //
@@ -15,7 +15,7 @@ export function identityLineOf(texts: Pick<Texts, 'identity_line'>): string {
   return texts.identity_line
 }
 
-/** Handles are canonical lowercase on the wire; a leading `@` is display only. */
+/** Handles are canonical lowercase on the wire; a leading `@` is display only. The kit's (`integration.anchor.normalizeHandle`). */
 export function normalizeHandle(handle: string): string {
-  return handle.trim().replace(/^@/, '').toLowerCase()
+  return kit.anchor.normalizeHandle(handle)
 }

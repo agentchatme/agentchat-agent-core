@@ -3,6 +3,7 @@ import * as os from 'node:os'
 import * as path from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createIdentityCommands } from '../src/identity/commands.js'
+import { renderAnchorBlock } from '../src/anchor/block.js'
 import { readCredentials, writeCredentials, type ResolvedIdentity } from '../src/identity/credentials.js'
 import type { HostProfile } from '../src/identity/host-profile.js'
 import { mockServedTexts } from './helpers/served-texts.js'
@@ -27,7 +28,7 @@ function fixture(): { home: string; seen: Array<ResolvedIdentity | null>; comman
     home: () => home,
     anchorFile: () => path.join(home, 'CLAUDE.md'),
     invocation: () => 'npx -y @agentchatme/claude-code',
-    renderAnchor: (line) => line,
+    renderAnchor: renderAnchorBlock,
     unplace: (identity) => {
       seen.push(identity)
       return ['  mcp: user MCP "agentchat" removed']

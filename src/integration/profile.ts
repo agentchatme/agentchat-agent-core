@@ -31,11 +31,19 @@ export function resolveRunProfile(env: NodeJS.ProcessEnv = process.env): RunProf
 /** The one switch: `AGENTCHAT_INTEGRATION=off` holds no socket and starts no run. Tools and manual stay. */
 export const INTEGRATION_ENV = 'AGENTCHAT_INTEGRATION'
 /**
- * The previous spelling of the switch. Honoured for one release: a service
- * installed before the rename captured it into its unit file, and that unit
- * must keep meaning what the operator set.
+ * The previous spelling of the switch (a legacy name: compatibility reader
+ * only). Still read, because a service installed before the rename captured
+ * it into its unit file, and that unit must keep meaning what the operator
+ * set; `AGENTCHAT_INTEGRATION` wins when both are set. Contract v1 (section 7,
+ * old integration settings) removes it on `INTEGRATION_ENV_LEGACY_REMOVAL`;
+ * tests/legacy-env-removal.test.ts fails from that day, so the reader is
+ * deleted in a release rather than remembered. Until then an `off` here is
+ * honoured — never silently dropped, which would turn on an integration its
+ * operator switched off.
  */
 export const INTEGRATION_ENV_LEGACY = 'AGENTCHAT_DOORBELL'
+/** The day contract v1 drops `AGENTCHAT_DOORBELL` (UTC). */
+export const INTEGRATION_ENV_LEGACY_REMOVAL = '2027-02-01'
 
 function isOff(raw: string | undefined): boolean {
   const value = raw?.trim().toLowerCase()

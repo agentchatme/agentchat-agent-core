@@ -7,7 +7,7 @@ import { resolveDaemonConfig } from '../daemon/config.js'
 import { idle } from '../daemon/health.js'
 import type { IntegrationClient } from '../client-identity.js'
 import { Integration } from './integration.js'
-import { integrationDisabledBy, resolveRunBudgetMs, resolveRunProfile, type RunProfile } from './profile.js'
+import { INTEGRATION_ENV, INTEGRATION_ENV_LEGACY, INTEGRATION_ENV_LEGACY_REMOVAL, integrationDisabledBy, resolveRunBudgetMs, resolveRunProfile, type RunProfile } from './profile.js'
 import { isRunnerFactory, type RunnerSource } from './runner.js'
 import { writeIntegrationStatus } from './status.js'
 
@@ -229,6 +229,9 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
   log.info(`integration resident for ${home} (${credentialsPath(home)}) — ${opts.client.runtime} ${opts.client.version}`)
   if (disabled) {
     log.info(`${disabledBy}=off — holding no socket and starting no run; the hosted tools and the manual still work in every session`)
+    if (disabledBy === INTEGRATION_ENV_LEGACY) {
+      log.warn(`${INTEGRATION_ENV_LEGACY} is the old name of ${INTEGRATION_ENV} (agent contract v1 schedules its removal for ${INTEGRATION_ENV_LEGACY_REMOVAL}); set ${INTEGRATION_ENV}=off instead`)
+    }
   }
   idle(home)
   offStatus(null)
