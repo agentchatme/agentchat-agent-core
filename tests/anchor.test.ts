@@ -425,3 +425,100 @@ describe('the user’s file is never left half-written or lost', () => {
     expect(fs.statSync(fileA()).isDirectory()).toBe(true)
   })
 })
+
+describe('what the review of 0.4.1 found, pinned', () => {
+  const next = renderAnchorBlock(servedLine(), HANDLE)
+  const original = `${USER_BEFORE}\n\n${OLD_BLOCKS[4]!.block}\n\n${USER_AFTER}\n`
+  const updated = `${USER_BEFORE}\n\n${next}\n\n${USER_AFTER}\n`
+
+  it.skipIf(!posix)('a relative ../ link behind a symlinked directory updates the file the kernel reaches, and nothing else', () => {
+    // real/x/CLAUDE.md is the file; real/sub/CLAUDE.md -> ../x/CLAUDE.md; home -> real/sub.
+    // Text-joining home/../x would name <dir>/x/CLAUDE.md — a different file.
+    const real = path.join(dir, 'real')
+    fs.mkdirSync(path.join(real, 'x'), { recursive: true })
+    fs.mkdirSync(path.join(real, 'sub'))
+    fs.writeFileSync(path.join(real, 'x', 'CLAUDE.md'), original)
+    fs.symlinkSync('../x/CLAUDE.md', path.join(real, 'sub', 'CLAUDE.md'))
+    fs.mkdirSync(path.join(dir, 'x'))
+    fs.writeFileSync(path.join(dir, 'x', 'CLAUDE.md'), 'an unrelated file\n')
+    fs.symlinkSync(path.join(real, 'sub'), path.join(dir, 'home'))
+
+    writeAnchor(path.join(dir, 'home', 'CLAUDE.md'), next, HANDLE)
+    expect(fs.readFileSync(path.join(real, 'x', 'CLAUDE.md'), 'utf-8')).toBe(updated)
+    expect(fs.readFileSync(path.join(dir, 'x', 'CLAUDE.md'), 'utf-8')).toBe('an unrelated file\n')
+    expect(fs.lstatSync(path.join(real, 'sub', 'CLAUDE.md')).isSymbolicLink()).toBe(true)
+
+    expect(removeAnchorAt(path.join(dir, 'home', 'CLAUDE.md'))).toBe('removed')
+    expect(fs.readFileSync(path.join(real, 'x', 'CLAUDE.md'), 'utf-8')).toBe(`${USER_BEFORE}\n\n${USER_AFTER}\n`)
+    expect(fs.readFileSync(path.join(dir, 'x', 'CLAUDE.md'), 'utf-8')).toBe('an unrelated file\n')
+  })
+
+  it.skipIf(!posix)('a symlink loop is refused and nothing is written', () => {
+    fs.symlinkSync(path.join(dir, 'b.md'), path.join(dir, 'a.md'))
+    fs.symlinkSync(path.join(dir, 'a.md'), path.join(dir, 'b.md'))
+    expect(() => writeAnchor(path.join(dir, 'a.md'), next, HANDLE)).toThrow(/ELOOP|too many symbolic links/)
+    expect(fs.readdirSync(dir).sort()).toEqual(['a.md', 'b.md'])
+  })
+
+  it.skipIf(!posix || root)('a writable file in a directory that is not: written in place, as 0.4.0 did, never refused', () => {
+    const locked = path.join(dir, 'locked')
+    fs.mkdirSync(locked)
+    const file = path.join(locked, 'CLAUDE.md')
+    fs.writeFileSync(file, original)
+    fs.chmodSync(locked, 0o555)
+    try {
+      writeAnchor(file, next, HANDLE)
+      expect(fs.readFileSync(file, 'utf-8')).toBe(updated)
+      expect(removeAnchorAt(file)).toBe('removed')
+      expect(fs.readFileSync(file, 'utf-8')).toBe(`${USER_BEFORE}\n\n${USER_AFTER}\n`)
+      expect(fs.readdirSync(locked)).toEqual(['CLAUDE.md'])
+    } finally {
+      fs.chmodSync(locked, 0o755)
+    }
+  })
+
+  it('a leading byte-order mark is kept, wherever the block is', () => {
+    fs.writeFileSync(fileA(), `﻿${OLD_BLOCKS[4]!.block}\n\n${USER_AFTER}\n`)
+    expect(readAnchorHandleAt(fileA(), SERVED_TEMPLATE)).toBe(HANDLE)
+    writeAnchor(fileA(), next, HANDLE)
+    expect(fs.readFileSync(fileA(), 'utf-8')).toBe(`﻿${next}\n\n${USER_AFTER}\n`)
+    expect(anchorIsCurrentAt(fileA(), servedLine(), HANDLE)).toBe(true)
+    expect(removeAnchorAt(fileA())).toBe('removed')
+    expect(fs.readFileSync(fileA(), 'utf-8')).toBe(`﻿${USER_AFTER}\n`)
+    fs.writeFileSync(fileA(), `﻿${USER_BEFORE}\n`)
+    writeAnchor(fileA(), next, HANDLE)
+    expect(fs.readFileSync(fileA(), 'utf-8')).toBe(`﻿${USER_BEFORE}\n\n${next}\n`)
+  })
+
+  it('a file that is not UTF-8 is never rewritten (its bytes would become U+FFFD)', () => {
+    const latin1 = Buffer.concat([Buffer.from('# R'), Buffer.from([0xe9]), Buffer.from('sumé\n', 'latin1'), Buffer.from(`\n${OLD_BLOCKS[4]!.block}\n`)])
+    fs.writeFileSync(fileA(), latin1)
+    expect(() => writeAnchor(fileA(), next, HANDLE)).toThrow(/not UTF-8/)
+    expect(() => removeAnchorAt(fileA())).toThrow(/not UTF-8/)
+    expect(() => hasAnchorAt(fileA())).toThrow(/not UTF-8/)
+    expect(fs.readFileSync(fileA()).equals(latin1)).toBe(true)
+  })
+
+  it('a served line that holds a marker line is refused (it would fence itself and grow the file on every write)', () => {
+    for (const marker of [ANCHOR_END, ANCHOR_START, '<!-- agentchat-skill:end -->', `  ${ANCHOR_END}  `]) {
+      expect(() => renderAnchorBlock(`${servedLine()}\n${marker}\nmore`, HANDLE)).toThrow(/marker/)
+    }
+    // A marker quoted inside a sentence is not a marker line.
+    expect(() => renderAnchorBlock(`${servedLine()} (fenced by ${ANCHOR_START})`, HANDLE)).not.toThrow()
+  })
+
+  it('currency agrees with what a write would do, so status and doctor --fix converge', () => {
+    // The current block inside a legacy pair: a write changes nothing … once.
+    fs.writeFileSync(fileA(), `<!-- agentchat-skill:start -->\n${next}\n<!-- agentchat-skill:end -->\n`)
+    writeAnchor(fileA(), next, HANDLE)
+    expect(anchorIsCurrentAt(fileA(), servedLine(), HANDLE)).toBe(true)
+    const once = fs.readFileSync(fileA(), 'utf-8')
+    writeAnchor(fileA(), next, HANDLE)
+    expect(fs.readFileSync(fileA(), 'utf-8')).toBe(once)
+    // The block with no blank line before it: a write would re-space it, so it is not current — until written.
+    fs.writeFileSync(fileA(), `${USER_BEFORE}\n${next}\n`)
+    expect(anchorIsCurrentAt(fileA(), servedLine(), HANDLE)).toBe(false)
+    writeAnchor(fileA(), next, HANDLE)
+    expect(anchorIsCurrentAt(fileA(), servedLine(), HANDLE)).toBe(true)
+  })
+})

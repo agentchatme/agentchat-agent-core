@@ -53,7 +53,11 @@ function validHandle(handle: string): boolean {
 }
 
 /** No served texts in hand: offline and nothing cached. */
-const NO_TEXTS: StatusContext = { identityLine: null, identityLineTemplate: null, manual: null }
+const NO_TEXTS: StatusContext = Object.freeze({ identityLine: null, identityLineTemplate: null, manual: null })
+
+function errorText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err)
+}
 
 /** What a command hands its host from one texts response. */
 function contextOf(texts: Texts): StatusContext {
@@ -264,13 +268,13 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
     // A host that wires itself separately must not be handed an identity block
     // before that wiring exists — it would announce a handle with nothing
     // listening. Once an anchor is already there, keep it current regardless.
-    if (profile.isWired !== undefined && !profile.isWired() && !hasAnchorAt(file)) return []
-    if (identityLine === null) {
-      return [
-        `  ${label}: identity line not written — GET /v1/texts could not be reached and nothing is cached; run \`${invocation()} doctor --fix\` once online`,
-      ]
-    }
     try {
+      if (profile.isWired !== undefined && !profile.isWired() && !hasAnchorAt(file)) return []
+      if (identityLine === null) {
+        return [
+          `  ${label}: identity line not written — GET /v1/texts could not be reached and nothing is cached; run \`${invocation()} doctor --fix\` once online`,
+        ]
+      }
       writeAnchor(file, profile.renderAnchor(identityLine, handle), handle)
       return [`  ${label}: @${handle} → ${file}`]
     } catch (err) {
@@ -592,6 +596,22 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
     }
   }
 
+  /**
+   * The instruction file's block as `status` reports it. A file that exists
+   * but cannot be read (permissions, a symlink loop, not UTF-8) is said as
+   * such — it is neither "missing" nor a reason for status to print nothing.
+   */
+  function anchorView(file: string | null, identityLine: string | null, handle: string | null): { present: boolean | null; current: boolean | null; error: string | null } {
+    if (file === null) return { present: null, current: null, error: null }
+    try {
+      const present = hasAnchorAt(file)
+      const current = identityLine === null || handle === null ? null : anchorIsCurrentAt(file, identityLine, handle)
+      return { present, current, error: null }
+    } catch (err) {
+      return { present: null, current: null, error: errorText(err) }
+    }
+  }
+
   async function runStatus(opts: { json?: boolean }): Promise<number> {
     const home = profile.home()
     const anchorFile = profile.anchorFile?.() ?? null
@@ -637,6 +657,7 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
       const refused = status === 401 || status === 403
       const detail = apiErr(err)
       if (opts.json) {
+        const offline = anchorView(anchorFile, null, null)
         console.log(
           JSON.stringify({
             configured: true,
@@ -646,7 +667,8 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
             key_source: identity.source,
             api_base: identity.apiBase,
             home,
-            anchor: anchorFile === null ? null : hasAnchorAt(anchorFile),
+            anchor: offline.present,
+            anchor_error: offline.error,
             integration,
           }),
         )
@@ -676,7 +698,7 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
     const tray = await traySummary(client).catch(() => null)
     const texts = await served(identity.apiKey, identity.apiBase)
     const identityLine = texts.identityLine
-    const anchorCurrent = identityLine === null || anchorFile === null ? null : anchorIsCurrentAt(anchorFile, identityLine, me.handle)
+    const anchor = anchorView(anchorFile, identityLine, me.handle)
 
     if (opts.json) {
       console.log(
@@ -689,9 +711,11 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
           key_source: identity.source,
           api_base: identity.apiBase,
           home,
-          anchor: anchorFile === null ? null : hasAnchorAt(anchorFile),
-          /** null: the served texts were unavailable (or there is no instruction file), so currency could not be checked. */
-          anchor_current: anchorCurrent,
+          anchor: anchor.present,
+          /** null: the served texts were unavailable (or there is no instruction file, or it cannot be read), so currency could not be checked. */
+          anchor_current: anchor.current,
+          /** Why the instruction file could not be read, or null. */
+          anchor_error: anchor.error,
           integration,
         }),
       )
@@ -709,7 +733,7 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
           ...(anchorFile === null
             ? []
             : [
-                `Identity line: ${hasAnchorAt(anchorFile) ? (anchorCurrent === null ? 'present (served texts unavailable — not checked)' : anchorCurrent ? 'current' : 'present (older text — `doctor --fix` refreshes it)') : 'missing'} (${anchorFile})`,
+                `Identity line: ${anchor.error !== null ? `unreadable — ${anchor.error}` : anchor.present ? (anchor.current === null ? 'present (served texts unavailable — not checked)' : anchor.current ? 'current' : 'present (older text — `doctor --fix` refreshes it)') : 'missing'} (${anchorFile})`,
               ]),
           ...formatIntegrationStatus(integration),
         ].join('\n'),
@@ -740,9 +764,18 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
       any = true
       reports.push('  credentials deleted')
     }
-    if (anchorFile !== null && removeAnchorAt(anchorFile) === 'removed') {
-      any = true
-      reports.push(`  ${anchorLabelOf(profile)} identity line removed`)
+    if (anchorFile !== null) {
+      // A file that cannot be rewritten must not stop the sign-out half-way:
+      // `unplace` below still has to take the old key out of the host.
+      try {
+        if (removeAnchorAt(anchorFile) === 'removed') {
+          any = true
+          reports.push(`  ${anchorLabelOf(profile)} identity line removed`)
+        }
+      } catch (err) {
+        any = true
+        reports.push(`  could not remove the identity line from ${anchorFile}: ${errorText(err)} — remove the agentchat block by hand`)
+      }
     }
     if (profile.unplace !== undefined) {
       try {
@@ -769,6 +802,13 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
     return 0
   }
 
+  /** What the instruction file claims, and whether it is the current block (null: no served line in hand). Throws when the file cannot be read. */
+  function readIdentityLine(anchorFile: string, handle: string, texts: StatusContext): { claimed: string | null; current: boolean | null } {
+    const claimed = readAnchorHandleAt(anchorFile, texts.identityLineTemplate)
+    const current = texts.identityLine === null ? null : anchorIsCurrentAt(anchorFile, texts.identityLine, handle)
+    return { claimed, current }
+  }
+
   /** The doctor's identity-line check (and its `--fix`), for a host that has an instruction file. */
   async function identityLineCheck(
     anchorFile: string,
@@ -777,8 +817,13 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
     texts: StatusContext,
     fix: boolean,
   ): Promise<DoctorCheck> {
-    const claimed = readAnchorHandleAt(anchorFile, texts.identityLineTemplate)
-    const current = texts.identityLine === null ? null : anchorIsCurrentAt(anchorFile, texts.identityLine, creds.handle)
+    let claimed: string | null
+    let current: boolean | null
+    try {
+      ;({ claimed, current } = readIdentityLine(anchorFile, creds.handle, texts))
+    } catch (err) {
+      return { name: 'identity-line', verdict: 'FAIL', detail: `cannot read ${anchorFile}: ${errorText(err)}` }
+    }
     if (claimed === creds.handle && current === true) {
       return { name: 'identity-line', verdict: 'PASS', detail: `@${claimed} in ${anchorFile}` }
     }
@@ -794,10 +839,16 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
     if (fix) {
       const report = await placeIdentity(creds.handle, creds.api_key, apiBase)
       const failed = report.some((l) => l.includes('FAILED') || l.includes('not written'))
-      return {
-        name: 'identity-line',
-        verdict: failed ? 'FAIL' : 'PASS',
-        detail: failed ? `could not repair: ${report.join('; ')}` : `repaired → @${creds.handle}`,
+      if (failed) return { name: 'identity-line', verdict: 'FAIL', detail: `could not repair: ${report.join('; ')}` }
+      // Said repaired only when the file now reads as repaired.
+      try {
+        const after = readIdentityLine(anchorFile, creds.handle, texts)
+        if (after.claimed === creds.handle && after.current !== false) {
+          return { name: 'identity-line', verdict: 'PASS', detail: `repaired → @${creds.handle}` }
+        }
+        return { name: 'identity-line', verdict: 'FAIL', detail: `repair did not take: ${anchorFile} still ${after.claimed === null ? 'has no identity line' : after.claimed !== creds.handle ? `says @${after.claimed}` : 'differs from the served block'}${report.length > 0 ? ` (${report.join('; ').trim()})` : ''}` }
+      } catch (err) {
+        return { name: 'identity-line', verdict: 'FAIL', detail: `cannot read ${anchorFile} after the repair: ${errorText(err)}` }
       }
     }
     return { name: 'identity-line', verdict: 'WARN', detail: `${why} — repair with \`${invocation()} doctor --fix\`` }
@@ -878,7 +929,13 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
       )
     }
 
-    if (profile.extraDoctorChecks !== undefined) checks.push(...(await profile.extraDoctorChecks({ ...opts, ...texts })))
+    if (profile.extraDoctorChecks !== undefined) {
+      try {
+        checks.push(...(await profile.extraDoctorChecks({ ...opts, ...texts })))
+      } catch (err) {
+        checks.push({ name: 'host', verdict: 'FAIL', detail: `the ${LABEL} checks failed: ${errorText(err)}` })
+      }
+    }
 
     console.log(checks.map((c) => `${c.verdict.padEnd(4)} ${c.name}: ${c.detail}`).join('\n'))
     return checks.some((c) => c.verdict === 'FAIL') ? 1 : 0

@@ -32,6 +32,9 @@ describe('the exit: the kit has no synchronous writer yet', () => {
         `agentchatme's integration kit now exports ${name}: delete src/util/fsutil.ts's copy (atomicWriteFile, renameWithRetry, and atomicCopyFile's rename) and call the kit instead`,
       ).toBe(false)
     }
+    // Under any other name, too: a synchronous file writer or rename in the kit is the cue.
+    const syncWriters = exported.filter((k) => /sync$/i.test(k) && /write|rename|atomic|file/i.test(k))
+    expect(syncWriters, `agentchatme's integration kit now exports ${syncWriters.join(', ')}: delete src/util/fsutil.ts's copy and call the kit instead`).toEqual([])
     // What the copy is the twin of is still there.
     expect(typeof kit.writeAtomic).toBe('function')
     expect(typeof kit.renameWithRetry).toBe('function')
@@ -166,6 +169,47 @@ describe('atomicWriteFile behaves as kit.writeAtomic', () => {
     expect(r.local.error).not.toBeNull()
     expect(r.kit.error).not.toBeNull()
     expect(r.local.files).toEqual(r.kit.files)
+  })
+
+  it('a rename that fails once with EBUSY ends the same way (retried on Windows, not elsewhere)', async () => {
+    const actual = await vi.importActual<typeof import('node:fs')>('node:fs')
+    const busy = () => Object.assign(new Error('EBUSY: resource busy or locked, rename'), { code: 'EBUSY' })
+    const localFile = path.join(dir, 'local.json')
+    const kitFile = path.join(dir, 'kit.json')
+    let localError: string | null = null
+    let kitError: string | null = null
+    let first = true
+    vi.mocked(fs.renameSync).mockImplementation(((from: fs.PathLike, to: fs.PathLike) => {
+      if (first) {
+        first = false
+        throw busy()
+      }
+      actual.renameSync(from, to)
+    }) as typeof fs.renameSync)
+    try {
+      atomicWriteFile(localFile, 'x', 0o600)
+    } catch (err) {
+      localError = (err as NodeJS.ErrnoException).code ?? 'error'
+    }
+    let kitFirst = true
+    try {
+      await kit.writeAtomic(kitFile, 'x', {
+        mode: 0o600,
+        rename: async (from: string, to: string) => {
+          if (kitFirst) {
+            kitFirst = false
+            throw busy()
+          }
+          await fs.promises.rename(from, to)
+        },
+      })
+    } catch (err) {
+      kitError = (err as NodeJS.ErrnoException).code ?? 'error'
+    }
+    expect(localError).toBe(kitError)
+    expect(localError).toBe(process.platform === 'win32' ? null : 'EBUSY')
+    expect(fs.existsSync(localFile)).toBe(fs.existsSync(kitFile))
+    expect(fs.readdirSync(dir).filter((f) => f.endsWith('.tmp'))).toEqual([])
   })
 
   it('the temp file has the same shape beside the target: .<name>.<12 hex>.tmp', async () => {
