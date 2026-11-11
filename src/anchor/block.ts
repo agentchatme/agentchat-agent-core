@@ -208,7 +208,7 @@ function readInstructionFile(filePath: string): { bom: string; text: string } | 
   try {
     decoded = UTF8.decode(bytes)
   } catch {
-    throw new Error(`${filePath} is not UTF-8 text; the AgentChat block is not read or written there`)
+    throw new Error(`${filePath} is not UTF-8 text; the AgentChat block is not read or written there (save the file as UTF-8 and run the command again)`)
   }
   return decoded.startsWith('\uFEFF') ? { bom: '\uFEFF', text: decoded.slice(1) } : { bom: '', text: decoded }
 }

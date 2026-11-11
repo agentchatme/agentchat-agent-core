@@ -230,7 +230,7 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
   if (disabled) {
     log.info(`${disabledBy}=off — holding no socket and starting no run; the hosted tools and the manual still work in every session`)
     if (disabledBy === INTEGRATION_ENV_LEGACY) {
-      log.warn(`${INTEGRATION_ENV_LEGACY} is the old name of ${INTEGRATION_ENV}, read until ${INTEGRATION_ENV_LEGACY_REMOVAL}; set ${INTEGRATION_ENV}=off instead`)
+      log.warn(`${INTEGRATION_ENV_LEGACY} is the old name of ${INTEGRATION_ENV} (agent contract v1 schedules its removal for ${INTEGRATION_ENV_LEGACY_REMOVAL}); set ${INTEGRATION_ENV}=off instead`)
     }
   }
   idle(home)

@@ -79,7 +79,7 @@ describe('runIntegration', () => {
     }
     expect(readIntegrationStatus(home)).toMatchObject({ socket: 'off', handle: 'probe' })
     expect(r.starts).toBe(0)
-    expect(written.join('')).toContain('AGENTCHAT_DOORBELL is the old name of AGENTCHAT_INTEGRATION, read until 2027-02-01')
+    expect(written.join('')).toContain('AGENTCHAT_DOORBELL is the old name of AGENTCHAT_INTEGRATION (agent contract v1 schedules its removal for 2027-02-01)')
   }, 10_000)
 
   it('no warning when the current name turned it off', async () => {
