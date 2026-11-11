@@ -1,6 +1,6 @@
 {
   "name": "@agentchatme/agent-core",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Shared host-agnostic engine for AgentChat integrations — the resident supervisor on the AgentChat SDK's integration kit (single-run mode: the socket acking on receipt, wakes, the tray before every run), the runner seam and spawnRun, the presets for known coding agents' headless runs, identity storage and flows, service plumbing. Runtime code only; every function takes an identity home, none resolves one.",
   "type": "module",
   "main": "./dist/index.js",

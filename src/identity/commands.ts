@@ -1,5 +1,5 @@
 import * as readline from 'node:readline'
-import { AgentChatClient } from 'agentchatme'
+import { AgentChatClient, type Texts } from 'agentchatme'
 import {
   DEFAULT_API_BASE,
   credentialsPath,
@@ -16,7 +16,6 @@ import { writeAnchor, removeAnchorAt, readAnchorHandleAt, hasAnchorAt, anchorIsC
 import { traySummary } from '../integration/tray.js'
 import { loadTexts, readCachedTexts } from '../integration/texts.js'
 import { identityLineOf } from '../skill/identity-line.js'
-import type { ServedManual } from '../skill/served-manual.js'
 import { anchorLabelOf, type DoctorCheck, type HostProfile, type StatusContext, type Verdict } from './host-profile.js'
 import { clientIdentityOf } from '../client-identity.js'
 import { REPEATED_FAILED_CYCLES, failedCyclesInARow, formatIntegrationStatus, readIntegrationStatus } from '../integration/status.js'
@@ -51,6 +50,14 @@ const HANDLE_PATTERN = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/
 
 function validHandle(handle: string): boolean {
   return handle.length >= 3 && handle.length <= 30 && HANDLE_PATTERN.test(handle)
+}
+
+/** No served texts in hand: offline and nothing cached. */
+const NO_TEXTS: StatusContext = { identityLine: null, identityLineTemplate: null, manual: null }
+
+/** What a command hands its host from one texts response. */
+function contextOf(texts: Texts): StatusContext {
+  return { identityLine: identityLineOf(texts), identityLineTemplate: texts.identity_line_template, manual: texts.manual }
 }
 
 /**
@@ -217,9 +224,9 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
    * fetch again. The CLI never writes an identity line it did not get from
    * the server.
    */
-  async function served(apiKey: string, apiBase: string): Promise<{ identityLine: string | null; manual: ServedManual | null }> {
+  async function served(apiKey: string, apiBase: string): Promise<StatusContext> {
     const loaded = await loadTexts({ home: profile.home(), runtime: profile.client.runtime, client: apiClient(apiKey, apiBase), timeoutMs: 5_000 })
-    return loaded === null ? { identityLine: null, manual: null } : { identityLine: identityLineOf(loaded.texts), manual: loaded.texts.manual }
+    return loaded === null ? NO_TEXTS : contextOf(loaded.texts)
   }
 
   /** The host's extra `status` lines, with the texts already fetched. */
@@ -264,7 +271,7 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
       ]
     }
     try {
-      writeAnchor(file, profile.renderAnchor(identityLine), handle)
+      writeAnchor(file, profile.renderAnchor(identityLine, handle), handle)
       return [`  ${label}: @${handle} → ${file}`]
     } catch (err) {
       return [`  ${label}: FAILED — ${String(err)}`]
@@ -601,8 +608,6 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
             pending: pending !== null,
             pending_kind: pending?.kind ?? null,
             integration,
-            // The previous key, kept one release for scripts that read it.
-            doorbell: integration,
           }),
         )
       } else if (pending?.kind === 'recover') {
@@ -643,7 +648,6 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
             home,
             anchor: anchorFile === null ? null : hasAnchorAt(anchorFile),
             integration,
-            doorbell: integration,
           }),
         )
       } else {
@@ -664,7 +668,7 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
         // what it can against the identity-home cache (what a fetch would
         // have fallen back to), or without texts when nothing is cached.
         const cached = readCachedTexts(home, profile.client.runtime)
-        await printExtraStatus(cached === null ? { identityLine: null, manual: null } : { identityLine: identityLineOf(cached.texts), manual: cached.texts.manual })
+        await printExtraStatus(cached === null ? NO_TEXTS : contextOf(cached.texts))
       }
       return 1
     }
@@ -672,7 +676,7 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
     const tray = await traySummary(client).catch(() => null)
     const texts = await served(identity.apiKey, identity.apiBase)
     const identityLine = texts.identityLine
-    const anchorCurrent = identityLine === null || anchorFile === null ? null : anchorIsCurrentAt(anchorFile, identityLine)
+    const anchorCurrent = identityLine === null || anchorFile === null ? null : anchorIsCurrentAt(anchorFile, identityLine, me.handle)
 
     if (opts.json) {
       console.log(
@@ -689,7 +693,6 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
           /** null: the served texts were unavailable (or there is no instruction file), so currency could not be checked. */
           anchor_current: anchorCurrent,
           integration,
-          doorbell: integration,
         }),
       )
     } else {
@@ -771,11 +774,11 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
     anchorFile: string,
     creds: { handle: string; api_key: string },
     apiBase: string,
-    identityLine: string | null,
+    texts: StatusContext,
     fix: boolean,
   ): Promise<DoctorCheck> {
-    const claimed = readAnchorHandleAt(anchorFile)
-    const current = identityLine === null ? null : anchorIsCurrentAt(anchorFile, identityLine)
+    const claimed = readAnchorHandleAt(anchorFile, texts.identityLineTemplate)
+    const current = texts.identityLine === null ? null : anchorIsCurrentAt(anchorFile, texts.identityLine, creds.handle)
     if (claimed === creds.handle && current === true) {
       return { name: 'identity-line', verdict: 'PASS', detail: `@${claimed} in ${anchorFile}` }
     }
@@ -804,8 +807,7 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
     const home = profile.home()
     const anchorFile = profile.anchorFile?.() ?? null
     const checks: DoctorCheck[] = []
-    let identityLine: string | null = null
-    let manual: ServedManual | null = null
+    let texts: StatusContext = NO_TEXTS
 
     checks.push({ name: 'node', verdict: 'PASS', detail: process.version })
     checks.push({ name: 'home', verdict: 'PASS', detail: home })
@@ -848,13 +850,13 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
       // on the machine whenever any one registered, so a two-agent box could
       // end up with an instruction file announcing the OTHER agent's handle.
       const apiBase = identity?.apiBase ?? creds.api_base ?? DEFAULT_API_BASE
-      ;({ identityLine, manual } = await served(creds.api_key, apiBase))
+      texts = await served(creds.api_key, apiBase)
       checks.push(
-        identityLine === null
+        texts.identityLine === null
           ? { name: 'texts', verdict: 'WARN', detail: 'GET /v1/texts could not be reached and nothing is cached — the identity line cannot be checked or placed until it can' }
           : { name: 'texts', verdict: 'PASS', detail: 'served texts in hand' },
       )
-      if (anchorFile !== null) checks.push(await identityLineCheck(anchorFile, creds, apiBase, identityLine, opts.fix === true))
+      if (anchorFile !== null) checks.push(await identityLineCheck(anchorFile, creds, apiBase, texts, opts.fix === true))
     }
 
     // The receive loop's own record: repeated cycles that did not get done
@@ -876,7 +878,7 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
       )
     }
 
-    if (profile.extraDoctorChecks !== undefined) checks.push(...(await profile.extraDoctorChecks({ ...opts, identityLine, manual })))
+    if (profile.extraDoctorChecks !== undefined) checks.push(...(await profile.extraDoctorChecks({ ...opts, ...texts })))
 
     console.log(checks.map((c) => `${c.verdict.padEnd(4)} ${c.name}: ${c.detail}`).join('\n'))
     return checks.some((c) => c.verdict === 'FAIL') ? 1 : 0

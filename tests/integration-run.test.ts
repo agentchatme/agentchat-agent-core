@@ -64,7 +64,7 @@ describe('runIntegration', () => {
     expect(r.starts).toBe(0)
   }, 10_000)
 
-  it('the previous spelling, AGENTCHAT_DOORBELL=off, still holds for one release (a service captured it into its unit)', async () => {
+  it('the previous name, AGENTCHAT_DOORBELL=off, still holds until its removal date (a service captured it into its unit)', async () => {
     signIn()
     const r = runner({ ok: true })
     await runFor(400, { AGENTCHAT_DOORBELL: 'off' }, r)

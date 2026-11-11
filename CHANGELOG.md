@@ -2,6 +2,32 @@
 
 All notable changes to `@agentchatme/agent-core` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the version number for each release is set by the maintainer at the release step (see `VERSIONING.md`).
 
+## [0.4.1] — 2026-11-11
+
+Fixed and adjusted existing behaviour (the number is set at the release step, `VERSIONING.md`). Still needs `agentchatme` 1.3.0.
+
+### Fixed
+
+- **The identity block is the SDK kit's** (`integration.anchor`), the shape every AgentChat integration writes: the fences, a handle line (`<!-- agentchat:handle <handle> -->`), the served identity line. 0.4.0 read the handle with its own copy of the served wording (`I am @… on AgentChat`), so a reworded line on the server would have read as "no identity line". Blocks are now found by the handle line, by the served `identity_line_template`'s words, and by both wordings earlier releases wrote; every block an earlier release wrote — the `You are **@handle** on AgentChat` blocks of 0.0.x (agent-core, Claude Code, Codex), the 0.1.0 local line, the 0.2.0–0.4.0 served line without a handle line, the legacy `agentchat-skill` block — is recognised and replaced by the current one on the next placement or `doctor --fix`.
+- **The block keeps its place in the file.** It used to be moved to the end on every write; it is now replaced where it is (the first AgentChat block of any known shape), every other one is removed, and the user's text before and after it is kept byte for byte.
+- **The instruction file is never left half-written.** `writeAnchor` and `removeAnchorAt` wrote `CLAUDE.md` / `AGENTS.md` in place, so a crash or a full disk mid-write could truncate the user's file. They now write a temp file beside it, flush it and rename it over the file; a failure leaves the old file byte for byte. A symlinked instruction file stays a symlink (the file it points to is the one replaced), its permission bits are kept, a read-only file is refused rather than replaced, and under root the file keeps its owner. A write that would change nothing is skipped.
+- `anchorIsCurrentAt` is true only when the file holds exactly the block for this line and handle and no second AgentChat block, so a stale extra block is repaired too.
+- The daemon warns when only the old switch name, `AGENTCHAT_DOORBELL=off`, turned it off.
+
+### Changed
+
+- **API:** `renderAnchorBlock(identityLine, handle)` and `HostProfile.renderAnchor(identityLine, handle)` take the handle (the block's handle line) and throw, writing nothing, when the line does not name it. `anchorIsCurrentAt(file, identityLine, handle)` takes the handle. `readAnchorHandleAt(file, template?)` / `readAnchorHandleFrom(text, template?)` take the served `identity_line_template`; `StatusContext` and `DoctorContext` carry it as `identityLineTemplate`. `writeAnchor(file, block, expectHandle)` checks the handle before writing instead of after. `hasAnchorAt` also sees a legacy `agentchat-skill` block. `upsertAnchorBlock` / `stripAnchorBlock` are the kit's `replace` / `remove`; `normalizeHandle` is the kit's.
+- `AGENTCHAT_DOORBELL`, the previous name of `AGENTCHAT_INTEGRATION`, is still read; the agent contract v1 (section 7) removes it on 2027-02-01 (`INTEGRATION_ENV_LEGACY_REMOVAL`), and a test fails from that day so the reader is deleted in a release. The README no longer says "for one release".
+- The temp file of an atomic write is named like the kit's (`.<name>.<12 hex>.tmp`, no process id).
+
+### Removed
+
+- The `doorbell` key in `status --json` (an alias of `integration`, kept since 0.2.0). Read `integration`.
+
+### Not changed, on purpose
+
+- `atomicWriteFile`, `atomicCopyFile` and `renameWithRetry` stay in this package: the kit's `writeAtomic` / `renameWithRetry` are async only, and every caller here and in the integrations is synchronous. They behave as the kit's (a test runs both through the same cases), and a test fails the day the kit exports a synchronous form, saying to delete this copy and switch.
+
 ## [0.4.0] — 2026-11-08
 
 Rebuilt and added behaviour (the number is set at the release step, `VERSIONING.md`). Needs `agentchatme` 1.3.0 (the integration kit and socket contract v1; the dependency range is `^1.3.0`).

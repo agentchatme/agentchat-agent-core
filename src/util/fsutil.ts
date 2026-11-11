@@ -4,6 +4,19 @@ import * as path from 'node:path'
 
 // ─── Atomic replacement ─────────────────────────────────────────────────────
 //
+// The synchronous twin of the SDK kit's `writeAtomic` / `renameWithRetry`
+// (`integration` in `agentchatme`, which was ported from this file). The kit
+// has only the async form, and every caller here is synchronous by design:
+// the service installers write their unit between `spawnSync` calls, the
+// credential and state writes sit in flows that must finish in order, the
+// status file is written from the receive loop's synchronous event handlers,
+// and a preset's `runner()` writes its MCP config before it returns. The two
+// copies behave the same — the same temp name shape, `wx`, mode on the
+// descriptor, fsync, rename, the same Windows retry — and
+// tests/fsutil-kit-parity.test.ts runs both through the same cases. The day
+// the kit exports a synchronous form, that test fails and says to delete this
+// copy and switch to the kit.
+//
 // Tmp file + rename in the same directory: a reader sees the old file or the
 // new one, never part of one, and a crash leaves the old file or a stray tmp —
 // never a truncated JSON that would make every later invocation throw. A
@@ -17,9 +30,9 @@ import * as path from 'node:path'
 // another process has open fails transiently (EPERM / EBUSY / EACCES while a
 // scanner or an editor holds it), so the rename is retried for ~100 ms.
 
-/** A fresh, unguessable tmp name beside `file`. */
+/** A fresh, unguessable tmp name beside `file` (the kit's shape: `.<name>.<12 hex>.tmp`). */
 function tmpPathFor(file: string): string {
-  return path.join(path.dirname(file), `.${path.basename(file)}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`)
+  return path.join(path.dirname(file), `.${path.basename(file)}.${randomBytes(6).toString('hex')}.tmp`)
 }
 
 const RENAME_RETRY_CODES = new Set(['EPERM', 'EBUSY', 'EACCES'])

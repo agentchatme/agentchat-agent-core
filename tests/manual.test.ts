@@ -64,15 +64,17 @@ describe('the identity line', () => {
     expect(normalizeHandle('  @Alice-Dev ')).toBe('alice-dev')
   })
 
-  it('is what the anchor block carries, and reads back', () => {
+  it('is what the anchor block carries (the kit’s shape: fences, handle line, the line), and reads back', () => {
     const line = textsFor('agent-a').identity_line
-    const block = renderAnchorBlock(line)
-    expect(block).toBe(`${ANCHOR_START}\n${line}\n${ANCHOR_END}`)
+    const block = renderAnchorBlock(line, 'agent-a')
+    expect(block).toBe(`${ANCHOR_START}\n<!-- agentchat:handle agent-a -->\n${line}\n${ANCHOR_END}`)
     expect(readAnchorHandleFrom(block)).toBe('agent-a')
   })
 
-  it('refuses an empty line', () => {
-    expect(() => renderAnchorBlock('   ')).toThrow(/empty/)
+  it('refuses an empty line, an empty handle, and a line that names someone else', () => {
+    expect(() => renderAnchorBlock('   ', 'agent-a')).toThrow(/empty/)
+    expect(() => renderAnchorBlock(textsFor('agent-a').identity_line, ' @ ')).toThrow(/empty/)
+    expect(() => renderAnchorBlock(textsFor('agent-b').identity_line, 'agent-a')).toThrow(/names @agent-a/)
   })
 
   it('still reads the block releases before the integration wrote, so doctor can refresh it', () => {

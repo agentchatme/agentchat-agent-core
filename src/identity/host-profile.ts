@@ -13,6 +13,12 @@ export interface DoctorCheck {
 /** What the shared `status` hands a host's extra lines: what it already fetched from the served texts (one fetch per command). */
 export interface StatusContext {
   identityLine: string | null
+  /**
+   * The served `identity_line_template` from the same texts, or null when none
+   * are in hand: what `readAnchorHandleAt` recognises an unmarked block by, in
+   * whatever words the server serves today.
+   */
+  identityLineTemplate: string | null
   /** The manual the served texts announce (`texts.manual`), or null when none are in hand — what `checkManual` compares the skill file with. */
   manual: ServedManual | null
 }
@@ -22,6 +28,8 @@ export interface DoctorContext {
   fix?: boolean
   /** The served identity line for this agent, or null when the server could not be reached and nothing is cached. */
   identityLine: string | null
+  /** The served `identity_line_template`, or null when none are in hand (see `StatusContext`). */
+  identityLineTemplate: string | null
   /** The manual the served texts announce, or null when none are in hand (`--fix` syncs the skill file to it). */
   manual: ServedManual | null
 }
@@ -60,8 +68,12 @@ export interface HostProfile {
   anchorFile?(): string
   /** Exactly what a user types to reach this integration. */
   invocation(): string
-  /** Render the anchor block body this host wants from the served identity line (normally `renderAnchorBlock`). */
-  renderAnchor(identityLine: string): string
+  /**
+   * The identity block this host places for `handle` from the served identity
+   * line (normally `renderAnchorBlock`, the kit's shape with the handle line).
+   * Throws when the line does not name the handle; nothing is written then.
+   */
+  renderAnchor(identityLine: string, handle: string): string
   /**
    * What to call the anchor in output. Defaults to the instruction file's own
    * basename (`CLAUDE.md`, `AGENTS.md`), which is what a user actually looks

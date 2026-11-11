@@ -7,7 +7,8 @@ import { createIdentityCommands } from '../src/identity/commands.js'
 import { writeCredentials } from '../src/identity/credentials.js'
 import { writeIntegrationStatus, type IntegrationStatus } from '../src/integration/status.js'
 import type { HostProfile } from '../src/identity/host-profile.js'
-import { mockServedTexts } from './helpers/served-texts.js'
+import { mockServedTexts, textsFor } from './helpers/served-texts.js'
+import { ANCHOR_END, ANCHOR_START, renderAnchorBlock } from '../src/anchor/block.js'
 
 // ─── `status` with a refused key still shows the integration ────────────────
 //
@@ -142,7 +143,7 @@ describe('status when getMe fails', () => {
     expect(out.join('\n')).toContain('Integration: socket reconnecting')
   })
 
-  it('--json carries the failure kind and the integration (and the old `doorbell` key, one release) instead of printing nothing parseable', async () => {
+  it('--json carries the failure kind and the integration instead of printing nothing parseable; the retired `doorbell` alias is gone', async () => {
     const { home, commands } = fixture()
     writeIntegrationStatus(home, refusedIntegration())
     vi.spyOn(AgentChatClient.prototype, 'getMe').mockRejectedValue(
@@ -152,9 +153,58 @@ describe('status when getMe fails', () => {
 
     expect(await commands.runStatus({ json: true })).toBe(1)
 
-    const parsed = JSON.parse(out.join('\n')) as { error: { kind: string; status: number }; integration: { socket: string }; doorbell: { socket: string } }
+    const parsed = JSON.parse(out.join('\n')) as { error: { kind: string; status: number }; integration: { socket: string } }
     expect(parsed.error).toMatchObject({ kind: 'key_refused', status: 401 })
     expect(parsed.integration.socket).toBe('blocked')
-    expect(parsed.doorbell.socket).toBe('blocked')
+    expect(parsed).not.toHaveProperty('doorbell')
+  })
+})
+
+describe('status --json', () => {
+  it('no answer carries the retired `doorbell` alias; the integration is under `integration`', async () => {
+    const unconfigured = fs.mkdtempSync(path.join(os.tmpdir(), 'agentchat-status-none-'))
+    homes.push(unconfigured)
+    const none = createIdentityCommands({
+      label: 'Example',
+      id: 'example',
+      client: { runtime: 'generic', version: '0.0.0-test' },
+      home: () => unconfigured,
+      invocation: () => 'example',
+      renderAnchor: renderAnchorBlock,
+    })
+    const { out } = capture()
+    expect(await none.runStatus({ json: true })).toBe(0)
+    const parsedNone = JSON.parse(out.pop() ?? '{}') as Record<string, unknown>
+    expect(parsedNone['configured']).toBe(false)
+    expect(parsedNone).toHaveProperty('integration')
+    expect(parsedNone).not.toHaveProperty('doorbell')
+
+    const { home, commands } = fixture()
+    vi.spyOn(AgentChatClient.prototype, 'getMe').mockResolvedValue({ handle: 'probe', status: 'active' } as never)
+    expect(await commands.runStatus({ json: true })).toBe(0)
+    const parsed = JSON.parse(out.pop() ?? '{}') as Record<string, unknown>
+    expect(parsed['configured']).toBe(true)
+    expect(parsed).toHaveProperty('integration')
+    expect(parsed).not.toHaveProperty('doorbell')
+    // No instruction file yet: present = false, current = false.
+    expect(parsed['anchor']).toBe(false)
+    expect(parsed['anchor_current']).toBe(false)
+    void home
+  })
+
+  it('anchor_current is true only for the kit block of the served line, and false for the unmarked block an earlier release wrote', async () => {
+    const { home, commands } = fixture()
+    const file = path.join(home, 'CLAUDE.md')
+    const line = textsFor('probe').identity_line
+    vi.spyOn(AgentChatClient.prototype, 'getMe').mockResolvedValue({ handle: 'probe', status: 'active' } as never)
+    const { out } = capture()
+
+    fs.writeFileSync(file, `# mine\n\n${ANCHOR_START}\n${line}\n${ANCHOR_END}\n`)
+    await commands.runStatus({ json: true })
+    expect(JSON.parse(out.pop() ?? '{}')).toMatchObject({ anchor: true, anchor_current: false })
+
+    fs.writeFileSync(file, `# mine\n\n${renderAnchorBlock(line, 'probe')}\n`)
+    await commands.runStatus({ json: true })
+    expect(JSON.parse(out.pop() ?? '{}')).toMatchObject({ anchor: true, anchor_current: true })
   })
 })
