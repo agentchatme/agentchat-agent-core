@@ -30,7 +30,7 @@ function fixture(): { home: string; commands: ReturnType<typeof createIdentityCo
     home: () => home,
     anchorFile: () => path.join(home, 'CLAUDE.md'),
     invocation: () => 'npx -y @agentchatme/claude-code',
-    renderAnchor: (line) => line,
+    renderAnchor: renderAnchorBlock,
   }
   writeCredentials(home, { api_key: `ac_${'s'.repeat(32)}`, handle: 'probe' })
   mockServedTexts()
@@ -88,7 +88,7 @@ describe('status fetches the served texts once per command', () => {
       home: () => home,
       anchorFile: () => path.join(home, 'ANCHOR.md'),
       invocation: () => 'npx -y @agentchatme/example',
-      renderAnchor: (line) => line,
+      renderAnchor: renderAnchorBlock,
       extraStatus: ({ identityLine }) => {
         seen.push(identityLine)
         return ['  placement: fine']

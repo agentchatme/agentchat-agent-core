@@ -4,6 +4,7 @@ import * as path from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { AgentChatClient, ConnectionError } from 'agentchatme'
 import { createIdentityCommands } from '../src/identity/commands.js'
+import { renderAnchorBlock } from '../src/anchor/block.js'
 import { writeCredentials } from '../src/identity/credentials.js'
 import type { DoctorContext, HostProfile, StatusContext } from '../src/identity/host-profile.js'
 import type { ServedManual } from '../src/skill/served-manual.js'
@@ -29,7 +30,7 @@ function fixture(extra: Partial<HostProfile>): { home: string; commands: ReturnT
     home: () => home,
     anchorFile: () => path.join(home, 'ANCHOR.md'),
     invocation: () => 'npx -y @agentchatme/example',
-    renderAnchor: (line) => line,
+    renderAnchor: renderAnchorBlock,
     ...extra,
   }
   const request = mockServedTexts('probe')

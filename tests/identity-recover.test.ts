@@ -4,6 +4,7 @@ import * as path from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { AgentChatClient, AgentChatError, HttpTransport } from 'agentchatme'
 import { createIdentityCommands } from '../src/identity/commands.js'
+import { renderAnchorBlock } from '../src/anchor/block.js'
 import {
   readCredentials,
   readPending,
@@ -34,7 +35,7 @@ function fixture(): { home: string; commands: ReturnType<typeof createIdentityCo
     home: () => home,
     anchorFile: () => path.join(home, 'ANCHOR.md'),
     invocation: () => INVOKE,
-    renderAnchor: (line) => line,
+    renderAnchor: renderAnchorBlock,
     isWired: () => false,
   }
   mockServedTexts()
