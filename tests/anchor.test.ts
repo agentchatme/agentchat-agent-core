@@ -478,16 +478,16 @@ describe('what the review of 0.4.1 found, pinned', () => {
   })
 
   it('a leading byte-order mark is kept, wherever the block is', () => {
-    fs.writeFileSync(fileA(), `﻿${OLD_BLOCKS[4]!.block}\n\n${USER_AFTER}\n`)
+    fs.writeFileSync(fileA(), `\uFEFF${OLD_BLOCKS[4]!.block}\n\n${USER_AFTER}\n`)
     expect(readAnchorHandleAt(fileA(), SERVED_TEMPLATE)).toBe(HANDLE)
     writeAnchor(fileA(), next, HANDLE)
-    expect(fs.readFileSync(fileA(), 'utf-8')).toBe(`﻿${next}\n\n${USER_AFTER}\n`)
+    expect(fs.readFileSync(fileA(), 'utf-8')).toBe(`\uFEFF${next}\n\n${USER_AFTER}\n`)
     expect(anchorIsCurrentAt(fileA(), servedLine(), HANDLE)).toBe(true)
     expect(removeAnchorAt(fileA())).toBe('removed')
-    expect(fs.readFileSync(fileA(), 'utf-8')).toBe(`﻿${USER_AFTER}\n`)
-    fs.writeFileSync(fileA(), `﻿${USER_BEFORE}\n`)
+    expect(fs.readFileSync(fileA(), 'utf-8')).toBe(`\uFEFF${USER_AFTER}\n`)
+    fs.writeFileSync(fileA(), `\uFEFF${USER_BEFORE}\n`)
     writeAnchor(fileA(), next, HANDLE)
-    expect(fs.readFileSync(fileA(), 'utf-8')).toBe(`﻿${USER_BEFORE}\n\n${next}\n`)
+    expect(fs.readFileSync(fileA(), 'utf-8')).toBe(`\uFEFF${USER_BEFORE}\n\n${next}\n`)
   })
 
   it('a file that is not UTF-8 is never rewritten (its bytes would become U+FFFD)', () => {
@@ -520,5 +520,77 @@ describe('what the review of 0.4.1 found, pinned', () => {
     expect(anchorIsCurrentAt(fileA(), servedLine(), HANDLE)).toBe(false)
     writeAnchor(fileA(), next, HANDLE)
     expect(anchorIsCurrentAt(fileA(), servedLine(), HANDLE)).toBe(true)
+  })
+})
+
+describe('what the second review of 0.4.1 found, pinned', () => {
+  const next = renderAnchorBlock(servedLine(), HANDLE)
+  const original = `${USER_BEFORE}\n\n${OLD_BLOCKS[4]!.block}\n\n${USER_AFTER}\n`
+  const updated = `${USER_BEFORE}\n\n${next}\n\n${USER_AFTER}\n`
+
+  /** sub -> elsewhere/deep/sub (a directory symlink); the user's file is elsewhere/deep/x/CLAUDE.md; x/CLAUDE.md is unrelated. */
+  function linkedThroughSub(linkText: (dir: string) => string): { link: string; real: string; unrelated: string } {
+    fs.mkdirSync(path.join(dir, 'elsewhere', 'deep', 'sub'), { recursive: true })
+    fs.mkdirSync(path.join(dir, 'elsewhere', 'deep', 'x'))
+    const real = path.join(dir, 'elsewhere', 'deep', 'x', 'CLAUDE.md')
+    fs.writeFileSync(real, original)
+    fs.symlinkSync(path.join('elsewhere', 'deep', 'sub'), path.join(dir, 'sub'))
+    fs.mkdirSync(path.join(dir, 'x'))
+    const unrelated = path.join(dir, 'x', 'CLAUDE.md')
+    fs.writeFileSync(unrelated, 'an unrelated file\n')
+    const link = path.join(dir, 'CLAUDE.md')
+    fs.symlinkSync(linkText(dir), link)
+    return { link, real, unrelated }
+  }
+
+  for (const [name, linkText] of [
+    // Joined by hand: path.join would normalise the .. away as text.
+    ['relative', () => ['sub', '..', 'x', 'CLAUDE.md'].join(path.sep)],
+    ['absolute', (d: string) => `${d}${path.sep}sub${path.sep}..${path.sep}x${path.sep}CLAUDE.md`],
+  ] as const) {
+    it.skipIf(!posix)(`a ${name} link whose text has a .. after a symlinked part reaches the file the kernel does`, () => {
+      const { link, real, unrelated } = linkedThroughSub(linkText)
+      writeAnchor(link, next, HANDLE)
+      expect(fs.readFileSync(real, 'utf-8')).toBe(updated)
+      expect(fs.readFileSync(unrelated, 'utf-8')).toBe('an unrelated file\n')
+      expect(removeAnchorAt(link)).toBe('removed')
+      expect(fs.readFileSync(real, 'utf-8')).toBe(`${USER_BEFORE}\n\n${USER_AFTER}\n`)
+      expect(fs.readFileSync(unrelated, 'utf-8')).toBe('an unrelated file\n')
+      expect(fs.lstatSync(link).isSymbolicLink()).toBe(true)
+    })
+  }
+
+  it.skipIf(!posix)('a dangling link into a directory that does not exist fails ENOENT, as a plain write would, and creates nothing', () => {
+    fs.mkdirSync(path.join(dir, 'r1'))
+    const link = path.join(dir, 'r1', 'L1')
+    fs.symlinkSync(path.join('..', 'h2', 'L2'), link)
+    expect(() => writeAnchor(link, next, HANDLE)).toThrow(/ENOENT/)
+    expect(fs.existsSync(path.join(dir, 'h2'))).toBe(false)
+    expect(fs.readdirSync(path.join(dir, 'r1'))).toEqual(['L1'])
+  })
+
+  it('a file the rename cannot replace (EBUSY: a single-file bind mount) is written in place, as 0.4.0 did', () => {
+    fs.writeFileSync(fileA(), original)
+    vi.mocked(fs.renameSync).mockImplementation(() => {
+      throw Object.assign(new Error('EBUSY: resource busy or locked, rename'), { code: 'EBUSY' })
+    })
+    writeAnchor(fileA(), next, HANDLE)
+    expect(fs.readFileSync(fileA(), 'utf-8')).toBe(updated)
+    expect(removeAnchorAt(fileA())).toBe('removed')
+    expect(fs.readFileSync(fileA(), 'utf-8')).toBe(`${USER_BEFORE}\n\n${USER_AFTER}\n`)
+    expect(strays()).toEqual([])
+  })
+
+  it('one write reaches the end state even when taking a block out lets stray markers fence a new one', () => {
+    const legacyStart = '<!-- agentchat-skill:start -->'
+    const legacyEnd = '<!-- agentchat-skill:end -->'
+    fs.writeFileSync(fileA(), `${next}\n\ntext\n\n${legacyStart}\nbody\n\n${next}\n${legacyEnd}\n`)
+    writeAnchor(fileA(), next, HANDLE)
+    expect(anchorIsCurrentAt(fileA(), servedLine(), HANDLE)).toBe(true)
+    const once = fs.readFileSync(fileA(), 'utf-8')
+    writeAnchor(fileA(), next, HANDLE)
+    expect(fs.readFileSync(fileA(), 'utf-8')).toBe(once)
+    expect(once.split(ANCHOR_START)).toHaveLength(2)
+    expect(once).toContain('text')
   })
 })

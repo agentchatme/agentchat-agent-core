@@ -84,7 +84,7 @@ export function writeAnchor(filePath: string, block: string, expectHandle?: stri
     }
   }
   const existing = readInstructionFile(filePath) ?? { bom: '', text: '' }
-  const next = kit.anchor.replace(existing.text, block)
+  const next = untilStable(existing.text, (text) => kit.anchor.replace(text, block))
   if (next !== existing.text) writeInstructionFile(filePath, existing.bom + next)
   if (expectHandle !== undefined && readInstructionFile(filePath)?.text !== next) {
     throw new Error(`writeAnchor: ${filePath} did not read back as written — remove the agentchat block manually and re-run`)
@@ -92,11 +92,28 @@ export function writeAnchor(filePath: string, block: string, expectHandle?: stri
   return 'written'
 }
 
+/**
+ * `step` applied until the text stops changing (bounded). One `replace` or
+ * `remove` is not always the end: taking a block out can leave two stray
+ * markers that now fence a block of their own (hand-made nesting). Repeating
+ * makes a write reach the state a second write would, so `anchorIsCurrentAt`
+ * holds right after it.
+ */
+function untilStable(text: string, step: (text: string) => string): string {
+  let current = text
+  for (let i = 0; i < 8; i++) {
+    const next = step(current)
+    if (next === current) return current
+    current = next
+  }
+  return current
+}
+
 /** Remove every AgentChat block (current or legacy) from the file; the rest stays as it was. */
 export function removeAnchorAt(filePath: string): AnchorAction {
   const existing = readInstructionFile(filePath)
   if (existing === null) return 'noop'
-  const next = kit.anchor.remove(existing.text)
+  const next = untilStable(existing.text, (text) => kit.anchor.remove(text))
   if (next === existing.text) return 'noop'
   writeInstructionFile(filePath, existing.bom + next)
   return 'removed'
@@ -156,7 +173,7 @@ export function readAnchorHandleAt(filePath: string, template: string | null): s
 }
 
 export function readAnchorHandleFrom(text: string, template: string | null): string | null {
-  return kit.anchor.find(text.replace(/^﻿/, ''), { template })?.handle ?? null
+  return kit.anchor.find(text.replace(/^\uFEFF/, ''), { template })?.handle ?? null
 }
 
 /** `existing` with `block` in place of the first block (current or legacy) and every other block removed; `kit.anchor.replace`. */
@@ -193,14 +210,17 @@ function readInstructionFile(filePath: string): { bom: string; text: string } | 
   } catch {
     throw new Error(`${filePath} is not UTF-8 text; the AgentChat block is not read or written there`)
   }
-  return decoded.startsWith('﻿') ? { bom: '﻿', text: decoded.slice(1) } : { bom: '', text: decoded }
+  return decoded.startsWith('\uFEFF') ? { bom: '\uFEFF', text: decoded.slice(1) } : { bom: '', text: decoded }
 }
 
 /**
  * Where a write to `filePath` lands: the file at the end of any symlink chain
- * (which may not exist yet). Each hop is resolved the way the kernel does:
- * from the link's real directory, so a relative `../x` behind a symlinked
- * directory reaches the same file a plain write would.
+ * (which may not exist yet). Each hop is resolved by the kernel, never as
+ * text: the link's text is joined to its real directory unnormalised, and the
+ * directory part of that is handed to `realpath(3)`. So a `..` in the link
+ * text, before or after a symlinked part (`sub/../x`, `../x` behind a
+ * symlinked directory), reaches the file a plain write would, and a link into
+ * a directory that does not exist fails ENOENT as a plain write would.
  */
 function resolveWriteTarget(filePath: string): string {
   let current = filePath
@@ -213,14 +233,27 @@ function resolveWriteTarget(filePath: string): string {
       throw err
     }
     if (!stat.isSymbolicLink()) return current
-    current = path.resolve(fs.realpathSync(path.dirname(current)), fs.readlinkSync(current))
+    const link = fs.readlinkSync(current)
+    const joined = path.isAbsolute(link) ? link : `${fs.realpathSync.native(path.dirname(current))}${path.sep}${link}`
+    current = path.join(fs.realpathSync.native(path.dirname(joined)), path.basename(joined))
   }
   throw Object.assign(new Error(`${filePath}: too many symbolic links`), { code: 'ELOOP' })
 }
 
-function directoryWritable(dir: string): boolean {
+/**
+ * Failures of the temp file or the rename — not of the user's file — after
+ * which an in-place write still works, as 0.4.0's did: a directory that takes
+ * no new file (EACCES / EPERM / EROFS: read-only, sticky and owned by another
+ * user, a sandbox), a file that cannot be renamed over (EBUSY / EXDEV: a
+ * single-file bind mount, a mount point; EPERM: held open on Windows). A full
+ * disk, an I/O error and the rest are not in it: an in-place write then could
+ * truncate the file, so they are thrown with the old file intact.
+ */
+const IN_PLACE_FALLBACK_CODES: ReadonlySet<string> = new Set(['EACCES', 'EPERM', 'EROFS', 'EBUSY', 'EXDEV'])
+
+function stillWritable(file: string): boolean {
   try {
-    fs.accessSync(dir, fs.constants.W_OK | fs.constants.X_OK)
+    fs.accessSync(file, fs.constants.W_OK)
     return true
   } catch {
     return false
@@ -238,8 +271,10 @@ function directoryWritable(dir: string): boolean {
  * - the file's permission bits;
  * - a file the user made read-only is refused (EACCES), not replaced;
  * - under root (`sudo`), the file's owner;
- * - a writable file in a directory that is not: there is nowhere to put a
- *   temp file, so the file is written in place, as before (not atomic then).
+ * - a writable file the temp file or the rename cannot replace (a directory
+ *   that takes no new file, a single-file bind mount, a file held open on
+ *   Windows): it is written in place, as before (not atomic then; see
+ *   `IN_PLACE_FALLBACK_CODES`).
  * What it does not keep: the other names of a hard-linked file (they keep the
  * old text), and extended attributes and ACLs on the file. A crash between
  * the temp file's creation and the rename can leave the temp file
@@ -257,14 +292,19 @@ export function writeInstructionFile(filePath: string, data: string): void {
   if (existing !== null) {
     if (!existing.isFile()) throw new Error(`${filePath} is not a regular file`)
     fs.accessSync(target, fs.constants.W_OK)
-    if (!directoryWritable(path.dirname(target))) {
-      fs.writeFileSync(target, data, 'utf-8')
-      return
-    }
   } else {
     fs.mkdirSync(path.dirname(target), { recursive: true })
   }
-  atomicWriteFile(target, data, existing === null ? undefined : existing.mode & 0o7777)
+  try {
+    atomicWriteFile(target, data, existing === null ? undefined : existing.mode & 0o7777)
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code
+    if (existing !== null && code !== undefined && IN_PLACE_FALLBACK_CODES.has(code) && stillWritable(target)) {
+      fs.writeFileSync(target, data, 'utf-8')
+      return
+    }
+    throw err
+  }
   if (existing !== null && typeof process.getuid === 'function' && process.getuid() === 0 && (existing.uid !== 0 || existing.gid !== 0)) {
     try {
       fs.chownSync(target, existing.uid, existing.gid)
