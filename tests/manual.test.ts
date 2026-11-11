@@ -28,13 +28,13 @@ describe('the bundled manual (the fallback for a skill file that cannot be downl
     // copy is only what a first install writes when it cannot download one.
     // Refresh it at release time with the two-command refresh (README §
     // Refreshing the bundled manual) so the fallback is never far behind.
-    expect(manualVersion()).toBe('2.2.1')
+    expect(manualVersion()).toBe('2.3.1')
   })
 
   it('is the main line’s text, not a per-host rendering: what it says about one integration it says about all', () => {
     // The guard used to be "names no `npx -y @agentchatme/…`" — the old
     // per-host template spelled one host's CLI into the manual. The served
-    // manual (2.2.1) now names the integrations' own `recover` commands
+    // manual (2.2.1 on) names the integrations' own `recover` commands
     // itself, for every integration alike; a copy that named only one host
     // would be a rendering again.
     const names = (pkg: string): boolean => MANUAL.includes(`@agentchatme/${pkg}`)
