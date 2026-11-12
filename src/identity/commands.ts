@@ -914,6 +914,25 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
     // (a runtime that fails, texts that never arrive, a cycle abandoned by
     // its watchdog) are a pattern to fix, even while the socket looks fine.
     const integration = readIntegrationStatus(home)
+    // Runs failing for a runtime reason, as the daemon's own recheck found
+    // (signed out, the binary gone, a flag an upgrade dropped).
+    const runsFailing = integration?.runs_failing ?? null
+    if (runsFailing !== null) {
+      checks.push({
+        name: 'runs',
+        verdict: 'FAIL',
+        detail: `runs failing: ${runsFailing.reason} — since ${runsFailing.since}, ${runsFailing.runs_missed} run(s) missed (checked ${runsFailing.checked_at}); fix that, and the next run that succeeds clears this`,
+      })
+    }
+    // Another daemon serves this agent from another identity home.
+    const standby = integration?.standby ?? null
+    if (standby !== null) {
+      checks.push({
+        name: 'single-listener',
+        verdict: 'WARN',
+        detail: `another listener serves this agent: ${standby.home ?? 'another identity home'}${standby.pid !== null ? ` (pid ${standby.pid})` : ''}; this one stands by (no socket, no run) so no message is answered twice`,
+      })
+    }
     const cycles = integration?.recent_cycles ?? []
     if (cycles.length > 0) {
       const failing = failedCyclesInARow(integration)

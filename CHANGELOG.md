@@ -23,6 +23,10 @@ The number is set at the release step (`VERSIONING.md`).
 - **An answer run's key file is its own** (`<stem>.<run id>.json`): a late cleanup of an abandoned run cannot remove the next run's.
 - **A hung Codex listing is killed with everything it started**: its process group on POSIX (it is spawned detached), its tree on Windows (`taskkill /T /F`; there `codex` runs under the npm `.cmd` shim, and killing the shim left the real process running, holding the workdir), and the answer waits for it to have exited (bounded). The config-file list the listing cache is keyed on is built for the platform: on Windows `<ProgramData>\OpenAI\Codex\config.toml` and `requirements.toml`, and the workdir chain up to its drive root.
 - `work` and `full` are unchanged; the README and `status` now say plainly that with either, runs started by peers' messages can read and change this machine.
+- **"Ready" while every run fails is said plainly.** After a run that did not get done, the runtime is checked again (its preflight, at most once every 5 minutes while runs keep failing). A failing check shows in `status` ("socket ready — but runs are failing" and "runs failing: <reason> — since <time>, N run(s) missed"), in `doctor` (FAIL `runs`), and in `integration.status.json` (`runs_failing`). Wakes keep starting runs and are counted; the next run that succeeds clears it.
+- **One agent, one listener.** Two identity homes holding the same agent's key each held a socket and started a run per wake: every message was answered twice. A per-agent lock in a per-user folder (`agentLockDir`) now lets one daemon serve the agent; the other stands by (no socket, no run), names the serving home in `status` (`standby`) and `doctor`, and takes over when that one stops.
+- **Locks are taken atomically.** `daemon.lock` (and the agent lock) are created with O_EXCL and name their holder's pid and start time. A stale lock (holder gone, or the pid reused) is taken over under a guard, never overwritten in place. The old steal wrote over a stale lock, so two daemons starting at once could both hold it.
+- **Windows: a hung probe no longer orphans its process or blocks the daemon.** `codex --version`, `codex login status`, `claude --version` and `claude auth status` ran synchronously with a timeout that killed only the `.cmd` shim, and then waited on the survivor's pipes. They are now async (`runProbe`): on timeout the whole tree is killed (POSIX process group, `taskkill /T /F`), its exit is waited for within a bound, and the probe answers. A `claude auth status` that hung counts as not signed in (no keychain fallback).
 
 ### Added
 
@@ -30,6 +34,7 @@ The number is set at the release step (`VERSIONING.md`).
 
 ### Changed
 
+- **API (breaking):** `Preset.inspect`, `inspectClaudeRuntime`, `claudeIsLoggedIn`, `inspectCodexRuntime` and `codexIsLoggedIn` return Promises (each takes an optional `timeoutMs`). New: `runProbe`, `acquirePidLock` and the lock helpers, `agentLockDir` / `agentLockPath` / `acquireAgentLock` / `AGENT_LOCK_DIR_ENV`, `IntegrationStatus.standby` and `.runs_failing`, `RUNTIME_RECHECK_MS`; `RunIntegrationOpts.standbyPollMs` / `.runtimeRecheckMs` and `IntegrationOptions.runtimeRecheckMs` (test seams).
 - **API:** `ANSWER_TOOLS` is `['Read', 'Glob', 'Grep']` (the web tools are `WEB_TOOLS`, still pre-approved in `work`). `claudeRunArgs('answer', …)` and `codexRunArgs('answer', …)` return the argv above; integrations that pin them update their pins. A `ClaudeRunner` for `answer` without `mcpConfigPath` now needs `answerMcp` (preflight fails without it). `PARENT_ENV_KEYS` lists more names; the rule is `withoutParentSession`.
 
 ## [0.4.1] — 2026-11-11

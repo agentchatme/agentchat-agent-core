@@ -41,6 +41,7 @@ const LEGACY: readonly LegacyEnv[] = [
 /** Names agent-core reads today that are not legacy. */
 const CURRENT = new Set([
   'AGENTCHAT_API_KEY',
+  'AGENTCHAT_LOCK_DIR',
   'AGENTCHAT_API_BASE',
   'AGENTCHAT_LOG_LEVEL',
   'AGENTCHAT_INTEGRATION',

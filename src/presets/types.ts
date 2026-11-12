@@ -52,8 +52,12 @@ export interface Preset {
   readonly label: string
   /** How the served texts spell the hosted tools for this runtime (`GET /v1/texts?runtime=`). */
   readonly runtime: TextsRuntime
-  /** Is the runtime installed, new enough and signed in? For `doctor` and `status`. */
-  inspect(env?: NodeJS.ProcessEnv, command?: string): PresetInspection
+  /**
+   * Is the runtime installed, new enough and signed in? For `doctor` and
+   * `status`. Async: its probes are killed with their whole tree when they
+   * hang (a Windows `.cmd` shim, an npm launcher), never left blocking.
+   */
+  inspect(env?: NodeJS.ProcessEnv, command?: string): Promise<PresetInspection>
   /**
    * A runner whose runs act as the agent in `ctx`: the hosted tool server is
    * given to each run with that agent's key (a file or an environment

@@ -2,6 +2,8 @@ import * as path from 'node:path'
 import * as fs from 'node:fs'
 import { log } from '../util/log.js'
 import { acquireLeaderLock } from '../daemon/leader-lock.js'
+import { acquireAgentLock, agentLockRefusal } from '../daemon/agent-lock.js'
+import type { HeldLock } from '../util/pid-lock.js'
 import { resolveIdentity, credentialsPath } from '../identity/credentials.js'
 import { resolveDaemonConfig } from '../daemon/config.js'
 import { idle } from '../daemon/health.js'
@@ -9,7 +11,7 @@ import type { IntegrationClient } from '../client-identity.js'
 import { Integration } from './integration.js'
 import { INTEGRATION_ENV, INTEGRATION_ENV_LEGACY, INTEGRATION_ENV_LEGACY_REMOVAL, integrationDisabledBy, resolveRunBudgetMs, resolveRunProfile, type RunProfile } from './profile.js'
 import { isRunnerFactory, type RunnerSource } from './runner.js'
-import { writeIntegrationStatus } from './status.js'
+import { writeIntegrationStatus, type IntegrationStandby } from './status.js'
 
 // ─── The resident supervisor ────────────────────────────────────────────────
 //
@@ -43,6 +45,8 @@ const POLL_MS = 5_000
 const TICK_MS = 250
 /** Ceiling for retry backoff when the runtime simply is not usable yet. */
 const MAX_BACKOFF_MS = 5 * 60_000
+/** While another daemon serves this agent: how often to look whether it still does. */
+const STANDBY_POLL_MS = 30_000
 /**
  * How long a shutdown waits for an interrupted run to end before the process
  * exits. The runner SIGTERMs the run's process group at once and SIGKILLs 5 s
@@ -88,6 +92,10 @@ export interface RunIntegrationOpts {
   credentialsFromHomeOnly?: boolean
   /** See `IntegrationOptions.dismissIgnoredInvites` (default true). */
   dismissIgnoredInvites?: boolean
+  /** Test seam: while another daemon serves this agent, how often to look again (30 s). */
+  standbyPollMs?: number
+  /** Test seam: `IntegrationOptions.runtimeRecheckMs`. */
+  runtimeRecheckMs?: number
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
@@ -124,6 +132,9 @@ function boundDaemonLog(home: string): void {
   }
 }
 
+/** The agent is served by another daemon: not a failure, no backoff. */
+class StandbyError extends Error {}
+
 /**
  * Run the integration daemon. Returns only on a condition that makes running
  * pointless — another daemon already holding this home's lock — or when
@@ -157,6 +168,14 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
   let failures = 0
   let lastFailure: string | null = null
   let shuttingDown = false
+  /** The agent lock (one agent, one listener), held for as long as an integration is live. */
+  let agentLock: HeldLock | null = null
+  /** Another daemon serves this agent: who, for status. */
+  let standby: IntegrationStandby | null = null
+  const releaseAgent = (): void => {
+    agentLock?.release()
+    agentLock = null
+  }
 
   const offStatus = (handle: string | null): void =>
     writeIntegrationStatus(home, {
@@ -182,6 +201,7 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
       retry_due_at: null,
       last_error: lastFailure,
       texts: null,
+      standby,
     })
 
   const disconnect = (why: string): void => {
@@ -190,6 +210,7 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
     live.stop()
     live = null
     liveFingerprint = null
+    releaseAgent()
     idle(home)
   }
 
@@ -246,6 +267,7 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
       observedFingerprint = fp
       failures = 0
       lastFailure = null
+      standby = null
       if (fp === null || disabled) offStatus(fp === null ? null : identityOf()?.handle ?? null)
     }
 
@@ -256,6 +278,25 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
     } else if (fp !== liveFingerprint) {
       try {
         const cfg = await resolveDaemonConfig({ home, workdir, client: opts.client, envKey })
+        // One agent, one listener: a daemon in another home that already
+        // serves this agent keeps it; this one stands by (no socket, no run)
+        // and takes over when that one stops (its lock goes stale).
+        // The process's own environment decides the lock folder (a service and a
+        // shell agree on it); the switches `env` carries do not move it.
+        const attempt = acquireAgentLock({ apiBase: cfg.apiBase, handle: cfg.handle, home }, { ...process.env, ...env })
+        if (!attempt.ok) {
+          const msg = agentLockRefusal({ handle: cfg.handle, home }, attempt.holder, attempt.path)
+          standby = { home: attempt.holder?.home ?? null, pid: attempt.holder?.pid ?? null, since: attempt.holder?.acquired_at ?? null }
+          if (msg !== lastFailure) {
+            log.warn(msg)
+            lastFailure = msg
+            offStatus(cfg.handle)
+          }
+          throw new StandbyError(msg)
+        }
+        if (standby !== null) log.info(`@${cfg.handle}: the other listener stopped; this one serves the agent now`)
+        standby = null
+        agentLock = attempt.lock
         const runner = isRunnerFactory(opts.runner) ? opts.runner.create(cfg) : opts.runner
         const candidate = new Integration({
           cfg,
@@ -266,6 +307,7 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
           profile,
           budgetMs,
           ...(opts.dismissIgnoredInvites !== undefined ? { dismissIgnoredInvites: opts.dismissIgnoredInvites } : {}),
+          ...(opts.runtimeRecheckMs !== undefined ? { runtimeRecheckMs: opts.runtimeRecheckMs } : {}),
         })
         await candidate.start()
         live = candidate
@@ -273,19 +315,22 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
         failures = 0
         lastFailure = null
       } catch (err) {
-        // Runtime not ready (host CLI missing or not signed in), network
-        // down, whatever. Stay resident and try again later — exiting would
-        // just make the service manager restart us in a loop. Backed off and
-        // de-duplicated so a condition that lasts days does not fill the log.
-        const msg = String(err instanceof Error ? err.message : err)
-        if (msg !== lastFailure) {
-          log.warn(`not connecting yet: ${msg}`)
-          lastFailure = msg
-          offStatus(identityOf()?.handle ?? null)
-        }
-        failures += 1
+        releaseAgent()
         live = null
         liveFingerprint = null
+        if (!(err instanceof StandbyError)) {
+          // Runtime not ready (host CLI missing or not signed in), network
+          // down, whatever. Stay resident and try again later — exiting would
+          // just make the service manager restart us in a loop. Backed off and
+          // de-duplicated so a condition that lasts days does not fill the log.
+          const msg = String(err instanceof Error ? err.message : err)
+          if (msg !== lastFailure) {
+            log.warn(`not connecting yet: ${msg}`)
+            lastFailure = msg
+            offStatus(identityOf()?.handle ?? null)
+          }
+          failures += 1
+        }
         idle(home)
       }
     }
@@ -294,7 +339,7 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
     // sign-in connects in well under a second. Exponential backoff while a
     // start keeps failing, capped — the watcher still wakes us instantly when
     // credentials change, so backing off never delays a real sign-in.
-    const waitMs = failures === 0 ? POLL_MS : Math.min(POLL_MS * 2 ** Math.min(failures, 6), MAX_BACKOFF_MS)
+    const waitMs = standby !== null ? (opts.standbyPollMs ?? STANDBY_POLL_MS) : failures === 0 ? POLL_MS : Math.min(POLL_MS * 2 ** Math.min(failures, 6), MAX_BACKOFF_MS)
     nudged = false
     const deadline = Date.now() + waitMs
     while (!nudged && !shuttingDown && !opts.signal?.aborted && Date.now() < deadline) {
@@ -309,6 +354,7 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
     if (!ended) log.warn(`a run in flight did not end within ${Math.round(SHUTDOWN_GRACE_MS / 1000)}s of being interrupted — exiting anyway`)
     live = null
   }
+  releaseAgent()
   idle(home)
   lock.release()
   if (shuttingDown) {

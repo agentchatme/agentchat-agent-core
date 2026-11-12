@@ -6,7 +6,7 @@ import { beat, idle } from '../daemon/health.js'
 import { clientIdentityOf, type IntegrationClient } from '../client-identity.js'
 import type { RunProfile } from './profile.js'
 import type { RunKind, RunOutcome, RunRunner, RunWake } from './runner.js'
-import { writeIntegrationStatus, type IntegrationLastRun, type IntegrationStatus, type SocketState } from './status.js'
+import { writeIntegrationStatus, type IntegrationLastRun, type IntegrationRunsFailing, type IntegrationStatus, type SocketState } from './status.js'
 import { blockedDetail, socketStateOf } from './socket-state.js'
 import { textsCachePath } from './texts.js'
 import { MANUAL } from '../skill/manual.js'
@@ -55,6 +55,13 @@ const HTTP_TIMEOUT_MS = 10_000
  */
 export const RUNNER_DEADLINE_SLACK_MS = 60_000
 
+/**
+ * After a run that did not get done, the runtime is checked again (its
+ * preflight) — at most once per this while runs keep failing, never on every
+ * wake. A failing check is what `status` and `doctor` then say.
+ */
+export const RUNTIME_RECHECK_MS = 5 * 60_000
+
 /** A runner's `preflight()` (a `--version`, an auth probe) past this counts as not ok. */
 export const PREFLIGHT_DEADLINE_MS = 60_000
 
@@ -73,6 +80,8 @@ export interface IntegrationOptions {
   readonly budgetMs: number
   /** Injectable for tests; past `budgetMs` plus this a runner that has not returned is abandoned. */
   readonly runnerDeadlineSlackMs?: number
+  /** Injectable for tests; `RUNTIME_RECHECK_MS`. */
+  readonly runtimeRecheckMs?: number
   /** Injectable for tests; defaults to an SDK client for `cfg`. */
   readonly api?: AgentChatClient
   /** Injectable for tests: the socket (built with `ackOnReceipt` and the v1 capabilities otherwise). */
@@ -156,6 +165,14 @@ export class Integration {
   private statusTimer: ReturnType<typeof setInterval> | null = null
   private socket: SocketState = 'idle'
   private lastError: string | null = null
+  /** When the first run that did not get done since the last good one ended; null while runs succeed. */
+  private failingSince: string | null = null
+  /** Runs that did not get done since then. */
+  private failingRuns = 0
+  /** What the runtime's own check says while runs fail (status `runs_failing`); null when it has not failed one. */
+  private runsFailing: IntegrationRunsFailing | null = null
+  private lastRecheckAt = 0
+  private recheckInFlight: Promise<void> | null = null
   private stopping = false
   private stopped: Promise<void> | null = null
 
@@ -342,6 +359,8 @@ export class Integration {
       handle: this.options.cfg.handle,
       profile: this.options.profile,
       workdir: this.options.cfg.workdir,
+      standby: null,
+      runs_failing: this.runsFailing,
       socket: this.stopping ? 'closed' : this.socket,
       wakes: status.coalescer.wakes,
       wakes_absorbed: status.coalescer.absorbed,
@@ -455,10 +474,65 @@ export class Integration {
     if (outcome.state !== 'ok') {
       log.warn(`run ${outcome.state} kind=${kind} id=${runId}${outcome.detail ? `: ${outcome.detail}` : ''} — the cards stay on the tray; the next wake (or the server's re-wake) finds them`)
     }
+    this.noteRunHealth(outcome, this.lastRun.ended_at)
     this.writeStatus()
     return outcome.state === 'ok'
       ? { status: 'completed' }
       : { status: outcome.state === 'not_started' ? 'not_started' : 'failed', ...(outcome.detail !== undefined ? { detail: outcome.detail } : {}) }
+  }
+
+  /**
+   * A run that did not get done may be the runtime itself (signed out, the
+   * binary gone, a flag an upgrade dropped): checked again, at most once per
+   * `RUNTIME_RECHECK_MS`, and said in status until a run succeeds. Wakes keep
+   * starting runs meanwhile — each is the quickest way back — and are counted.
+   */
+  private noteRunHealth(outcome: RunOutcome, endedAt: string): void {
+    if (outcome.state === 'ok') {
+      if (this.runsFailing !== null) log.info(`runs work again (${this.failingRuns} run(s) missed since ${this.failingSince})`)
+      this.failingSince = null
+      this.failingRuns = 0
+      this.runsFailing = null
+      return
+    }
+    this.failingSince ??= endedAt
+    this.failingRuns += 1
+    if (this.runsFailing !== null) this.runsFailing = { ...this.runsFailing, runs_missed: this.failingRuns }
+    const recheckMs = this.options.runtimeRecheckMs ?? RUNTIME_RECHECK_MS
+    if (this.recheckInFlight === null && !this.stopping && (this.lastRecheckAt === 0 || Date.now() - this.lastRecheckAt >= recheckMs)) {
+      this.recheckInFlight = this.recheckRuntime().finally(() => {
+        this.recheckInFlight = null
+      })
+    }
+  }
+
+  private async recheckRuntime(): Promise<void> {
+    this.lastRecheckAt = Date.now()
+    const pre = await withDeadline(this.options.runner.preflight(), PREFLIGHT_DEADLINE_MS, () => ({
+      ok: false,
+      detail: `preflight did not answer within ${Math.round(PREFLIGHT_DEADLINE_MS / 1000)} s`,
+    })).catch((err: unknown) => ({ ok: false, detail: `preflight threw: ${err instanceof Error ? err.message : String(err)}` }))
+    // A run succeeded while it was being checked: nothing to say.
+    if (this.failingSince === null || this.stopping) return
+    const checkedAt = new Date().toISOString()
+    if (!pre.ok) {
+      const reason = `${this.options.runner.name}: ${pre.detail ?? 'its check failed'}`
+      if (this.runsFailing?.reason !== reason) log.warn(`runs failing — ${reason} (since ${this.failingSince}, ${this.failingRuns} run(s) missed); status says so until a run succeeds`)
+      this.runsFailing = { reason, since: this.failingSince, runs_missed: this.failingRuns, checked_at: checkedAt }
+    } else if (this.runsFailing !== null) {
+      // The runtime checks out again, but no run has succeeded yet.
+      this.runsFailing = {
+        ...this.runsFailing,
+        reason: `${this.options.runner.name} checks out now, but runs still fail${this.lastRun?.detail ? ` (last: ${this.lastRun.detail})` : ''}`,
+        checked_at: checkedAt,
+      }
+    }
+    this.writeStatus()
+  }
+
+  /** Test seam: resolves when a runtime check started by a failed run has finished. */
+  async runtimeCheckSettled(): Promise<void> {
+    await this.recheckInFlight
   }
 
   private onEvent(event: kit.ReceiveLoopEvent): void {

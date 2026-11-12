@@ -7,7 +7,8 @@ import { workdirExposesHome, type RunProfile } from '../integration/profile.js'
 import type { RunOutcome, RunPreflight, RunRequest, RunRunner } from '../integration/runner.js'
 import { killProcessTree, redactDiagnostic, spawnRun } from '../integration/spawn-run.js'
 import { log } from '../util/log.js'
-import { spawnCommand, spawnCommandSync } from '../util/spawn.js'
+import { spawnCommand } from '../util/spawn.js'
+import { runProbe } from '../util/probe.js'
 import { VERSION } from '../version.js'
 import { semverAtLeast } from './semver.js'
 import { withoutInheritedKey, withoutParentSession, type Preset, type PresetContext, type PresetInspection } from './types.js'
@@ -107,15 +108,14 @@ export function codexHomeFrom(env: NodeJS.ProcessEnv = process.env): string {
   return path.join(os.homedir(), '.codex')
 }
 
-export function inspectCodexRuntime(codexHome: string, command = 'codex'): PresetInspection {
-  const result = spawnCommandSync(command, ['--version'], {
-    encoding: 'utf-8',
-    timeout: 10_000,
-    windowsHide: true,
-    env: { ...process.env, CODEX_HOME: codexHome },
-  })
+/** How long a probe (`--version`, `login status`) may take; a hung one is killed with its whole tree (`runProbe`). */
+export const CODEX_PROBE_TIMEOUT_MS = 10_000
+
+export async function inspectCodexRuntime(codexHome: string, command = 'codex', timeoutMs = CODEX_PROBE_TIMEOUT_MS): Promise<PresetInspection> {
+  const result = await runProbe(command, ['--version'], { timeoutMs, env: { ...process.env, CODEX_HOME: codexHome } })
+  if (result.timedOut) return { ok: false, detail: `codex --version did not answer within ${Math.round(timeoutMs / 1000)} s (killed)` }
   if (result.error) return { ok: false, detail: `codex CLI not found on PATH (${result.error.message})` }
-  const rendered = String(result.stdout || result.stderr).trim()
+  const rendered = (result.stdout || result.stderr).trim()
   if (result.status !== 0) return { ok: false, detail: rendered || `codex --version exited ${result.status}` }
   return semverAtLeast(rendered, MIN_CODEX_VERSION)
     ? { ok: true, detail: rendered }
@@ -123,15 +123,10 @@ export function inspectCodexRuntime(codexHome: string, command = 'codex'): Prese
 }
 
 /** `codex login status` exits 0 when signed in. */
-export function codexIsLoggedIn(codexHome: string, command = 'codex'): PresetInspection {
-  const status = spawnCommandSync(command, ['login', 'status'], {
-    encoding: 'utf-8',
-    timeout: 10_000,
-    windowsHide: true,
-    env: { ...process.env, CODEX_HOME: codexHome },
-  })
+export async function codexIsLoggedIn(codexHome: string, command = 'codex', timeoutMs = CODEX_PROBE_TIMEOUT_MS): Promise<PresetInspection> {
+  const status = await runProbe(command, ['login', 'status'], { timeoutMs, env: { ...process.env, CODEX_HOME: codexHome } })
   if (status.error) return { ok: false, detail: status.error.message }
-  const detail = `${status.stdout ?? ''}${status.stderr ?? ''}`.trim().slice(0, 200)
+  const detail = `${status.stdout}${status.stderr}`.trim().slice(0, 200)
   return status.status === 0 ? { ok: true, detail: detail || 'signed in' } : { ok: false, detail: detail || 'codex is not signed in (run `codex login`)' }
 }
 
@@ -420,9 +415,9 @@ export class CodexRunner implements RunRunner {
   }
 
   async preflight(): Promise<RunPreflight> {
-    const runtime = inspectCodexRuntime(this.options.codexHome, this.command)
+    const runtime = await inspectCodexRuntime(this.options.codexHome, this.command)
     if (!runtime.ok) return { ok: false, detail: runtime.detail }
-    const auth = codexIsLoggedIn(this.options.codexHome, this.command)
+    const auth = await codexIsLoggedIn(this.options.codexHome, this.command)
     if (!auth.ok) return { ok: false, detail: `codex login status failed: ${auth.detail}` }
     if (this.workdir() !== this.options.workdir && !this.warnedHome) {
       this.warnedHome = true
@@ -610,11 +605,11 @@ export const codexPreset: Preset = {
   // `work` and `full` read the whole filesystem (an `answer` run reads only its
   // workdir): true, because the field is one for every profile.
   readsIdentityHome: true,
-  inspect(env = process.env, command = 'codex') {
+  async inspect(env = process.env, command = 'codex') {
     const home = codexHomeFrom(env)
-    const runtime = inspectCodexRuntime(home, command)
+    const runtime = await inspectCodexRuntime(home, command)
     if (!runtime.ok) return runtime
-    const auth = codexIsLoggedIn(home, command)
+    const auth = await codexIsLoggedIn(home, command)
     return auth.ok ? { ok: true, detail: `${runtime.detail}, signed in` } : { ok: false, detail: `${runtime.detail}, not signed in: ${auth.detail}` }
   },
   runner(ctx: PresetContext): RunRunner {

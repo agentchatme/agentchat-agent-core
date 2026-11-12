@@ -135,6 +135,31 @@ Pending group invites are on the tray (contract v1), so nothing about them is ke
 
 A run is classified `ok` (exit 0), `timed_out` (killed past its budget), `failed` (interrupted, or exited non-zero after writing to stdout), or `not_started` (exited non-zero with **nothing on stdout** — a signed-out CLI, a bad flag; its stderr complaint rides along, redacted, in the detail — or no served texts in hand yet). None of them is retried here.
 
+### One agent, one listener
+
+Two identity homes can hold the same agent's key: a CLI listener's home and an integration's, say. If both held a socket, every message would be answered twice. So the first daemon to start for an agent holds its **agent lock**, and any other daemon for that agent holds no socket and starts no run. `status` names the home that serves the agent (`standby`, and the last error), `doctor` warns, and the standby daemon takes over when that one stops.
+
+- **Where the lock lives:** one file per agent, `agent-<32 hex>.lock`, named by a hash of the API origin and the agent's handle (never the key). The folder is per user and owner-only, derived from the home folder alone so that a service and a shell agree on it:
+  - macOS: `~/Library/Application Support/AgentChat/locks`
+  - Windows: `%USERPROFILE%\AppData\Local\AgentChat\locks`
+  - elsewhere: `~/.local/state/agentchat/locks`
+  - `AGENTCHAT_LOCK_DIR` overrides it, for tests and sandboxes. Two daemons given different folders do not see each other.
+- **How it is held:** the agent lock and each home's `daemon.lock` are created with O_EXCL. Each names its holder's pid and start time, so a reused pid is not mistaken for the holder.
+- **Stale locks:** a lock whose holder is gone is taken over atomically. Only the holder of a short-lived guard file may remove a stale lock, and no lock is ever overwritten in place.
+- **Limit:** two different OS users holding one agent's key do not see each other.
+
+### When runs keep failing
+
+The socket can be fine while every run fails: the runtime was signed out, its binary removed, or an upgrade dropped a flag. After a run that did not get done, the daemon checks the runtime again with the runner's own preflight. It does this at most once every 5 minutes while runs keep failing, never on every wake. If the check fails, `status` says so plainly, under a headline that reads "socket ready — but runs are failing":
+
+```
+runs failing: claude: claude is not signed in (run `claude` once and sign in) — since <time>, N run(s) missed
+```
+
+`doctor` reports a FAIL check `runs`, and `integration.status.json` carries `runs_failing` (`reason`, `since`, `runs_missed`, `checked_at`). Wakes still start runs and are counted: each one is the quickest way back. The next run that succeeds clears it.
+
+The runtime probes (`inspectClaudeRuntime`, `claudeIsLoggedIn`, `inspectCodexRuntime`, `codexIsLoggedIn`, `Preset.inspect`) are async (`runProbe`). A probe that hangs is killed with everything it started: its process group on POSIX, `taskkill /T /F` on Windows, where the npm `.cmd` shim and the real process differ. Its exit is waited for, within a bound. A synchronous probe could only kill the shim, and then sat blocking the daemon.
+
 ### Run profiles
 
 `AGENTCHAT_RUN_PROFILE=answer|work|full` (default `answer`) says what a headless run may do; each integration maps the profile to its runtime's real flags and documents them. A run is started by **any** peer's unread message, a stranger's cold DM included, so the default gives it nothing to leak and no way to leak it:
@@ -197,7 +222,9 @@ pnpm test        # incl. tests/integration.test.ts (the SDK kit's receive loop a
                  # (the regression guard: an answer argv never gains the web, the shell or a read outside its workdir),
                  # tests/answer-isolation.test.ts (answer runs load only the AgentChat MCP server, no run carries a
                  # parent session's variables, the home folder is no answer run's workdir), tests/answer-review.test.ts
-                 # (no user context files, no extra working directories, per-run key files, the listing cache)
+                 # (no user context files, no extra working directories, per-run key files, the listing cache),
+                 # tests/listener-health.test.ts (runs failing said and cleared, the agent lock and its atomic
+                 # takeover, probes killed with their whole tree)
 ```
 
 The engine builds on the SDK's integration kit (`import { integration } from 'agentchatme'`, `agentchatme` 1.3.0 and later).

@@ -161,6 +161,8 @@ export {
   type IntegrationStatus,
   type IntegrationLastRun,
   type IntegrationCycle,
+  type IntegrationStandby,
+  type IntegrationRunsFailing,
   FAILED_CYCLE_OUTCOMES,
   REPEATED_FAILED_CYCLES,
   failedCyclesInARow,
@@ -223,6 +225,8 @@ export {
   HEARTBEAT_FILE,
 } from './daemon/health.js'
 export { acquireLeaderLock, type LockHandle } from './daemon/leader-lock.js'
+export { AGENT_LOCK_DIR_ENV, agentLockDir, agentLockPath, acquireAgentLock, agentLockRefusal } from './daemon/agent-lock.js'
+export { acquirePidLock, lockHolder, holderAlive, pidAlive, processStartedAt, parseHolder, PROCESS_STARTED_AT, type LockHolder, type HeldLock, type LockAttempt } from './util/pid-lock.js'
 export {
   installService,
   uninstallService,
@@ -253,3 +257,4 @@ export {
 export { log } from './util/log.js'
 export { atomicWriteFile, atomicCopyFile, readJsonFile } from './util/fsutil.js'
 export { spawnCommand, spawnCommandSync } from './util/spawn.js'
+export { runProbe, PROBE_KILL_WAIT_MS, type ProbeResult, type ProbeOptions } from './util/probe.js'
