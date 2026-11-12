@@ -809,7 +809,7 @@ describe('runs that keep failing for a runtime reason are said in status and doc
     const checksBefore = runner.preflights
     wake('m1')
     await until(() => runner.starts === 2, 5_000)
-    await i.runtimeCheckSettled()
+    await i.runtimeCheckDone()
     const failing = i.snapshot().runs_failing
     expect(failing).toMatchObject({ reason: 'claude: claude is not signed in (run `claude` once and sign in)', runs_missed: 1 })
     expect(runner.preflights).toBe(checksBefore + 1)
@@ -844,14 +844,14 @@ describe('runs that keep failing for a runtime reason are said in status and doc
     await until(() => i.snapshot().socket === 'ready', 5_000)
     wake('m0')
     await until(() => runner.starts === 1, 5_000)
-    await i.runtimeCheckSettled()
+    await i.runtimeCheckDone()
     expect(i.snapshot().runs_failing?.reason).toBe('claude: claude CLI not found on PATH')
     const checks = runner.preflights
     await new Promise((r) => setTimeout(r, 300))
     runner.check = { ok: false, detail: 'unknown option --permission-prompts' }
     wake('m1')
     await until(() => runner.starts === 2, 5_000)
-    await i.runtimeCheckSettled()
+    await i.runtimeCheckDone()
     expect(runner.preflights).toBe(checks + 1)
     expect(i.snapshot().runs_failing).toMatchObject({ reason: 'claude: unknown option --permission-prompts', runs_missed: 2 })
   }, 20_000)
@@ -865,7 +865,7 @@ describe('runs that keep failing for a runtime reason are said in status and doc
     const checks0 = runner.preflights
     wake('a')
     await until(() => runner.starts === 1, 5_000)
-    await i.runtimeCheckSettled()
+    await i.runtimeCheckDone()
     expect(runner.preflights).toBe(checks0 + 1)
     runner.outcome = { state: 'ok', exitCode: 0, durationMs: 1 }
     wake('b')
@@ -874,7 +874,7 @@ describe('runs that keep failing for a runtime reason are said in status and doc
     runner.check = { ok: false, detail: 'unknown option --permission-prompts' }
     wake('c')
     await until(() => runner.starts === 3, 5_000)
-    await i.runtimeCheckSettled()
+    await i.runtimeCheckDone()
     expect(runner.preflights).toBe(checks0 + 2)
     expect(i.snapshot().runs_failing?.reason).toBe('claude: unknown option --permission-prompts')
   }, 20_000)
@@ -910,7 +910,7 @@ describe('runs that keep failing for a runtime reason are said in status and doc
     const runner = new ScriptedRunner({ state: 'failed', exitCode: 1, durationMs: 1, detail: 'the model errored' }, { ok: true })
     const i = await start(runner, 60_000)
     await until(() => runner.starts === 1, 5_000)
-    await i.runtimeCheckSettled()
+    await i.runtimeCheckDone()
     expect(i.snapshot().runs_failing ?? null).toBeNull()
   }, 20_000)
 })

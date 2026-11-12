@@ -553,7 +553,7 @@ export class Integration {
   }
 
   /** Test seam: resolves when a runtime check started by a failed run has finished. */
-  async runtimeCheckSettled(): Promise<void> {
+  async runtimeCheckDone(): Promise<void> {
     await this.recheckInFlight
   }
 
