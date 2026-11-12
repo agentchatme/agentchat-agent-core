@@ -101,6 +101,10 @@ export interface RunIntegrationOpts {
   pollMs?: number
   /** Test seam: the loop's own tick, how soon it notices a nudge (250 ms). */
   tickMs?: number
+  /** Test seams: `IntegrationOptions.quietMs`, `maxMs` and `paceMs` (when a wake's run starts). */
+  quietMs?: number
+  maxMs?: number
+  paceMs?: number
   /** Test seam: while another daemon serves this agent, how often to look again (30 s). */
   standbyPollMs?: number
   /** Test seam: `IntegrationOptions.runtimeRecheckMs`. */
@@ -114,6 +118,20 @@ export interface RunIntegrationOpts {
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
+
+/** Sleep `ms`, or less if `signal` fires (a stop is never held for a tick). */
+function sleepUnless(ms: number, signal: AbortSignal | undefined): Promise<void> {
+  if (signal?.aborted === true) return Promise.resolve()
+  return new Promise((resolve) => {
+    const done = (): void => {
+      clearTimeout(timer)
+      signal?.removeEventListener('abort', done)
+      resolve()
+    }
+    const timer = setTimeout(done, ms)
+    signal?.addEventListener('abort', done, { once: true })
+  })
+}
 
 /**
  * Identity fingerprint: changes when the user signs out, signs in, or swaps to
@@ -470,6 +488,9 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
           budgetMs,
           ...(opts.dismissIgnoredInvites !== undefined ? { dismissIgnoredInvites: opts.dismissIgnoredInvites } : {}),
           ...(opts.runtimeRecheckMs !== undefined ? { runtimeRecheckMs: opts.runtimeRecheckMs } : {}),
+          ...(opts.quietMs !== undefined ? { quietMs: opts.quietMs } : {}),
+          ...(opts.maxMs !== undefined ? { maxMs: opts.maxMs } : {}),
+          ...(opts.paceMs !== undefined ? { paceMs: opts.paceMs } : {}),
           statusExtra: () => ({ lease_errors: leaseErrors() }),
         })
         starting = candidate
@@ -521,7 +542,7 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
     nudged = false
     const deadline = Date.now() + waitMs
     while (!nudged && !shuttingDown && !opts.signal?.aborted && Date.now() < deadline) {
-      await sleep(opts.tickMs ?? TICK_MS)
+      await sleepUnless(opts.tickMs ?? TICK_MS, opts.signal)
     }
   }
 

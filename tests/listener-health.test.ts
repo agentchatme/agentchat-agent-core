@@ -343,7 +343,11 @@ describe('the lease: O_EXCL, the bare pid first, renewed by its holder, taken ov
       fs.utimesSync(file, new Date(old), new Date(old))
       expect((await acquireLease(file, {}, { bootedAt })).ok).toBe(false)
       resetLeaseObservations()
-      leaseFile(file, { pid: live.pid ?? 0, renewed_at: old }) // touched since the boot
+      leaseFile(file, { pid: live.pid ?? 0, renewed_at: old }) // the file touched since the boot
+      expect((await acquireLease(file, {}, { bootedAt })).ok).toBe(false)
+      resetLeaseObservations()
+      leaseFile(file, { pid: live.pid ?? 0, renewed_at: Date.now() }) // renewed since the boot, the file's time kept (a restore)
+      fs.utimesSync(file, new Date(old), new Date(old))
       expect((await acquireLease(file, {}, { bootedAt })).ok).toBe(false)
     } finally {
       live.kill('SIGKILL')
@@ -563,6 +567,13 @@ describe('one agent, one listener: the supervisor', () => {
   afterEach(async () => {
     await double?.close()
   })
+  /** A wake's run starts within a fraction of a second (no 2 s quiet window, no pacing). */
+  const promptRuns = { quietMs: 50, maxMs: 200, paceMs: 50 }
+  const wakeStartsRun = async (runner: ScriptedRunner, id: string): Promise<void> => {
+    const before = runner.starts
+    double.send({ type: 'message.new', payload: { id, conversation_id: 'conv_1', sender: 'peer', content: { text: 'x' } } })
+    await until(() => runner.starts > before, 3_000)
+  }
 
   it('two homes holding one agent\'s key: the first serves it, the second stands by naming the first home (status rewritten every poll) and takes over when it stops', async () => {
     double = await startServerDouble({ tray: { waiting: 0 } })
@@ -767,25 +778,44 @@ describe('one agent, one listener: the supervisor', () => {
     }
   }, 30_000)
 
-  it('a daemon whose home lock is taken over stops serving at once (a wake right after starts no run) and exits (code 1)', async () => {
-    double = await startServerDouble({ tray: { waiting: 1 } })
+  it('a daemon whose home lock is taken over exits at once (code 1)', async () => {
+    double = await startServerDouble({ tray: { waiting: 0 } })
     const home1 = path.join(sandbox, 'h-lost')
     signIn(home1, KEY, double.apiBase)
-    const runner = new ScriptedRunner({ state: 'ok', exitCode: 0, durationMs: 1 }, { ok: true })
-    // A minute between polls (only the nudge makes the exit prompt) and a 2 s loop tick (only the lease's own stop is at once).
-    const a = daemon(home1, runner, { pollMs: 60_000, tickMs: 2_000, lease: { renewMs: 50 } })
+    // A minute between polls: only the nudge can make the exit immediate.
+    const a = daemon(home1, okRunner(), { pollMs: 60_000 })
     await until(() => readIntegrationStatus(home1)?.socket === 'ready', 10_000)
-    await new Promise((r) => setTimeout(r, 500))
     const other = sleeper()
     try {
-      const starts = runner.starts
       leaseFile(path.join(home1, 'daemon.lock'), { pid: other.pid ?? 0, renewed_at: Date.now(), home: home1 })
       const t0 = Date.now()
-      await new Promise((r) => setTimeout(r, 300))
-      double.send({ type: 'message.new', payload: { id: 'm-after', conversation_id: 'conv_1', sender: 'peer', content: { text: 'x' } } })
       expect(await a.done).toBe(1)
       expect(Date.now() - t0).toBeLessThan(5_000)
+    } finally {
+      other.kill('SIGKILL')
+    }
+  }, 30_000)
+
+  it('a lost home lock stops the integration at once: a wake right after the loss starts no run, though the loop has not looked yet', async () => {
+    double = await startServerDouble({ tray: { waiting: 1 } })
+    const home1 = path.join(sandbox, 'h-lost-run')
+    signIn(home1, KEY, double.apiBase)
+    const runner = new ScriptedRunner({ state: 'ok', exitCode: 0, durationMs: 1 }, { ok: true })
+    // The loop ticks every 20 s here: it does not look during the test, so only the lease's own stop can be at once.
+    const a = daemon(home1, runner, { tickMs: 20_000, lease: { renewMs: 50 }, ...promptRuns })
+    await until(() => readIntegrationStatus(home1)?.socket === 'ready', 10_000)
+    const other = sleeper()
+    try {
+      await wakeStartsRun(runner, 'm-before') // the control: here a wake starts a run within a fraction of a second
+      const starts = runner.starts
+      leaseFile(path.join(home1, 'daemon.lock'), { pid: other.pid ?? 0, renewed_at: Date.now(), home: home1 })
+      await new Promise((r) => setTimeout(r, 400)) // its next renewal (50 ms) finds it lost
+      double.send({ type: 'message.new', payload: { id: 'm-after', conversation_id: 'conv_1', sender: 'peer', content: { text: 'x' } } })
+      await new Promise((r) => setTimeout(r, 1_000))
       expect(runner.starts).toBe(starts)
+      const t0 = Date.now()
+      expect(await a.stop()).toBe(1)
+      expect(Date.now() - t0).toBeLessThan(3_000) // a stop does not wait out the loop's tick
     } finally {
       other.kill('SIGKILL')
     }
@@ -796,11 +826,12 @@ describe('one agent, one listener: the supervisor', () => {
     const home1 = path.join(sandbox, 'h-lost-agent')
     signIn(home1, KEY, double.apiBase)
     const runner = new ScriptedRunner({ state: 'ok', exitCode: 0, durationMs: 1 }, { ok: true })
-    const a = daemon(home1, runner, { tickMs: 3_000, lease: { renewMs: 50 } })
+    // The loop ticks every 20 s here: it does not look during the test, so only the lease's own stop can be at once.
+    const a = daemon(home1, runner, { tickMs: 20_000, lease: { renewMs: 50 }, ...promptRuns })
     const other = sleeper()
     try {
       await until(() => readIntegrationStatus(home1)?.socket === 'ready', 10_000)
-      await new Promise((r) => setTimeout(r, 500))
+      await wakeStartsRun(runner, 'm-before') // the control: here a wake starts a run within a fraction of a second
       const starts = runner.starts
       leaseFile(agentLockPath({ apiBase: double.apiBase, handle: 'probe' }), { pid: other.pid ?? 0, renewed_at: Date.now(), home: '/the/other/home' })
       await new Promise((r) => setTimeout(r, 400)) // its next renewal (50 ms) finds it lost
