@@ -6,8 +6,9 @@
 // Three profiles, mapped by each integration to its runtime's real flags
 // (documented per runtime in that integration's README):
 //
-//   answer — every AgentChat hosted tool, and file reads inside the run's own
-//            working folder only: no web search or fetch, no shell, no edits,
+//   answer — every AgentChat hosted tool and no other MCP server, and file
+//            reads inside the run's own working folder only (never the home
+//            folder or above it): no web search or fetch, no shell, no edits,
 //            nothing outside the workdir readable. The default.
 //   work   — plus the web, edits and shell (in the run's workspace).
 //   full   — the runtime's own bypass-everything mode.
@@ -19,6 +20,10 @@
 // Whatever the profile, a headless run NEVER waits on a permission prompt:
 // anything that would prompt is denied, not waited on.
 
+import * as fs from 'node:fs'
+import * as os from 'node:os'
+import * as path from 'node:path'
+
 export const RUN_PROFILES = ['answer', 'work', 'full'] as const
 export type RunProfile = (typeof RUN_PROFILES)[number]
 
@@ -28,6 +33,31 @@ export const PEER_RUN_WARNING = "runs started by peers' messages can read and ch
 /** `PEER_RUN_WARNING` for `work` and `full`; null for `answer` (and anything that is not a profile). */
 export function runProfileWarning(profile: string): string | null {
   return profile === 'work' || profile === 'full' ? PEER_RUN_WARNING : null
+}
+
+/** `dir` as the kernel sees it (symlinks resolved), or resolved only when it does not exist yet. */
+function realOrResolved(dir: string): string {
+  const resolved = path.resolve(dir)
+  try {
+    return fs.realpathSync(resolved)
+  } catch {
+    return resolved
+  }
+}
+
+/**
+ * Whether a run workdir is the user's home folder, a folder that contains it
+ * (`/Users`, `/home`, a drive root), or the filesystem root. A run started
+ * there sees everything under it: a peer-started run whose readable folder is
+ * the home folder can read `~/.ssh`. Symlinks are resolved on both sides;
+ * Windows compares case-insensitively.
+ */
+export function workdirExposesHome(workdir: string, home: string = os.homedir()): boolean {
+  const norm = (p: string): string => (process.platform === 'win32' ? p.toLowerCase() : p)
+  const dir = norm(realOrResolved(workdir))
+  const user = norm(realOrResolved(home))
+  if (dir === path.parse(dir).root) return true
+  return user === dir || user.startsWith(dir.endsWith(path.sep) ? dir : dir + path.sep)
 }
 
 export const RUN_PROFILE_ENV = 'AGENTCHAT_RUN_PROFILE'

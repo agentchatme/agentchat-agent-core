@@ -3,7 +3,7 @@ import * as os from 'node:os'
 import * as path from 'node:path'
 import { clientHeadersOf } from '../client-identity.js'
 import { hostedMcpUrl } from '../integration/mcp-probe.js'
-import type { RunProfile } from '../integration/profile.js'
+import { workdirExposesHome, type RunProfile } from '../integration/profile.js'
 import type { RunOutcome, RunPreflight, RunRequest, RunRunner } from '../integration/runner.js'
 import { spawnRun } from '../integration/spawn-run.js'
 import { atomicWriteFile } from '../util/fsutil.js'
@@ -11,7 +11,7 @@ import { log } from '../util/log.js'
 import { spawnCommandSync } from '../util/spawn.js'
 import { VERSION } from '../version.js'
 import { semverAtLeast } from './semver.js'
-import { withoutInheritedKey, type Preset, type PresetContext, type PresetInspection } from './types.js'
+import { withoutInheritedKey, withoutParentSession, type Preset, type PresetContext, type PresetInspection } from './types.js'
 
 // ─── Claude Code: one headless run (`claude -p`) ────────────────────────────
 //
@@ -113,7 +113,12 @@ export const ANSWER_DENIED_TOOLS = ['WebFetch', 'WebSearch', 'Bash'] as const
  */
 export const ANSWER_SETTINGS = JSON.stringify({ permissions: { blockReadsOutsideWorkingDirectories: true } })
 
-/** Env a parent Claude Code session leaks that would make the child think it is nested. */
+/**
+ * Env a parent Claude Code session leaks that would make the child think it is
+ * nested — a sample kept for callers that named it; the rule is
+ * `withoutParentSession` (every `CLAUDE_CODE_*` but the user's documented
+ * settings, `CLAUDE_PID`, and the Codex session variables).
+ */
 export const PARENT_ENV_KEYS = [
   'CLAUDECODE',
   'CLAUDE_CODE_CHILD_SESSION',
@@ -123,6 +128,10 @@ export const PARENT_ENV_KEYS = [
   'CLAUDE_CODE_EFFORT_LEVEL',
   'CLAUDE_EFFORT',
   'AI_AGENT',
+  'CLAUDE_CODE_MESSAGING_SOCKET',
+  'CLAUDE_CODE_MESSAGING_TOKEN',
+  'CLAUDE_CODE_SESSION_ATTENDED',
+  'CLAUDE_PID',
 ]
 
 /**
@@ -160,8 +169,7 @@ function claudeProcessEnv(configDirOverride: string | undefined, source: NodeJS.
 }
 
 export function buildClaudeEnv(configDirOverride: string | undefined, source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
-  const env = claudeProcessEnv(configDirOverride, source)
-  for (const key of PARENT_ENV_KEYS) delete env[key]
+  const env = claudeProcessEnv(configDirOverride, withoutParentSession(source))
   env['DISABLE_AUTOUPDATER'] = '1'
   const wait = Number(env['CLAUDE_CODE_MCP_STARTUP_WAIT_MS'])
   if (!Number.isFinite(wait) || wait < Number(MCP_STARTUP_WAIT_MS)) env['CLAUDE_CODE_MCP_STARTUP_WAIT_MS'] = MCP_STARTUP_WAIT_MS
@@ -403,19 +411,42 @@ export function claudeMcpConfig(apiBase: string, apiKey: string, clientVersion: 
   return `${JSON.stringify({ mcpServers: { [CLAUDE_MCP_SERVER_NAME]: { type: 'http', url: hostedMcpUrl(apiBase), headers } } }, null, 2)}\n`
 }
 
+/**
+ * The AgentChat hosted server alone, for `answer` runs that have no
+ * `mcpConfigPath`: written owner-only to `file` for each run (from the key
+ * `apiKey()` returns then, so a credential change is followed), passed with
+ * `--strict-mcp-config`, and removed when the run ends. An `answer` run then
+ * loads no other MCP server — the user's own, a project's, a plugin's, a
+ * claude.ai connector — whatever the user scope registers. `file` must sit
+ * inside a `denyReadPaths` entry (it holds the key), or preflight refuses.
+ */
+export interface ClaudeAnswerMcp {
+  readonly file: string
+  readonly apiBase: string
+  readonly apiKey: () => string | null
+  /** The version named in `X-AgentChat-Client-Version` (the front door that placed the run). Defaults to this engine's. */
+  readonly clientVersion?: string
+}
+
 export interface ClaudeRunnerOptions {
   readonly configDir: string | undefined
   /**
    * The run's working directory; the `work` profile edits and runs shell here.
    * Must lie outside `denyReadPaths`, or the run cannot read its own cwd —
-   * preflight says so once and still runs.
+   * preflight says so once and still runs. An `answer` run whose workdir is the
+   * home folder or contains it works in `answerFallbackWorkdir` instead.
    */
   readonly workdir: string
   readonly profile: RunProfile
   /** Paths every run's file tools are denied: the key store (identity home, the user-scope MCP state). */
   readonly denyReadPaths: readonly string[]
-  /** See `ClaudeRunArgOptions.mcpConfigPath`. */
+  /** See `ClaudeRunArgOptions.mcpConfigPath`: every profile, strict. */
   readonly mcpConfigPath?: string
+  /**
+   * See `ClaudeAnswerMcp`. Without it (and without `mcpConfigPath`) an `answer`
+   * run does not start: it would load every MCP server the user registered.
+   */
+  readonly answerMcp?: ClaudeAnswerMcp
   /** The one-line fix printed when the workdir sits inside a denied path. */
   readonly workdirAdvice?: string
   /**
@@ -429,20 +460,41 @@ export interface ClaudeRunnerOptions {
   readonly env?: NodeJS.ProcessEnv
 }
 
+/**
+ * The folder an `answer` run works in when its configured workdir is the
+ * user's home folder or contains it (`workdirExposesHome`): an empty folder of
+ * its own beside Claude Code's config, never inside a denied path. The run
+ * keeps working — it only cannot read the user's files.
+ */
+export function claudeAnswerFallbackWorkdir(configDirOverride: string | undefined): string {
+  return path.join(claudeHomeFor(configDirOverride), 'agentchat-answer-workdir')
+}
+
 export class ClaudeRunner implements RunRunner {
   readonly name = 'claude'
   private readonly command: string
   /** The workdir warning is one line per process, not one per preflight (preflight repeats every few minutes). */
   private warnedWorkdir = false
   private warnedDeny = false
+  private warnedHome = false
 
   constructor(private readonly options: ClaudeRunnerOptions) {
     this.command = options.command ?? 'claude'
   }
 
-  /** The denied path the configured workdir sits in, or null when the run can read its own cwd. */
+  /**
+   * Where this runner's runs work: the configured workdir, except that an
+   * `answer` run never works in the home folder or above it — it gets
+   * `claudeAnswerFallbackWorkdir` (its readable folder would be the whole home).
+   */
+  workdir(): string {
+    if (this.options.profile === 'answer' && workdirExposesHome(this.options.workdir)) return claudeAnswerFallbackWorkdir(this.options.configDir)
+    return this.options.workdir
+  }
+
+  /** The denied path the workdir sits in, or null when the run can read its own cwd. */
   workdirDeniedBy(): string | null {
-    return deniedAncestorOf(this.options.workdir, this.options.denyReadPaths)
+    return deniedAncestorOf(this.workdir(), this.options.denyReadPaths)
   }
 
   async preflight(): Promise<RunPreflight> {
@@ -451,6 +503,21 @@ export class ClaudeRunner implements RunRunner {
     if (!claudeIsLoggedIn(this.options.configDir, this.command)) {
       return { ok: false, detail: 'claude is not signed in (run `claude` once and sign in)' }
     }
+    if (this.options.profile === 'answer' && this.options.mcpConfigPath === undefined) {
+      const answerMcp = this.options.answerMcp
+      // Fail closed: without an AgentChat-only tool config the run would load
+      // every MCP server the user registered.
+      if (answerMcp === undefined) {
+        return { ok: false, detail: 'an answer run needs the AgentChat-only tool config (ClaudeRunnerOptions.answerMcp): without it the run would load every MCP server the user registered' }
+      }
+      if (deniedAncestorOf(answerMcp.file, this.options.denyReadPaths) === null) {
+        return { ok: false, detail: `the answer runs' tool config ${answerMcp.file} holds the key and must sit inside a path the runs are denied (${this.options.denyReadPaths.join(', ')})` }
+      }
+    }
+    if (this.workdir() !== this.options.workdir && !this.warnedHome) {
+      this.warnedHome = true
+      log.warn(`the run workdir ${this.options.workdir} is your home folder or contains it: answer runs work in ${this.workdir()} instead, so a peer-started run reads none of your files there. Point the workdir at a folder of its own to choose another.`)
+    }
     // A cwd inside the key store is an operator choice the deny rules then
     // make unreadable to the run. Said once, with the fix; the run still
     // starts — the hosted tools do not need the cwd.
@@ -458,7 +525,7 @@ export class ClaudeRunner implements RunRunner {
     if (denied !== null && !this.warnedWorkdir) {
       this.warnedWorkdir = true
       log.warn(
-        `the run workdir ${this.options.workdir} is inside ${denied}, which every run's file tools are denied: runs cannot read their own working directory.${this.options.workdirAdvice ? ` ${this.options.workdirAdvice}` : ''}`,
+        `the run workdir ${this.workdir()} is inside ${denied}, which every run's file tools are denied: runs cannot read their own working directory.${this.options.workdirAdvice ? ` ${this.options.workdirAdvice}` : ''}`,
       )
     }
     const uncovered = inexpressibleDenyPaths(this.options.denyReadPaths)
@@ -478,36 +545,63 @@ export class ClaudeRunner implements RunRunner {
     }
     // Owner-only on creation, as the identity home is. Creation only: an
     // operator's own workspace keeps its permissions.
-    fs.mkdirSync(this.options.workdir, { recursive: true, mode: 0o700 })
+    fs.mkdirSync(this.workdir(), { recursive: true, mode: 0o700 })
     return { ok: true }
+  }
+
+  /** The `--mcp-config` file this runner's runs are given, if any: the listener's (every profile), or the answer runs' own. */
+  private mcpConfigPathForRun(): string | undefined {
+    if (this.options.mcpConfigPath !== undefined) return this.options.mcpConfigPath
+    return this.options.profile === 'answer' ? this.options.answerMcp?.file : undefined
   }
 
   /** The exact argv one run uses — exported for tests to pin per profile. */
   args(): string[] {
+    const mcpConfigPath = this.mcpConfigPathForRun()
     return claudeRunArgs(this.options.profile, {
       maxBudgetUsd: (this.options.env ?? process.env)['AGENTCHAT_RUN_MAX_BUDGET_USD'],
-      workdir: this.options.workdir,
+      workdir: this.workdir(),
       denyReadPaths: this.options.denyReadPaths,
-      mcpConfigPath: this.options.mcpConfigPath,
+      ...(mcpConfigPath !== undefined ? { mcpConfigPath } : {}),
     })
   }
 
   async start(request: RunRequest): Promise<RunOutcome> {
-    const args = this.args()
-    log.debug(`claude ${args.join(' ')} (prompt on stdin, ${request.kind} run ${request.runId})`)
-    return spawnRun({
-      command: this.command,
-      args,
-      cwd: this.options.workdir,
-      env: buildClaudeEnv(this.options.configDir, this.options.env ?? process.env),
-      stdin: request.prompt,
-      budgetMs: request.budgetMs,
-      // Stopping SIGTERMs this run's process group instead of orphaning it.
-      ...(request.signal ? { signal: request.signal } : {}),
-      // The engine records a group invite as offered the moment the process
-      // has spawned, so a run cut short still counts as the one offer.
-      ...(request.onStarted ? { onStarted: request.onStarted } : {}),
-    })
+    const startedAt = Date.now()
+    const notStarted = (detail: string): RunOutcome => ({ state: 'not_started', exitCode: null, durationMs: Date.now() - startedAt, detail })
+    // An answer run's own AgentChat-only tool config: written for this run, removed after it.
+    const answerMcp = this.options.profile === 'answer' && this.options.mcpConfigPath === undefined ? this.options.answerMcp : undefined
+    if (this.options.profile === 'answer' && this.options.mcpConfigPath === undefined && answerMcp === undefined) {
+      return notStarted('an answer run needs the AgentChat-only tool config (ClaudeRunnerOptions.answerMcp)')
+    }
+    if (answerMcp !== undefined) {
+      const key = answerMcp.apiKey()
+      if (key === null) return notStarted('no AgentChat key for the answer run\'s tool config')
+      try {
+        atomicWriteFile(answerMcp.file, claudeMcpConfig(answerMcp.apiBase, key, answerMcp.clientVersion ?? VERSION), 0o600)
+      } catch (err) {
+        return notStarted(`could not write the answer run's tool config ${answerMcp.file}: ${err instanceof Error ? err.message : String(err)}`)
+      }
+    }
+    try {
+      const args = this.args()
+      log.debug(`claude ${args.join(' ')} (prompt on stdin, ${request.kind} run ${request.runId})`)
+      return await spawnRun({
+        command: this.command,
+        args,
+        cwd: this.workdir(),
+        env: buildClaudeEnv(this.options.configDir, this.options.env ?? process.env),
+        stdin: request.prompt,
+        budgetMs: request.budgetMs,
+        // Stopping SIGTERMs this run's process group instead of orphaning it.
+        ...(request.signal ? { signal: request.signal } : {}),
+        // The engine records a group invite as offered the moment the process
+        // has spawned, so a run cut short still counts as the one offer.
+        ...(request.onStarted ? { onStarted: request.onStarted } : {}),
+      })
+    } finally {
+      if (answerMcp !== undefined) fs.rmSync(answerMcp.file, { force: true })
+    }
   }
 }
 

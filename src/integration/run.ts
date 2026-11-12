@@ -166,6 +166,7 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
       runtime: opts.runner.name,
       handle,
       profile,
+      workdir,
       socket: disabled ? 'off' : 'idle',
       wakes: 0,
       wakes_absorbed: 0,

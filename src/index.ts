@@ -140,6 +140,7 @@ export {
   resolveRunProfile,
   PEER_RUN_WARNING,
   runProfileWarning,
+  workdirExposesHome,
   integrationDisabled,
   integrationDisabledBy,
   resolveRunBudgetMs,

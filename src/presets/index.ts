@@ -10,6 +10,7 @@ import { codexPreset } from './codex.js'
 import type { Preset } from './types.js'
 
 export type { Preset, PresetContext, PresetInspection } from './types.js'
+export { withoutParentSession, isParentSessionEnv, CLAUDE_CODE_ENV_KEPT, CLAUDE_SESSION_ENV, CODEX_SESSION_ENV } from './types.js'
 export { semverAtLeast } from './semver.js'
 export {
   CLAUDE_CODE_PRESET,
@@ -39,6 +40,8 @@ export {
   claudeMcpConfigPath,
   ClaudeRunner,
   claudeCodePreset,
+  claudeAnswerFallbackWorkdir,
+  type ClaudeAnswerMcp,
   type ClaudeRunArgOptions,
   type ClaudeRunnerOptions,
 } from './claude-code.js'
@@ -61,6 +64,11 @@ export {
   agentchatTableKeys,
   CodexRunner,
   codexPreset,
+  codexAnswerFallbackWorkdir,
+  codexServerNameAddressable,
+  parseCodexMcpList,
+  codexMcpDisableArgs,
+  CODEX_MCP_LIST_TIMEOUT_MS,
   type CodexMcpOverride,
   type CodexRunnerOptions,
 } from './codex.js'

@@ -3,14 +3,14 @@ import * as os from 'node:os'
 import * as path from 'node:path'
 import { clientHeadersOf } from '../client-identity.js'
 import { hostedMcpUrl } from '../integration/mcp-probe.js'
-import type { RunProfile } from '../integration/profile.js'
+import { workdirExposesHome, type RunProfile } from '../integration/profile.js'
 import type { RunOutcome, RunPreflight, RunRequest, RunRunner } from '../integration/runner.js'
 import { spawnRun } from '../integration/spawn-run.js'
 import { log } from '../util/log.js'
-import { spawnCommandSync } from '../util/spawn.js'
+import { spawnCommand, spawnCommandSync } from '../util/spawn.js'
 import { VERSION } from '../version.js'
 import { semverAtLeast } from './semver.js'
-import { withoutInheritedKey, type Preset, type PresetContext, type PresetInspection } from './types.js'
+import { withoutInheritedKey, withoutParentSession, type Preset, type PresetContext, type PresetInspection } from './types.js'
 
 // ─── Codex: one headless run (`codex exec`) ─────────────────────────────────
 //
@@ -253,14 +253,92 @@ export interface CodexRunnerOptions {
   /** Test seam: the binary to run. */
   readonly command?: string
   readonly env?: NodeJS.ProcessEnv
+  /** Test seam: how long `codex mcp list` may take (`CODEX_MCP_LIST_TIMEOUT_MS`). */
+  readonly mcpListTimeoutMs?: number
+}
+
+/**
+ * The folder an `answer` run works in when its configured workdir is the
+ * user's home folder or contains it (`workdirExposesHome`): an empty folder of
+ * its own under CODEX_HOME. The run keeps working — it only cannot reach the
+ * user's files through its workspace root.
+ */
+export function codexAnswerFallbackWorkdir(codexHome: string): string {
+  return path.join(codexHome, 'agentchat-answer-workdir')
+}
+
+/** How long `codex mcp list` may take before an answer run is given up (not started). */
+export const CODEX_MCP_LIST_TIMEOUT_MS = 20_000
+/** The most `codex mcp list --json` output read; more is a failure, not a truncation. */
+const CODEX_MCP_LIST_MAX_BYTES = 1024 * 1024
+
+/**
+ * A server name a `-c mcp_servers.<name>.enabled=false` override can address.
+ * Codex splits a `-c` key on every `.` (codex-rs/config/src/overrides.rs) and
+ * the value at the first `=`, but allows `.` in a server name
+ * (codex-mcp/src/rmcp_client.rs: `^[a-zA-Z0-9_:@/.-]+$`).
+ */
+export function codexServerNameAddressable(name: string): boolean {
+  return /^[A-Za-z0-9_:@/-]+$/.test(name)
+}
+
+/**
+ * The names of the MCP servers `codex mcp list --json` reports enabled, or why
+ * that output cannot be trusted. Names only: an entry's transport can carry
+ * header and env values, and none of it is kept.
+ */
+export function parseCodexMcpList(stdout: string): { ok: true; names: string[] } | { ok: false; detail: string } {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(stdout)
+  } catch {
+    return { ok: false, detail: 'its output is not JSON' }
+  }
+  if (!Array.isArray(parsed)) return { ok: false, detail: 'its output is not a list' }
+  const names: string[] = []
+  for (const entry of parsed) {
+    const name = (entry as { name?: unknown } | null)?.name
+    const enabled = (entry as { enabled?: unknown } | null)?.enabled
+    if (typeof name !== 'string' || name.length === 0) return { ok: false, detail: 'an entry has no name' }
+    if (enabled !== false) names.push(name)
+  }
+  return { ok: true, names }
+}
+
+/**
+ * `-c mcp_servers.<name>.enabled=false` for every listed server but AgentChat's,
+ * or why that cannot be done. Only names Codex listed: an override for a server
+ * no config layer defines is a config error ("invalid transport").
+ */
+export function codexMcpDisableArgs(names: readonly string[]): { ok: true; args: string[] } | { ok: false; detail: string } {
+  const args: string[] = []
+  for (const name of names) {
+    if (name === CODEX_MCP_SERVER_NAME) continue
+    if (!codexServerNameAddressable(name)) {
+      return { ok: false, detail: `the MCP server "${name}" cannot be switched off for one run (Codex reads a "." in a -c key as a table); rename it or remove it` }
+    }
+    args.push('-c', `mcp_servers.${name}.enabled=false`)
+  }
+  return { ok: true, args }
 }
 
 export class CodexRunner implements RunRunner {
   readonly name = 'codex'
   private readonly command: string
+  private warnedHome = false
 
   constructor(private readonly options: CodexRunnerOptions) {
     this.command = options.command ?? 'codex'
+  }
+
+  /**
+   * Where this runner's runs work (`-C`): the configured workdir, except that an
+   * `answer` run never has the home folder or above it as its workspace root —
+   * it gets `codexAnswerFallbackWorkdir`.
+   */
+  workdir(): string {
+    if (this.options.profile === 'answer' && workdirExposesHome(this.options.workdir)) return codexAnswerFallbackWorkdir(this.options.codexHome)
+    return this.options.workdir
   }
 
   async preflight(): Promise<RunPreflight> {
@@ -268,30 +346,101 @@ export class CodexRunner implements RunRunner {
     if (!runtime.ok) return { ok: false, detail: runtime.detail }
     const auth = codexIsLoggedIn(this.options.codexHome, this.command)
     if (!auth.ok) return { ok: false, detail: `codex login status failed: ${auth.detail}` }
-    fs.mkdirSync(this.options.workdir, { recursive: true })
+    if (this.workdir() !== this.options.workdir && !this.warnedHome) {
+      this.warnedHome = true
+      log.warn(`the run workdir ${this.options.workdir} is your home folder or contains it: answer runs work in ${this.workdir()} instead, so a peer-started run reaches none of your files there. Point the workdir at a folder of its own to choose another.`)
+    }
+    fs.mkdirSync(this.workdir(), { recursive: true })
     return { ok: true }
   }
 
-  /** The exact argv one run uses — exported for tests to pin per profile. */
+  /** The exact argv one run uses — exported for tests to pin per profile. An `answer` run adds `answerMcpDisables()` before the prompt. */
   args(): string[] {
-    return codexRunArgs(this.options.profile, { workdir: this.options.workdir, ...(this.options.mcp !== undefined ? { mcp: this.options.mcp } : {}) })
+    return codexRunArgs(this.options.profile, { workdir: this.workdir(), ...(this.options.mcp !== undefined ? { mcp: this.options.mcp } : {}) })
   }
 
   /** The child environment: Codex's home and the key the hosted server needs, under the configured name. */
   env(): NodeJS.ProcessEnv {
-    const env: NodeJS.ProcessEnv = { ...(this.options.env ?? process.env), CODEX_HOME: this.options.codexHome }
+    // Nothing of a parent Claude Code or Codex session, in every profile.
+    const env: NodeJS.ProcessEnv = { ...withoutParentSession(this.options.env ?? process.env), CODEX_HOME: this.options.codexHome }
     const key = this.options.apiKey()
     if (key !== null) env[this.options.keyEnv] = key
     return env
   }
 
+  /**
+   * For an `answer` run: `-c mcp_servers.<name>.enabled=false` for every MCP
+   * server the run would load but AgentChat's — the user's own in config.toml,
+   * a project's, a managed one. Codex has no "only this server" switch, and a
+   * tool such a server marks read-only runs without approval. Asked of Codex
+   * itself (`codex mcp list --json`, with the run's own `-c`/`--disable`
+   * flags, from the run's workdir), so every layer is counted. Any failure —
+   * an error, a timeout, output that is not the list — means no run.
+   */
+  async answerMcpDisables(): Promise<{ ok: true; args: string[] } | { ok: false; detail: string }> {
+    const run = this.args()
+    // The run's config flags only: `-c <v>` and `--disable <feature>` pairs.
+    const flags = run.flatMap((arg, i) => (run[i - 1] === '-c' || run[i - 1] === '--disable' ? [run[i - 1] as string, arg] : []))
+    const listed = await new Promise<{ ok: true; stdout: string } | { ok: false; detail: string }>((resolve) => {
+      let child: ReturnType<typeof spawnCommand>
+      try {
+        child = spawnCommand(this.command, ['mcp', 'list', '--json', ...flags], { cwd: this.workdir(), env: this.env(), stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true })
+      } catch (err) {
+        resolve({ ok: false, detail: err instanceof Error ? err.message : String(err) })
+        return
+      }
+      let stdout = ''
+      let tooLong = false
+      const timeoutMs = this.options.mcpListTimeoutMs ?? CODEX_MCP_LIST_TIMEOUT_MS
+      const timer = setTimeout(() => {
+        child.kill('SIGKILL')
+        resolve({ ok: false, detail: `no answer within ${Math.round(timeoutMs / 1000)} s` })
+      }, timeoutMs)
+      child.stdout?.on('data', (chunk: Buffer) => {
+        stdout += chunk.toString('utf-8')
+        if (stdout.length > CODEX_MCP_LIST_MAX_BYTES && !tooLong) {
+          tooLong = true
+          child.kill('SIGKILL')
+        }
+      })
+      child.on('error', (err) => {
+        clearTimeout(timer)
+        resolve({ ok: false, detail: err.message })
+      })
+      child.on('close', (code) => {
+        clearTimeout(timer)
+        if (tooLong) resolve({ ok: false, detail: 'its output is too long' })
+        else if (code !== 0) resolve({ ok: false, detail: `it exited ${code}` })
+        else resolve({ ok: true, stdout })
+      })
+    })
+    if (!listed.ok) return listed
+    const parsed = parseCodexMcpList(listed.stdout)
+    if (!parsed.ok) return parsed
+    return codexMcpDisableArgs(parsed.names)
+  }
+
   async start(request: RunRequest): Promise<RunOutcome> {
-    const args = this.args()
+    const startedAt = Date.now()
+    let args = this.args()
+    if (this.options.profile === 'answer') {
+      // Fail closed: an answer run starts only with every MCP server but AgentChat's switched off.
+      const disables = await this.answerMcpDisables()
+      if (!disables.ok) {
+        return {
+          state: 'not_started',
+          exitCode: null,
+          durationMs: Date.now() - startedAt,
+          detail: `could not list Codex's MCP servers (\`codex mcp list --json\`: ${disables.detail}); an answer run starts only with every server but ${CODEX_MCP_SERVER_NAME} switched off`,
+        }
+      }
+      args = [...args.slice(0, -1), ...disables.args, CODEX_PROMPT_FROM_STDIN]
+    }
     log.debug(`codex ${args.join(' ')} (prompt on stdin, ${request.kind} run ${request.runId})`)
     return spawnRun({
       command: this.command,
       args,
-      cwd: this.options.workdir,
+      cwd: this.workdir(),
       env: this.env(),
       // Written to stdin and then closed: `codex exec -` reads its
       // instructions until EOF. Never as an argument (see codexRunArgs).

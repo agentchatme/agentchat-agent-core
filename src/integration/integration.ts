@@ -341,6 +341,7 @@ export class Integration {
       runtime: this.options.runner.name,
       handle: this.options.cfg.handle,
       profile: this.options.profile,
+      workdir: this.options.cfg.workdir,
       socket: this.stopping ? 'closed' : this.socket,
       wakes: status.coalescer.wakes,
       wakes_absorbed: status.coalescer.absorbed,
