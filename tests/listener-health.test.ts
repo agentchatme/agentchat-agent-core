@@ -369,19 +369,27 @@ describe('the lease: O_EXCL, the bare pid first, renewed by its holder, taken ov
       '  while (!fs.existsSync(go)) await new Promise((r) => setTimeout(r, 1))',
       "  const r = await m.acquireLease(file, { label: 'race' })",
       "  fs.appendFileSync(out, JSON.stringify({ pid: process.pid, ok: r.ok }) + '\\n')",
-      // Every contender stays alive until all have answered.
+      // Every contender stays alive until all have answered (and never past two minutes, whatever happens to the test).
       '  const poll = setInterval(() => { if (fs.existsSync(done)) { clearInterval(poll); process.exit(0) } }, 20)',
       '})',
+      'setTimeout(() => process.exit(2), 120000).unref()',
     ].join('\n')
     const kids = Array.from({ length: 8 }, () => spawn(process.execPath, ['--experimental-strip-types', '--no-warnings', '-e', script, lib, file, go, out, done], { stdio: 'ignore' }))
-    await new Promise((r) => setTimeout(r, 1500))
-    fs.writeFileSync(go, '')
-    await until(() => fs.existsSync(out) && fs.readFileSync(out, 'utf-8').trim().split('\n').length === 8, 60_000)
-    const results = fs.readFileSync(out, 'utf-8').trim().split('\n').map((l) => JSON.parse(l) as { pid: number; ok: boolean })
-    fs.writeFileSync(done, '')
-    expect(results.filter((r) => r.ok)).toHaveLength(1)
-    expect(parseLease(fs.readFileSync(file, 'utf-8'))?.pid).toBe(results.find((r) => r.ok)?.pid)
-    await Promise.all(kids.map((k) => new Promise((r) => (k.exitCode !== null ? r(null) : k.once('exit', r)))))
+    const exited = (k: ChildProcess): Promise<unknown> => new Promise((r) => (k.exitCode !== null || k.signalCode !== null ? r(null) : k.once('exit', r)))
+    try {
+      await new Promise((r) => setTimeout(r, 1500))
+      fs.writeFileSync(go, '')
+      await until(() => fs.existsSync(out) && fs.readFileSync(out, 'utf-8').trim().split('\n').length === 8, 60_000)
+      const results = fs.readFileSync(out, 'utf-8').trim().split('\n').map((l) => JSON.parse(l) as { pid: number; ok: boolean })
+      fs.writeFileSync(done, '')
+      expect(results.filter((r) => r.ok)).toHaveLength(1)
+      expect(parseLease(fs.readFileSync(file, 'utf-8'))?.pid).toBe(results.find((r) => r.ok)?.pid)
+      await Promise.all(kids.map(exited))
+    } finally {
+      // A failed run leaves no contender behind.
+      for (const k of kids) if (k.exitCode === null && k.signalCode === null) k.kill('SIGKILL')
+      await Promise.all(kids.map(exited))
+    }
   }, 90_000)
 
   it('the home lock (leader lock) is the same lease; an older release\'s stale bare-pid lock is taken over', async () => {
@@ -953,6 +961,26 @@ describe('doctor says what clears a failing home: a run that succeeds, or (after
 })
 
 describe('a probe that hangs is killed with everything it started, and answers', () => {
+  // A test that fails (a tree that was not killed) leaves nothing running behind it. A passing test
+  // removed its pids file once it saw them all gone, so only a failed test's processes are killed here.
+  afterEach(() => {
+    for (const name of ['pids.json', 'probe-pids.json']) {
+      let pids: number[] = []
+      try {
+        pids = JSON.parse(fs.readFileSync(path.join(sandbox, name), 'utf-8')) as number[]
+      } catch {
+        continue
+      }
+      for (const pid of pids) {
+        try {
+          process.kill(pid, 'SIGKILL')
+        } catch {
+          /* gone */
+        }
+      }
+    }
+  })
+
   // A killed process can sit unreaped for a moment on a loaded machine; one that was never killed lives on for ten minutes.
   const expectGone = async (file: string): Promise<void> => {
     const pids = JSON.parse(fs.readFileSync(file, 'utf-8')) as number[]
@@ -960,6 +988,7 @@ describe('a probe that hangs is killed with everything it started, and answers',
     const deadline = Date.now() + 5_000
     while (pids.some(alive) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 50))
     for (const pid of pids) expect(alive(pid), `pid ${pid} still alive`).toBe(false)
+    fs.rmSync(file, { force: true }) // checked: nothing for the cleanup below to kill
   }
 
   it('runProbe: a timeout kills the tree, waits for it to exit, and says it timed out', async () => {
