@@ -198,7 +198,9 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
   let nudged = false
   // Stops checks in flight (a give-up recheck's probes) when the daemon stops.
   const stopChecks = new AbortController()
-  opts.signal?.addEventListener('abort', () => stopChecks.abort(), { once: true })
+  // A signal aborted already fires no event: stopped from the start.
+  if (opts.signal?.aborted === true) stopChecks.abort()
+  else opts.signal?.addEventListener('abort', () => stopChecks.abort(), { once: true })
 
   // Taken for the PROCESS, not for a connection: one resident daemon per
   // identity home, signed in or not. A lease: should another daemon ever take
