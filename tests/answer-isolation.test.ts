@@ -235,7 +235,10 @@ describe('Codex answer: every MCP server but AgentChat\'s switched off per run, 
     it(`a listing that ${mode === 'fail' ? 'fails' : mode === 'garbage' ? 'is not the list' : 'never answers'}: no run (fail closed, with the reason)`, async () => {
       const fake = installFakeCodex(sandbox)
       const runner = new CodexRunner(options(fake, { FAKE_MCP_LIST_MODE: mode }, { mcpListTimeoutMs: 1_500 }))
-      expect(await runner.preflight()).toEqual({ ok: true })
+      // Said at preflight (status shows it as the last error), and every run is refused too.
+      const pre = await runner.preflight()
+      expect(pre.ok).toBe(false)
+      expect(pre.detail).toMatch(why)
       const outcome = await runner.start(request)
       expect(outcome.state).toBe('not_started')
       expect(outcome.detail).toMatch(why)
@@ -247,7 +250,7 @@ describe('Codex answer: every MCP server but AgentChat\'s switched off per run, 
   it('a server whose name no -c key can address: no run', async () => {
     const fake = installFakeCodex(sandbox)
     const runner = new CodexRunner(options(fake, { FAKE_MCP_LIST: JSON.stringify([{ name: 'agentchat', enabled: true }, { name: 'my.server', enabled: true }]) }))
-    expect(await runner.preflight()).toEqual({ ok: true })
+    expect(await runner.preflight()).toMatchObject({ ok: false, detail: expect.stringMatching(/"my\.server" cannot be switched off/) })
     expect(await runner.start(request)).toMatchObject({ state: 'not_started', detail: expect.stringMatching(/"my\.server" cannot be switched off/) })
     expect(readFakeRuns(fake)).toEqual([])
   }, 20_000)

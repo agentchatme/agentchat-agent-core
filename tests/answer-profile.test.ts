@@ -241,6 +241,8 @@ function assertCodexAnswerIsConfined(argv: readonly string[], workdir: string): 
   for (const feature of ['shell_tool', 'view_image', 'image_generation', 'plugins', 'apps', 'memories', 'browser_use', 'computer_use']) expect(disabled).toContain(feature)
   expect(config).toContain('web_search="disabled"')
   expect(config.filter((c) => c.startsWith('web_search=') || c.startsWith('tools.web_search'))).toEqual(['web_search="disabled"'])
+  // No project or ancestor AGENTS.md in the run's context.
+  expect(config.filter((c) => c.startsWith('project_doc_max_bytes='))).toEqual(['project_doc_max_bytes=0'])
 
   // The one permission profile: read the workspace root, nothing else, no write, no network.
   expect(config.filter((c) => c.startsWith('default_permissions='))).toEqual(['default_permissions="agentchat_answer"'])
@@ -271,6 +273,7 @@ describe('Codex answer: no shell, no local-file tool, AgentChat tools only (regr
       without('shell_tool'),
       without('view_image'),
       without('web_search="disabled"'),
+      without('project_doc_max_bytes=0'),
       without('default_permissions="agentchat_answer"'),
       [...good.slice(0, -1), '-c', 'web_search="live"', '-'],
       [...good.slice(0, -1), '-c', 'features.shell_tool=true', '-'],

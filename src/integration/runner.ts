@@ -29,6 +29,14 @@ export interface RunRequest {
   readonly prompt: string
   /** Unique per run; for logs and for runtimes that want a session name. */
   readonly runId: string
+  /**
+   * The served identity line for the agent this run acts as (`GET /v1/texts`
+   * `identity_line`: who it is on AgentChat). Normally the runtime loads it
+   * from the instruction file the integration placed it in; a runner whose
+   * run loads no instruction file (an `answer` run, kept from the user's own
+   * files) gives it to the run itself. Absent when no texts are in hand.
+   */
+  readonly identityLine?: string
   /** The run is killed past this budget and counts as failed. */
   readonly budgetMs: number
   /**

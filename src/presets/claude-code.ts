@@ -153,6 +153,11 @@ export function claudeHomeFor(configDirOverride: string | undefined): string {
   return configDirOverride ?? path.join(os.homedir(), '.claude')
 }
 
+/** Where Claude Code keeps every project's transcripts and auto memory: `<config dir>/projects`. */
+export function claudeProjectsDirFor(configDirOverride: string | undefined): string {
+  return path.join(claudeHomeFor(configDirOverride), 'projects')
+}
+
 /**
  * Where Claude Code keeps user-scoped MCP servers (and so any key registered
  * there): `~/.claude.json`, or `$CLAUDE_CONFIG_DIR/.claude.json`.
@@ -343,6 +348,13 @@ export interface ClaudeRunArgOptions {
    * the run uses the user-scope server the integration registered.
    */
   readonly mcpConfigPath?: string | undefined
+  /**
+   * A file whose text is appended to the system prompt (`--append-system-prompt-file`,
+   * documented since 2.1.69): how an `answer` run, which loads no CLAUDE.md,
+   * is told its identity line. A file, not argv text: an argument cannot carry
+   * a line break through a Windows `.cmd` shim.
+   */
+  readonly appendSystemPromptFile?: string | undefined
 }
 
 /** Whether a path can be carried by a `Read(//<path>)` rule in a comma/space-separated list: absolute POSIX, no comma, no whitespace. */
@@ -390,6 +402,7 @@ export function claudeRunArgs(profile: RunProfile, options: ClaudeRunArgOptions 
     ...(budget !== undefined && /^\d+(\.\d+)?$/.test(budget) ? ['--max-budget-usd', budget] : []),
     // Variadic, so it is closed by the boolean flag right after it.
     ...(options.mcpConfigPath !== undefined ? ['--mcp-config', options.mcpConfigPath, '--strict-mcp-config'] : []),
+    ...(options.appendSystemPromptFile !== undefined ? ['--append-system-prompt-file', options.appendSystemPromptFile] : []),
     ...claudeProfileArgs(profile, options.workdir),
     // Last: the option is variadic and the prompt arrives on stdin, so there
     // is no positional for it to swallow.
@@ -412,10 +425,105 @@ export function claudeMcpConfig(apiBase: string, apiKey: string, clientVersion: 
 }
 
 /**
+ * What an `answer` run's environment adds: no CLAUDE.md of any scope (user,
+ * project, ancestors, `.claude/rules`, `@` imports) and no auto memory
+ * (code.claude.com/docs/en/env-vars; both read by 2.1.274, the floor). The
+ * user's own files are not a peer-started run's context: what it could read
+ * there it could send. Its identity line comes in by
+ * `--append-system-prompt-file` instead.
+ */
+export const ANSWER_ENV: Readonly<Record<string, string>> = Object.freeze({
+  CLAUDE_CODE_DISABLE_CLAUDE_MDS: '1',
+  CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1',
+})
+
+/** The system folder Claude Code reads managed settings from (code.claude.com/docs/en/managed-settings). */
+export function claudeManagedSettingsDir(platform: NodeJS.Platform = process.platform): string {
+  if (platform === 'darwin') return '/Library/Application Support/ClaudeCode'
+  if (platform === 'win32') return 'C:\\Program Files\\ClaudeCode'
+  return '/etc/claude-code'
+}
+
+/** The git repository root at or above `dir` (a `.git` file or folder), or null. */
+function gitRootOf(dir: string): string | null {
+  let current = path.resolve(dir)
+  for (;;) {
+    if (fs.existsSync(path.join(current, '.git'))) return current
+    const parent = path.dirname(current)
+    if (parent === current) return null
+    current = parent
+  }
+}
+
+/**
+ * The settings files that can give an `answer` run more working directories
+ * than its own: `permissions.additionalDirectories` there counts as a working
+ * directory even under `blockReadsOutsideWorkingDirectories`
+ * (settings-reference.md) — the user's settings, the managed file and its
+ * `managed-settings.d/` drop-ins, and `.claude/settings.local.json` at the
+ * workdir's repository root (counted when git does not track it; checked
+ * whenever it is there). MDM and server-managed policies are not files and
+ * are not covered.
+ */
+export function claudeSettingsFilesGrantingDirectories(configDirOverride: string | undefined, workdir: string): string[] {
+  const managed = claudeManagedSettingsDir()
+  const dropIns = (() => {
+    try {
+      return fs
+        .readdirSync(path.join(managed, 'managed-settings.d'))
+        .filter((name) => name.endsWith('.json') && !name.startsWith('.'))
+        .sort()
+        .map((name) => path.join(managed, 'managed-settings.d', name))
+    } catch {
+      return []
+    }
+  })()
+  return [
+    path.join(claudeHomeFor(configDirOverride), 'settings.json'),
+    path.join(managed, 'managed-settings.json'),
+    ...dropIns,
+    path.join(gitRootOf(workdir) ?? path.resolve(workdir), '.claude', 'settings.local.json'),
+  ]
+}
+
+/**
+ * The first of those files that lists `permissions.additionalDirectories`, with
+ * why, or null. A file that is not JSON is ignored by Claude Code (and so here),
+ * unless it names the key — then it counts, as it may be read another way.
+ */
+export function claudeExtraDirectoriesGrant(configDirOverride: string | undefined, workdir: string): { file: string; detail: string } | null {
+  for (const file of claudeSettingsFilesGrantingDirectories(configDirOverride, workdir)) {
+    let text: string
+    try {
+      text = fs.readFileSync(file, 'utf-8')
+    } catch {
+      continue
+    }
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(text)
+    } catch {
+      if (text.includes('additionalDirectories')) return { file, detail: 'names permissions.additionalDirectories and is not valid JSON' }
+      continue
+    }
+    const dirs = (parsed as { permissions?: { additionalDirectories?: unknown } } | null)?.permissions?.additionalDirectories
+    if (Array.isArray(dirs) && dirs.length > 0) return { file, detail: `lists permissions.additionalDirectories (${dirs.length} folder${dirs.length === 1 ? '' : 's'})` }
+  }
+  return null
+}
+
+/** The reason an `answer` run does not start while a settings file grants more working directories. */
+function extraDirectoriesRefusal(grant: { file: string; detail: string }): string {
+  return `answer runs do not start while ${grant.file} ${grant.detail}: Claude Code counts those as working directories, so a run started by a peer's message could read them. Remove the key from that file (your own sessions can use --add-dir instead).`
+}
+
+/**
  * The AgentChat hosted server alone, for `answer` runs that have no
- * `mcpConfigPath`: written owner-only to `file` for each run (from the key
- * `apiKey()` returns then, so a credential change is followed), passed with
- * `--strict-mcp-config`, and removed when the run ends. An `answer` run then
+ * `mcpConfigPath`: written owner-only for each run beside `file`, under a name
+ * of that run's own (`<file stem>.<run id>.json`, so a late cleanup of an
+ * abandoned run cannot remove the next run's), from the key `apiKey()` returns
+ * then (a credential change is followed), passed with `--strict-mcp-config`,
+ * and removed when the run ends. An `answer` run then
  * loads no other MCP server — the user's own, a project's, a plugin's, a
  * claude.ai connector — whatever the user scope registers. `file` must sit
  * inside a `denyReadPaths` entry (it holds the key), or preflight refuses.
@@ -514,6 +622,10 @@ export class ClaudeRunner implements RunRunner {
         return { ok: false, detail: `the answer runs' tool config ${answerMcp.file} holds the key and must sit inside a path the runs are denied (${this.options.denyReadPaths.join(', ')})` }
       }
     }
+    if (this.options.profile === 'answer') {
+      const grant = claudeExtraDirectoriesGrant(this.options.configDir, this.workdir())
+      if (grant !== null) return { ok: false, detail: extraDirectoriesRefusal(grant) }
+    }
     if (this.workdir() !== this.options.workdir && !this.warnedHome) {
       this.warnedHome = true
       log.warn(`the run workdir ${this.options.workdir} is your home folder or contains it: answer runs work in ${this.workdir()} instead, so a peer-started run reads none of your files there. Point the workdir at a folder of its own to choose another.`)
@@ -528,7 +640,7 @@ export class ClaudeRunner implements RunRunner {
         `the run workdir ${this.workdir()} is inside ${denied}, which every run's file tools are denied: runs cannot read their own working directory.${this.options.workdirAdvice ? ` ${this.options.workdirAdvice}` : ''}`,
       )
     }
-    const uncovered = inexpressibleDenyPaths(this.options.denyReadPaths)
+    const uncovered = inexpressibleDenyPaths(this.readDenyPaths())
     if (uncovered.length > 0) {
       const why =
         process.platform === 'win32'
@@ -549,48 +661,113 @@ export class ClaudeRunner implements RunRunner {
     return { ok: true }
   }
 
-  /** The `--mcp-config` file this runner's runs are given, if any: the listener's (every profile), or the answer runs' own. */
-  private mcpConfigPathForRun(): string | undefined {
-    if (this.options.mcpConfigPath !== undefined) return this.options.mcpConfigPath
-    return this.options.profile === 'answer' ? this.options.answerMcp?.file : undefined
+  /** `<dir>/<stem>.<run id><ext>`: a file of this run's own beside `file` (the run id reduced to letters, digits and `-`). */
+  private static perRun(file: string, runId: string, ext: string): string {
+    const stem = path.basename(file, path.extname(file))
+    const id = runId.replace(/[^A-Za-z0-9-]/g, '').slice(0, 64) || 'run'
+    return path.join(path.dirname(file), `${stem}.${id}${ext}`)
   }
 
-  /** The exact argv one run uses — exported for tests to pin per profile. */
-  args(): string[] {
-    const mcpConfigPath = this.mcpConfigPathForRun()
+  /** The answer run's own files for `runId`: its AgentChat-only tool config (integration path) and its identity-line file. */
+  private answerRunFiles(runId: string): { mcpConfigPath?: string; identityFile?: string } {
+    if (this.options.profile !== 'answer') return {}
+    const base = this.options.mcpConfigPath ?? this.options.answerMcp?.file
+    return {
+      ...(this.options.mcpConfigPath === undefined && this.options.answerMcp !== undefined ? { mcpConfigPath: ClaudeRunner.perRun(this.options.answerMcp.file, runId, '.json') } : {}),
+      ...(base !== undefined ? { identityFile: ClaudeRunner.perRun(base, runId, '.identity.md') } : {}),
+    }
+  }
+
+  /**
+   * What this runner's runs are denied reading: the key store, and for an
+   * `answer` run also Claude Code's own record of every project
+   * (`<config dir>/projects`: transcripts and auto memory). Claude Code lets a
+   * run read its project's memory folder even with auto memory off and reads
+   * blocked outside the working directories (seen on 2.1.322); a deny rule
+   * wins over that.
+   */
+  readDenyPaths(): string[] {
+    return this.options.profile === 'answer' ? [...this.options.denyReadPaths, claudeProjectsDirFor(this.options.configDir)] : [...this.options.denyReadPaths]
+  }
+
+  private argsFor(mcpConfigPath: string | undefined, appendSystemPromptFile: string | undefined): string[] {
     return claudeRunArgs(this.options.profile, {
       maxBudgetUsd: (this.options.env ?? process.env)['AGENTCHAT_RUN_MAX_BUDGET_USD'],
       workdir: this.workdir(),
-      denyReadPaths: this.options.denyReadPaths,
+      denyReadPaths: this.readDenyPaths(),
       ...(mcpConfigPath !== undefined ? { mcpConfigPath } : {}),
+      ...(appendSystemPromptFile !== undefined ? { appendSystemPromptFile } : {}),
     })
+  }
+
+  /**
+   * The argv of a run — exported for tests to pin per profile. With a `runId`,
+   * that run's own files (an answer run's tool config and identity-line file);
+   * without, the configured `answerMcp.file` stands in and no identity file.
+   */
+  args(runId?: string, identityLine?: boolean): string[] {
+    if (runId === undefined) {
+      const mcpConfigPath = this.options.mcpConfigPath ?? (this.options.profile === 'answer' ? this.options.answerMcp?.file : undefined)
+      return this.argsFor(mcpConfigPath, undefined)
+    }
+    const files = this.answerRunFiles(runId)
+    return this.argsFor(files.mcpConfigPath ?? this.options.mcpConfigPath, identityLine === true ? files.identityFile : undefined)
+  }
+
+  /** The run's environment: no parent session; an answer run loads no CLAUDE.md and no auto memory (`ANSWER_ENV`). */
+  runEnv(): NodeJS.ProcessEnv {
+    const env = buildClaudeEnv(this.options.configDir, this.options.env ?? process.env)
+    return this.options.profile === 'answer' ? { ...env, ...ANSWER_ENV } : env
   }
 
   async start(request: RunRequest): Promise<RunOutcome> {
     const startedAt = Date.now()
     const notStarted = (detail: string): RunOutcome => ({ state: 'not_started', exitCode: null, durationMs: Date.now() - startedAt, detail })
+    const answer = this.options.profile === 'answer'
     // An answer run's own AgentChat-only tool config: written for this run, removed after it.
-    const answerMcp = this.options.profile === 'answer' && this.options.mcpConfigPath === undefined ? this.options.answerMcp : undefined
-    if (this.options.profile === 'answer' && this.options.mcpConfigPath === undefined && answerMcp === undefined) {
+    const answerMcp = answer && this.options.mcpConfigPath === undefined ? this.options.answerMcp : undefined
+    if (answer && this.options.mcpConfigPath === undefined && answerMcp === undefined) {
       return notStarted('an answer run needs the AgentChat-only tool config (ClaudeRunnerOptions.answerMcp)')
     }
-    if (answerMcp !== undefined) {
+    // Settings can change while the daemon runs: checked before every answer run, not only at preflight.
+    if (answer) {
+      const grant = claudeExtraDirectoriesGrant(this.options.configDir, this.workdir())
+      if (grant !== null) return notStarted(extraDirectoriesRefusal(grant))
+    }
+    const files = this.answerRunFiles(request.runId)
+    const identityFile = answer && request.identityLine !== undefined ? files.identityFile : undefined
+    const written: string[] = []
+    const cleanup = (): void => {
+      for (const file of written) fs.rmSync(file, { force: true })
+    }
+    if (answerMcp !== undefined && files.mcpConfigPath !== undefined) {
       const key = answerMcp.apiKey()
       if (key === null) return notStarted('no AgentChat key for the answer run\'s tool config')
       try {
-        atomicWriteFile(answerMcp.file, claudeMcpConfig(answerMcp.apiBase, key, answerMcp.clientVersion ?? VERSION), 0o600)
+        atomicWriteFile(files.mcpConfigPath, claudeMcpConfig(answerMcp.apiBase, key, answerMcp.clientVersion ?? VERSION), 0o600)
+        written.push(files.mcpConfigPath)
       } catch (err) {
-        return notStarted(`could not write the answer run's tool config ${answerMcp.file}: ${err instanceof Error ? err.message : String(err)}`)
+        cleanup()
+        return notStarted(`could not write the answer run's tool config ${files.mcpConfigPath}: ${err instanceof Error ? err.message : String(err)}`)
+      }
+    }
+    if (identityFile !== undefined && request.identityLine !== undefined) {
+      try {
+        atomicWriteFile(identityFile, `${request.identityLine.trim()}\n`, 0o600)
+        written.push(identityFile)
+      } catch (err) {
+        cleanup()
+        return notStarted(`could not write the answer run's identity line ${identityFile}: ${err instanceof Error ? err.message : String(err)}`)
       }
     }
     try {
-      const args = this.args()
+      const args = this.argsFor(files.mcpConfigPath ?? this.options.mcpConfigPath, identityFile)
       log.debug(`claude ${args.join(' ')} (prompt on stdin, ${request.kind} run ${request.runId})`)
       return await spawnRun({
         command: this.command,
         args,
         cwd: this.workdir(),
-        env: buildClaudeEnv(this.options.configDir, this.options.env ?? process.env),
+        env: this.runEnv(),
         stdin: request.prompt,
         budgetMs: request.budgetMs,
         // Stopping SIGTERMs this run's process group instead of orphaning it.
@@ -600,7 +777,8 @@ export class ClaudeRunner implements RunRunner {
         ...(request.onStarted ? { onStarted: request.onStarted } : {}),
       })
     } finally {
-      if (answerMcp !== undefined) fs.rmSync(answerMcp.file, { force: true })
+      // Only this run's own files: a late cleanup can never touch another run's.
+      cleanup()
     }
   }
 }

@@ -5,7 +5,7 @@ import { clientHeadersOf } from '../client-identity.js'
 import { hostedMcpUrl } from '../integration/mcp-probe.js'
 import { workdirExposesHome, type RunProfile } from '../integration/profile.js'
 import type { RunOutcome, RunPreflight, RunRequest, RunRunner } from '../integration/runner.js'
-import { spawnRun } from '../integration/spawn-run.js'
+import { redactDiagnostic, spawnRun } from '../integration/spawn-run.js'
 import { log } from '../util/log.js'
 import { spawnCommand, spawnCommandSync } from '../util/spawn.js'
 import { VERSION } from '../version.js'
@@ -171,6 +171,11 @@ export function codexProfileArgs(profile: RunProfile): string[] {
         `permissions.${CODEX_ANSWER_PERMISSIONS}.filesystem=${CODEX_ANSWER_FILESYSTEM}`,
         '-c',
         'web_search="disabled"',
+        // No project or ancestor AGENTS.md (core/src/agents_md.rs:65-67, 129: a
+        // zero budget reads none). $CODEX_HOME/AGENTS.md has no such switch in
+        // 0.154.0 (codex-home/src/instructions/mod.rs, wired unconditionally).
+        '-c',
+        'project_doc_max_bytes=0',
         ...CODEX_ANSWER_DISABLED_FEATURES.flatMap((feature) => ['--disable', feature]),
       ]
     // `work` and `full` are the operator's explicit opt-in: a run started by
@@ -322,10 +327,68 @@ export function codexMcpDisableArgs(names: readonly string[]): { ok: true; args:
   return { ok: true, args }
 }
 
+/** Why an answer run does not start when Codex's MCP servers cannot be listed (or one cannot be switched off). */
+function codexAnswerListingRefusal(detail: string): string {
+  return `could not list Codex's MCP servers (\`codex mcp list --json\` with the answer flags: ${detail}); an answer run starts only with every server but ${CODEX_MCP_SERVER_NAME} switched off`
+}
+
+/** How long a listing is reused while none of the files it was read from changed (layers that are not files: a cloud bundle). */
+export const CODEX_MCP_LIST_MAX_AGE_MS = 60 * 60_000
+
+/**
+ * The config files `codex mcp list` (and the run) read, in the loader's order
+ * (openai/codex rust-v0.154.0 config/src/loader/mod.rs:79-95, layer_io.rs:22,
+ * loader/macos.rs:20): system, managed, requirements, the user's config.toml,
+ * the macOS managed preferences, and `config.toml` / `.codex/config.toml` from
+ * the workdir up to the root.
+ */
+export function codexConfigLayerFiles(codexHome: string, workdir: string, platform: NodeJS.Platform = process.platform): string[] {
+  const system =
+    platform === 'win32'
+      ? [path.join(process.env['ProgramData'] ?? 'C:\\ProgramData', 'OpenAI', 'Codex', 'config.toml'), path.join(process.env['ProgramData'] ?? 'C:\\ProgramData', 'OpenAI', 'Codex', 'requirements.toml')]
+      : ['/etc/codex/config.toml', '/etc/codex/managed_config.toml', '/etc/codex/requirements.toml']
+  const user = (() => {
+    try {
+      return os.userInfo().username
+    } catch {
+      return null
+    }
+  })()
+  const managedPrefs =
+    platform === 'darwin'
+      ? ['/Library/Managed Preferences/com.openai.codex.plist', ...(user !== null ? [path.join('/Library/Managed Preferences', user, 'com.openai.codex.plist')] : [])]
+      : []
+  const tree: string[] = []
+  let current = path.resolve(workdir)
+  tree.push(path.join(current, 'config.toml'))
+  for (;;) {
+    tree.push(path.join(current, '.codex', 'config.toml'))
+    const parent = path.dirname(current)
+    if (parent === current) break
+    current = parent
+  }
+  return [...system, ...managedPrefs, path.join(codexHome, 'config.toml'), ...tree]
+}
+
+/** What the listing depends on: every layer file's size and mtime (or its absence), the flags, the workdir, the binary. */
+function codexListingKey(files: readonly string[], parts: readonly string[]): string {
+  const stats = files.map((file) => {
+    try {
+      const st = fs.statSync(file)
+      return `${file}\u0000${st.size}\u0000${st.mtimeMs}`
+    } catch {
+      return `${file}\u0000-`
+    }
+  })
+  return [...parts, ...stats].join('\u0001')
+}
+
 export class CodexRunner implements RunRunner {
   readonly name = 'codex'
   private readonly command: string
   private warnedHome = false
+  /** The last good listing and what it depended on: a stranger's DM does not cost a listing (and its contacts to the user's MCP hosts) on every run. */
+  private listing: { key: string; at: number; result: { ok: true; args: string[] } } | null = null
 
   constructor(private readonly options: CodexRunnerOptions) {
     this.command = options.command ?? 'codex'
@@ -351,6 +414,13 @@ export class CodexRunner implements RunRunner {
       log.warn(`the run workdir ${this.options.workdir} is your home folder or contains it: answer runs work in ${this.workdir()} instead, so a peer-started run reaches none of your files there. Point the workdir at a folder of its own to choose another.`)
     }
     fs.mkdirSync(this.workdir(), { recursive: true })
+    if (this.options.profile === 'answer') {
+      // Said up front, not only as a run's detail: a Codex that rejects one of
+      // the answer flags, or a server no `-c` key can switch off, stops every
+      // answer run.
+      const disables = await this.answerMcpDisables()
+      if (!disables.ok) return { ok: false, detail: codexAnswerListingRefusal(disables.detail) }
+    }
     return { ok: true }
   }
 
@@ -381,16 +451,24 @@ export class CodexRunner implements RunRunner {
     const run = this.args()
     // The run's config flags only: `-c <v>` and `--disable <feature>` pairs.
     const flags = run.flatMap((arg, i) => (run[i - 1] === '-c' || run[i - 1] === '--disable' ? [run[i - 1] as string, arg] : []))
+    // Reused while nothing it was read from changed (and for at most an hour);
+    // a failure is never cached, so the next run asks again.
+    const key = codexListingKey(codexConfigLayerFiles(this.options.codexHome, this.workdir()), [this.command, this.workdir(), ...flags])
+    if (this.listing !== null && this.listing.key === key && Date.now() - this.listing.at < CODEX_MCP_LIST_MAX_AGE_MS) return this.listing.result
     const listed = await new Promise<{ ok: true; stdout: string } | { ok: false; detail: string }>((resolve) => {
       let child: ReturnType<typeof spawnCommand>
       try {
-        child = spawnCommand(this.command, ['mcp', 'list', '--json', ...flags], { cwd: this.workdir(), env: this.env(), stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true })
+        child = spawnCommand(this.command, ['mcp', 'list', '--json', ...flags], { cwd: this.workdir(), env: this.env(), stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
       } catch (err) {
         resolve({ ok: false, detail: err instanceof Error ? err.message : String(err) })
         return
       }
       let stdout = ''
+      let stderr = ''
       let tooLong = false
+      child.stderr?.on('data', (chunk: Buffer) => {
+        if (stderr.length < 4096) stderr += chunk.toString('utf-8')
+      })
       const timeoutMs = this.options.mcpListTimeoutMs ?? CODEX_MCP_LIST_TIMEOUT_MS
       const timer = setTimeout(() => {
         child.kill('SIGKILL')
@@ -409,15 +487,19 @@ export class CodexRunner implements RunRunner {
       })
       child.on('close', (code) => {
         clearTimeout(timer)
+        // Codex's own complaint, first line, bounded and redacted (e.g. "Unknown feature flag: …").
+        const said = redactDiagnostic(stderr.split(/\r?\n/).find((line) => line.trim().length > 0) ?? '', 200)
         if (tooLong) resolve({ ok: false, detail: 'its output is too long' })
-        else if (code !== 0) resolve({ ok: false, detail: `it exited ${code}` })
+        else if (code !== 0) resolve({ ok: false, detail: `it exited ${code}${said ? `: ${said}` : ''}` })
         else resolve({ ok: true, stdout })
       })
     })
     if (!listed.ok) return listed
     const parsed = parseCodexMcpList(listed.stdout)
     if (!parsed.ok) return parsed
-    return codexMcpDisableArgs(parsed.names)
+    const result = codexMcpDisableArgs(parsed.names)
+    if (result.ok) this.listing = { key, at: Date.now(), result }
+    return result
   }
 
   async start(request: RunRequest): Promise<RunOutcome> {
@@ -426,14 +508,7 @@ export class CodexRunner implements RunRunner {
     if (this.options.profile === 'answer') {
       // Fail closed: an answer run starts only with every MCP server but AgentChat's switched off.
       const disables = await this.answerMcpDisables()
-      if (!disables.ok) {
-        return {
-          state: 'not_started',
-          exitCode: null,
-          durationMs: Date.now() - startedAt,
-          detail: `could not list Codex's MCP servers (\`codex mcp list --json\`: ${disables.detail}); an answer run starts only with every server but ${CODEX_MCP_SERVER_NAME} switched off`,
-        }
-      }
+      if (!disables.ok) return { state: 'not_started', exitCode: null, durationMs: Date.now() - startedAt, detail: codexAnswerListingRefusal(disables.detail) }
       args = [...args.slice(0, -1), ...disables.args, CODEX_PROMPT_FROM_STDIN]
     }
     log.debug(`codex ${args.join(' ')} (prompt on stdin, ${request.kind} run ${request.runId})`)

@@ -35,29 +35,65 @@ export function runProfileWarning(profile: string): string | null {
   return profile === 'work' || profile === 'full' ? PEER_RUN_WARNING : null
 }
 
-/** `dir` as the kernel sees it (symlinks resolved), or resolved only when it does not exist yet. */
-function realOrResolved(dir: string): string {
-  const resolved = path.resolve(dir)
+/**
+ * The kernel's identity of a directory (device and inode), or null when it
+ * cannot be read or the filesystem reports no inode (0: FAT, some network
+ * filesystems — then only spellings are compared).
+ */
+function identityOf(dir: string): string | null {
   try {
-    return fs.realpathSync(resolved)
+    const st = fs.statSync(dir, { bigint: true })
+    return st.ino === 0n ? null : `${st.dev}:${st.ino}`
+  } catch {
+    return null
+  }
+}
+
+/** `p` as the kernel resolves it (symlinks, and on macOS the on-disk case), or resolved only when it cannot be. */
+function realOrResolved(p: string): string {
+  const resolved = path.resolve(p)
+  try {
+    return fs.realpathSync.native(resolved)
   } catch {
     return resolved
   }
+}
+
+/** Case-folded where the platform's default filesystems are case-insensitive. */
+function spelling(p: string): string {
+  return process.platform === 'win32' || process.platform === 'darwin' ? p.toLowerCase() : p
 }
 
 /**
  * Whether a run workdir is the user's home folder, a folder that contains it
  * (`/Users`, `/home`, a drive root), or the filesystem root. A run started
  * there sees everything under it: a peer-started run whose readable folder is
- * the home folder can read `~/.ssh`. Symlinks are resolved on both sides;
- * Windows compares case-insensitively.
+ * the home folder can read `~/.ssh`.
+ *
+ * Decided by what the kernel says the directories ARE (device and inode), not
+ * by their spelling: the workdir exposes the home folder when, for some
+ * trailing part of the home folder's path (`Users/<name>`, `<name>`, or
+ * nothing), `<workdir>/<that part>` is the home folder itself. That holds for
+ * an ancestor and for the home folder, however they are reached — a
+ * case-insensitive volume's `/users/<name>` or `/USERS/<NAME>`, macOS's
+ * `/System/Volumes/Data` (a firmlink root that is not `/`), a symlink, a bind
+ * mount that keeps the names. A filesystem without inodes falls back to
+ * comparing spellings (case-folded on macOS and Windows).
  */
 export function workdirExposesHome(workdir: string, home: string = os.homedir()): boolean {
-  const norm = (p: string): string => (process.platform === 'win32' ? p.toLowerCase() : p)
-  const dir = norm(realOrResolved(workdir))
-  const user = norm(realOrResolved(home))
+  const dir = realOrResolved(workdir)
   if (dir === path.parse(dir).root) return true
-  return user === dir || user.startsWith(dir.endsWith(path.sep) ? dir : dir + path.sep)
+  const homes = [...new Set([path.resolve(home), realOrResolved(home)])]
+  const homeIds = new Set(homes.map(identityOf).filter((id): id is string => id !== null))
+  for (const h of homes) {
+    const parts = h.slice(path.parse(h).root.length).split(path.sep).filter((part) => part.length > 0)
+    for (let i = 0; i <= parts.length; i++) {
+      const candidate = path.join(dir, ...parts.slice(i))
+      const id = identityOf(candidate)
+      if (id !== null ? homeIds.has(id) : spelling(realOrResolved(candidate)) === spelling(realOrResolved(h)) && fs.existsSync(candidate)) return true
+    }
+  }
+  return false
 }
 
 export const RUN_PROFILE_ENV = 'AGENTCHAT_RUN_PROFILE'

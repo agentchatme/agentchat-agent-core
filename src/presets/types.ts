@@ -120,6 +120,12 @@ export const CLAUDE_CODE_ENV_KEPT: readonly string[] = [
   'CLAUDE_CODE_ENABLE_TELEMETRY',
   'CLAUDE_CODE_SUBPROCESS_ENV_SCRUB',
   'CLAUDE_CODE_MCP_ALLOWLIST_ENV',
+  'CLAUDE_CODE_DISABLE_CLAUDE_MDS',
+  'CLAUDE_CODE_DISABLE_AUTO_MEMORY',
+  // Model request settings the user chose
+  'CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS',
+  'CLAUDE_CODE_EXTRA_BODY',
+  'CLAUDE_CODE_MAX_OUTPUT_TOKENS',
   // Platform
   'CLAUDE_CODE_GIT_BASH_PATH',
   'CLAUDE_CODE_TMPDIR',
@@ -127,8 +133,13 @@ export const CLAUDE_CODE_ENV_KEPT: readonly string[] = [
   'CLAUDE_CODE_MCP_STARTUP_WAIT_MS',
 ]
 
-/** Claude Code session variables outside the `CLAUDE_CODE_` prefix (code.claude.com/docs/en/env-vars), and `AI_AGENT`. */
-export const CLAUDE_SESSION_ENV: readonly string[] = ['CLAUDECODE', 'CLAUDE_PID', 'CLAUDE_EFFORT', 'AI_AGENT']
+/**
+ * Claude Code session variables outside the `CLAUDE_CODE_` prefix
+ * (code.claude.com/docs/en/env-vars, hooks.md): what it sets in the processes
+ * it spawns — its pid, the effort level, a background job's folder, the hook
+ * env file, the project folder, the W3C trace context — and `AI_AGENT`.
+ */
+export const CLAUDE_SESSION_ENV: readonly string[] = ['CLAUDECODE', 'CLAUDE_PID', 'CLAUDE_EFFORT', 'CLAUDE_JOB_DIR', 'CLAUDE_ENV_FILE', 'CLAUDE_PROJECT_DIR', 'TRACEPARENT', 'TRACESTATE', 'AI_AGENT']
 
 /**
  * What a Codex session sets in the processes it spawns (openai/codex at
@@ -148,19 +159,122 @@ export const CODEX_SESSION_ENV: readonly string[] = [
   'CODEX_ESCALATE_SOCKET',
   'CODEX_NETWORK_PROXY_ACTIVE',
   'CODEX_NETWORK_ALLOW_LOCAL_BINDING',
+  'CODEX_NETWORK_PROXY_ATTRIBUTION',
+  'CODEX_NETWORK_PROXY_CREDENTIAL_BROKER_ACTIVE',
+  'CODEX_NETWORK_PROXY_BROKERED_CREDENTIALS',
+  'CODEX_WINDOWS_SANDBOX_PROXY_PORTS',
 ]
 
-/** Whether `key` is a parent session's variable (`withoutParentSession` drops it). Case-insensitive, as Windows names are. */
+/**
+ * What a Codex session's managed network proxy puts in its children's
+ * environment (openai/codex rust-v0.154.0 network-proxy/src/proxy.rs:578-628
+ * `PROXY_ENV_KEYS`): proxy URLs pointing at the parent's proxy, which dies
+ * with it. Dropped only when the environment says that proxy was active
+ * (`CODEX_NETWORK_PROXY_ACTIVE`): otherwise they are the user's own proxy.
+ */
+export const CODEX_MANAGED_PROXY_ENV: readonly string[] = [
+  'ELECTRON_GET_USE_PROXY',
+  'NODE_USE_ENV_PROXY',
+  'HTTP_PROXY',
+  'HTTPS_PROXY',
+  'YARN_HTTP_PROXY',
+  'YARN_HTTPS_PROXY',
+  'NPM_CONFIG_HTTP_PROXY',
+  'NPM_CONFIG_HTTPS_PROXY',
+  'NPM_CONFIG_PROXY',
+  'BUNDLE_HTTP_PROXY',
+  'BUNDLE_HTTPS_PROXY',
+  'PIP_PROXY',
+  'DOCKER_HTTP_PROXY',
+  'DOCKER_HTTPS_PROXY',
+  'WS_PROXY',
+  'WSS_PROXY',
+  'NO_PROXY',
+  'NPM_CONFIG_NOPROXY',
+  'YARN_NO_PROXY',
+  'BUNDLE_NO_PROXY',
+  'ALL_PROXY',
+  'FTP_PROXY',
+]
+
+/** The CA-bundle variables Codex points at its managed proxy's bundle (network-proxy/src/certs.rs:157-169 `CUSTOM_CA_ENV_KEYS`). */
+const CODEX_CA_ENV_KEYS: readonly string[] = [
+  'CODEX_CA_CERTIFICATE',
+  'SSL_CERT_FILE',
+  'REQUESTS_CA_BUNDLE',
+  'CURL_CA_BUNDLE',
+  'NODE_EXTRA_CA_CERTS',
+  'GIT_SSL_CAINFO',
+  'CARGO_HTTP_CAINFO',
+  'PIP_CERT',
+  'BUNDLE_SSL_CA_CERT',
+  'NPM_CONFIG_CAFILE',
+]
+
+/** The managed proxy's generated trust bundle: `$CODEX_HOME/proxy/ca-bundle…` (certs.rs:149-152, 430-438). */
+function isManagedCaBundle(value: string): boolean {
+  return /[\\/]proxy[\\/]ca-bundle[^\\/]*$/.test(value)
+}
+
+/** The managed proxy's `GIT_SSH_COMMAND` starts with this marker (proxy.rs `CODEX_PROXY_GIT_SSH_COMMAND_MARKER`). */
+const CODEX_PROXY_GIT_SSH_MARKER = 'CODEX_PROXY_GIT_SSH_COMMAND=1 '
+
+/** Whether `key` is a parent session's variable by its name alone. Case-insensitive, as Windows names are. */
 export function isParentSessionEnv(key: string): boolean {
   const upper = key.toUpperCase()
   if (upper.startsWith('CLAUDE_CODE_')) return !CLAUDE_CODE_ENV_KEPT.includes(upper)
   return CLAUDE_SESSION_ENV.includes(upper) || CODEX_SESSION_ENV.includes(upper)
 }
 
-/** A copy of `env` without any Claude Code or Codex parent-session variable: what every preset run, in every profile, starts from. */
+/** The value of `name` in `env`, whatever its case. */
+function envValue(env: NodeJS.ProcessEnv, name: string): string | undefined {
+  for (const [key, value] of Object.entries(env)) if (key.toUpperCase() === name) return value
+  return undefined
+}
+
+/**
+ * The variable names a Codex credential broker replaced with dummy values
+ * (`CODEX_NETWORK_PROXY_BROKERED_CREDENTIALS`: a JSON list of [name, dummy]),
+ * where the environment still holds that dummy (credential_broker.rs:520-531).
+ */
+function brokeredDummies(env: NodeJS.ProcessEnv): Set<string> {
+  const marker = envValue(env, 'CODEX_NETWORK_PROXY_BROKERED_CREDENTIALS')
+  const out = new Set<string>()
+  if (marker === undefined) return out
+  let pairs: unknown
+  try {
+    pairs = JSON.parse(marker)
+  } catch {
+    return out
+  }
+  if (!Array.isArray(pairs)) return out
+  for (const pair of pairs) {
+    if (!Array.isArray(pair) || typeof pair[0] !== 'string' || typeof pair[1] !== 'string') continue
+    if (envValue(env, pair[0].toUpperCase()) === pair[1]) out.add(pair[0].toUpperCase())
+  }
+  return out
+}
+
+/**
+ * A copy of `env` without any Claude Code or Codex parent-session variable:
+ * what every preset run, in every profile, starts from. By name: the session
+ * markers above. By value: a parent Codex proxy's URLs (only while its marker
+ * says it was active), its CA bundle, its SSH command, the dummy credentials
+ * its broker substituted. The user's own proxy, CA bundle and settings stay.
+ */
 export function withoutParentSession(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const proxyActive = envValue(env, 'CODEX_NETWORK_PROXY_ACTIVE') !== undefined
+  const dummies = brokeredDummies(env)
   const copy: NodeJS.ProcessEnv = {}
-  for (const [key, value] of Object.entries(env)) if (!isParentSessionEnv(key)) copy[key] = value
+  for (const [key, value] of Object.entries(env)) {
+    const upper = key.toUpperCase()
+    if (isParentSessionEnv(key)) continue
+    if (proxyActive && CODEX_MANAGED_PROXY_ENV.includes(upper)) continue
+    if (value !== undefined && CODEX_CA_ENV_KEYS.includes(upper) && isManagedCaBundle(value)) continue
+    if (value !== undefined && upper === 'GIT_SSH_COMMAND' && value.startsWith(CODEX_PROXY_GIT_SSH_MARKER)) continue
+    if (dummies.has(upper)) continue
+    copy[key] = value
+  }
   return copy
 }
 

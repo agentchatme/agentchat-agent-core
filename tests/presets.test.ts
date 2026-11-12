@@ -110,6 +110,7 @@ describe('Codex flags', () => {
       '-c', 'default_permissions="agentchat_answer"',
       '-c', 'permissions.agentchat_answer.filesystem={ ":workspace_roots" = "read" }',
       '-c', 'web_search="disabled"',
+      '-c', 'project_doc_max_bytes=0',
       '--disable', 'shell_tool',
       '--disable', 'view_image',
       '--disable', 'image_generation',

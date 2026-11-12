@@ -397,6 +397,7 @@ export class Integration {
     const onAbort = (): void => controller.abort()
     if (request.signal.aborted) controller.abort()
     else request.signal.addEventListener('abort', onAbort, { once: true })
+    const identityLine = this.texts.current()?.identity_line
     let outcome: RunOutcome
     try {
       outcome = await withDeadline(
@@ -405,6 +406,7 @@ export class Integration {
           wake,
           prompt: `${request.prompt}\n\n${this.options.manualPointer}`,
           runId,
+          ...(identityLine !== undefined && identityLine.trim().length > 0 ? { identityLine } : {}),
           budgetMs,
           signal: controller.signal,
         }),

@@ -29,6 +29,8 @@ export interface FakeRun {
   env: Record<string, string>
   /** What the run's `--mcp-config` file held when it started (names and mode only), `'unreadable'`, or null without one. */
   mcpConfig: { servers: string[]; mode: number } | 'unreadable' | null
+  /** The text of the run's `--append-system-prompt-file` when it started, `'unreadable'`, or null without one. */
+  appendedSystemPrompt: string | null
 }
 
 export interface FakeMcpList {
@@ -79,7 +81,10 @@ function install(root: string, name: string, version: string, authArgs: [string,
       "  const at = args.indexOf('--mcp-config')",
       '  let mcpConfig = null',
       "  if (at >= 0) { try { const file = args[at + 1]; mcpConfig = { servers: Object.keys(JSON.parse(fs.readFileSync(file, 'utf8')).mcpServers || {}), mode: fs.statSync(file).mode & 0o777 } } catch { mcpConfig = 'unreadable' } }",
-      '  const record = { argv: args, stdin, cwd: process.cwd(), env, mcpConfig }',
+      "  const sp = args.indexOf('--append-system-prompt-file')",
+      "  let appendedSystemPrompt = null",
+      "  if (sp >= 0) { try { appendedSystemPrompt = fs.readFileSync(args[sp + 1], 'utf8') } catch { appendedSystemPrompt = 'unreadable' } }",
+      '  const record = { argv: args, stdin, cwd: process.cwd(), env, mcpConfig, appendedSystemPrompt }',
       "  if (process.env.FAKE_RUNTIME_RECORD) fs.appendFileSync(process.env.FAKE_RUNTIME_RECORD, JSON.stringify(record) + '\\n')",
       "  process.stdout.write('model output that must be discarded\\n')",
       '  process.exit(0)',
