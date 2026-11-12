@@ -1,21 +1,23 @@
 import * as path from 'node:path'
 import { log } from '../util/log.js'
-import { acquirePidLock, type HeldLock } from '../util/pid-lock.js'
+import { acquireLease, type Lease, type LeaseOptions } from '../util/lease.js'
 
 // ─── Single-instance lock (per identity home) ───────────────────────────────
 //
 // Two daemons for one home = duplicate replies + socket thrash. `daemon.lock`
-// in the home enforces one: created with O_EXCL, naming its holder's pid and
-// start time; a stale one (holder gone, or the pid reused) is taken over
-// atomically (`util/pid-lock.ts`). One agent served from two homes is the agent
+// in the home enforces one: a lease (`util/lease.ts`) — created with O_EXCL,
+// renewed by its holder, taken over under a guard when its holder is gone.
+// Its first line is the holder's bare pid, as older readers expect (the
+// Windows service reinstall stops the daemon by it; a 0.4.x daemon reads it to
+// decide the lock is held). One agent served from two homes is the agent
 // lock's business (`daemon/agent-lock.ts`).
 
-export type LockHandle = HeldLock
+export type LockHandle = Lease
 
-export function acquireLeaderLock(home: string): LockHandle | null {
+export async function acquireLeaderLock(home: string, options: LeaseOptions = {}): Promise<LockHandle | null> {
   const lockPath = path.join(home, 'daemon.lock')
-  const attempt = acquirePidLock(lockPath, { home: path.resolve(home) })
-  if (attempt.ok) return attempt.lock
+  const attempt = await acquireLease(lockPath, { home: path.resolve(home) }, options)
+  if (attempt.ok) return attempt.lease
   log.error(`another agentchat daemon already holds ${lockPath}${attempt.holder !== null ? ` (pid ${attempt.holder.pid})` : ''}`)
   return null
 }

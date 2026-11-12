@@ -2,7 +2,7 @@ import * as crypto from 'node:crypto'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import { normalizeHandle } from '../skill/identity-line.js'
-import { acquirePidLock, type LockAttempt, type LockHolder } from '../util/pid-lock.js'
+import { acquireLease, type LeaseAttempt, type LeaseHolder, type LeaseOptions } from '../util/lease.js'
 
 // ─── One agent, one listener ────────────────────────────────────────────────
 //
@@ -15,7 +15,7 @@ import { acquirePidLock, type LockAttempt, type LockHolder } from '../util/pid-l
 //
 // The file is named by a hash of the API origin and the agent's handle (what
 // the server knows the agent by) — never the key. It names the holder's pid,
-// start time and identity home: nothing secret.
+// host, identity home and last renewal: nothing secret.
 
 /** Overrides the folder (tests and sandboxes). Two listeners given different folders do not see each other. */
 export const AGENT_LOCK_DIR_ENV = 'AGENTCHAT_LOCK_DIR'
@@ -55,13 +55,21 @@ export function agentLockPath(agent: { apiBase: string; handle: string }, env: N
   return path.join(agentLockDir(env), `agent-${id}.lock`)
 }
 
-/** Hold this agent for this process (an identity home's daemon), or learn which live process does. */
-export function acquireAgentLock(agent: { apiBase: string; handle: string; home: string }, env: NodeJS.ProcessEnv = process.env): LockAttempt {
-  return acquirePidLock(agentLockPath(agent, env), { home: path.resolve(agent.home), label: `@${normalizeHandle(agent.handle)}` })
+/**
+ * Hold this agent for this process (an identity home's daemon), or learn which
+ * live process does. The lock is a lease (`util/lease.ts`): renewed while held,
+ * stale 45 s after its holder stops renewing (at once when its pid is dead on
+ * this host); a holder that finds it replaced stands down (`Lease.onLost`).
+ */
+export function acquireAgentLock(agent: { apiBase: string; handle: string; home: string }, env: NodeJS.ProcessEnv = process.env, options: LeaseOptions = {}): Promise<LeaseAttempt> {
+  return acquireLease(agentLockPath(agent, env), { home: path.resolve(agent.home), label: `@${normalizeHandle(agent.handle)}` }, options)
 }
 
-/** The status sentence for a daemon that does not serve its agent because another does. */
-export function agentLockRefusal(agent: { handle: string; home: string }, holder: LockHolder | null, file: string): string {
-  const who = holder === null ? `another process (${file})` : `${holder.home !== undefined ? holder.home : 'another identity home'} (pid ${holder.pid}${holder.acquired_at !== undefined ? `, since ${holder.acquired_at}` : ''})`
+/** The status sentence for a daemon that does not serve its agent because another does (or the lock is contended right now). */
+export function agentLockRefusal(agent: { handle: string; home: string }, holder: LeaseHolder | null, file: string): string {
+  const who =
+    holder === null
+      ? `another listener (its lock ${file} is being taken over right now)`
+      : `${holder.home !== undefined ? holder.home : 'another identity home'} (pid ${holder.pid}${holder.host !== null ? ` on ${holder.host}` : ''}${holder.acquired_at !== undefined ? `, since ${holder.acquired_at}` : ''})`
   return `@${normalizeHandle(agent.handle)} is served by ${who}: this one (${path.resolve(agent.home)}) holds no socket and starts no run while it does, so no message is answered twice. Stop that one, or log out here; this one takes over when it stops.`
 }

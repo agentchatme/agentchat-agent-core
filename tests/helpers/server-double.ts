@@ -45,6 +45,8 @@ export interface Tray {
 }
 
 export interface ServerDoubleOptions {
+  /** What `GET /v1/agents/me` answers as the handle (absent: 404). */
+  meHandle?: string
   upgrade?: UpgradeMode
   helloCapabilities?: readonly string[]
   /** Cards on the tray; `truncated` when more wait than one page shows; `deferred` hidden from the cards. */
@@ -93,6 +95,10 @@ export interface ServerDouble {
   readonly dismissed: string[]
   /** Push a frame to the most recent live socket. */
   send(frame: unknown): void
+  /** From now on, refuse a hello with this key (close 1008 'Invalid token'), as for a key rotated elsewhere. */
+  refuseKey(apiKey: string): void
+  /** Drop every live socket whose hello used this key (all of them without one): the client reconnects. */
+  kick(apiKey?: string): void
   /** Acks recorded across every connection. */
   acks(): string[]
   close(): Promise<void>
@@ -110,6 +116,7 @@ export async function startServerDouble(options: ServerDoubleOptions = {}): Prom
   const dismissed: string[] = []
   const served: Served[] = []
   const requests: string[] = []
+  const refusedKeys = new Set<string>()
 
   const server = http.createServer((req, res) => {
     const url = new URL(req.url ?? '/', 'http://127.0.0.1')
@@ -165,6 +172,10 @@ export async function startServerDouble(options: ServerDoubleOptions = {}): Prom
       )
       return
     }
+    if (url.pathname === '/v1/agents/me' && options.meHandle !== undefined) {
+      res.end(JSON.stringify({ handle: options.meHandle, status: 'active' }))
+      return
+    }
     if (url.pathname === '/v1/texts') {
       if (textsStatus !== 200) {
         res.statusCode = textsStatus
@@ -207,6 +218,14 @@ export async function startServerDouble(options: ServerDoubleOptions = {}): Prom
     },
     manualAuth,
     dismissed,
+    refuseKey: (apiKey) => {
+      refusedKeys.add(apiKey)
+    },
+    kick: (apiKey) => {
+      for (const entry of served) {
+        if (apiKey === undefined || entry.hello?.['api_key'] === apiKey) entry.socket.terminate()
+      }
+    },
     send: (frame) => {
       const last = served[served.length - 1]
       if (!last) throw new Error('no live socket to send on')
@@ -247,7 +266,7 @@ export async function startServerDouble(options: ServerDoubleOptions = {}): Prom
             return
           }
           entry.hello = frame
-          if (decided === 'refuse') {
+          if (decided === 'refuse' || refusedKeys.has(String(frame['api_key']))) {
             ws.close(1008, 'Invalid token')
             return
           }

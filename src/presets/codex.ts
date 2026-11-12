@@ -4,7 +4,7 @@ import * as path from 'node:path'
 import { clientHeadersOf } from '../client-identity.js'
 import { hostedMcpUrl } from '../integration/mcp-probe.js'
 import { workdirExposesHome, type RunProfile } from '../integration/profile.js'
-import type { RunOutcome, RunPreflight, RunRequest, RunRunner } from '../integration/runner.js'
+import type { RunOutcome, RunPreflight, RunPreflightOptions, RunRequest, RunRunner } from '../integration/runner.js'
 import { killProcessTree, redactDiagnostic, spawnRun } from '../integration/spawn-run.js'
 import { log } from '../util/log.js'
 import { spawnCommand } from '../util/spawn.js'
@@ -111,8 +111,8 @@ export function codexHomeFrom(env: NodeJS.ProcessEnv = process.env): string {
 /** How long a probe (`--version`, `login status`) may take; a hung one is killed with its whole tree (`runProbe`). */
 export const CODEX_PROBE_TIMEOUT_MS = 10_000
 
-export async function inspectCodexRuntime(codexHome: string, command = 'codex', timeoutMs = CODEX_PROBE_TIMEOUT_MS): Promise<PresetInspection> {
-  const result = await runProbe(command, ['--version'], { timeoutMs, env: { ...process.env, CODEX_HOME: codexHome } })
+export async function inspectCodexRuntime(codexHome: string, command = 'codex', timeoutMs = CODEX_PROBE_TIMEOUT_MS, signal?: AbortSignal): Promise<PresetInspection> {
+  const result = await runProbe(command, ['--version'], { timeoutMs, env: { ...process.env, CODEX_HOME: codexHome }, ...(signal !== undefined ? { signal } : {}) })
   if (result.timedOut) return { ok: false, detail: `codex --version did not answer within ${Math.round(timeoutMs / 1000)} s (killed)` }
   if (result.error) return { ok: false, detail: `codex CLI not found on PATH (${result.error.message})` }
   const rendered = (result.stdout || result.stderr).trim()
@@ -123,8 +123,8 @@ export async function inspectCodexRuntime(codexHome: string, command = 'codex', 
 }
 
 /** `codex login status` exits 0 when signed in. */
-export async function codexIsLoggedIn(codexHome: string, command = 'codex', timeoutMs = CODEX_PROBE_TIMEOUT_MS): Promise<PresetInspection> {
-  const status = await runProbe(command, ['login', 'status'], { timeoutMs, env: { ...process.env, CODEX_HOME: codexHome } })
+export async function codexIsLoggedIn(codexHome: string, command = 'codex', timeoutMs = CODEX_PROBE_TIMEOUT_MS, signal?: AbortSignal): Promise<PresetInspection> {
+  const status = await runProbe(command, ['login', 'status'], { timeoutMs, env: { ...process.env, CODEX_HOME: codexHome }, ...(signal !== undefined ? { signal } : {}) })
   if (status.error) return { ok: false, detail: status.error.message }
   const detail = `${status.stdout}${status.stderr}`.trim().slice(0, 200)
   return status.status === 0 ? { ok: true, detail: detail || 'signed in' } : { ok: false, detail: detail || 'codex is not signed in (run `codex login`)' }
@@ -414,10 +414,10 @@ export class CodexRunner implements RunRunner {
     return this.options.workdir
   }
 
-  async preflight(): Promise<RunPreflight> {
-    const runtime = await inspectCodexRuntime(this.options.codexHome, this.command)
+  async preflight(options: RunPreflightOptions = {}): Promise<RunPreflight> {
+    const runtime = await inspectCodexRuntime(this.options.codexHome, this.command, CODEX_PROBE_TIMEOUT_MS, options.signal)
     if (!runtime.ok) return { ok: false, detail: runtime.detail }
-    const auth = await codexIsLoggedIn(this.options.codexHome, this.command)
+    const auth = await codexIsLoggedIn(this.options.codexHome, this.command, CODEX_PROBE_TIMEOUT_MS, options.signal)
     if (!auth.ok) return { ok: false, detail: `codex login status failed: ${auth.detail}` }
     if (this.workdir() !== this.options.workdir && !this.warnedHome) {
       this.warnedHome = true

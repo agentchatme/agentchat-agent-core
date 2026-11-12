@@ -4,15 +4,16 @@ import * as os from 'node:os'
 import * as path from 'node:path'
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import { pathToFileURL } from 'node:url'
-import { acquirePidLock, holderAlive, parseHolder, processStartedAt, PROCESS_STARTED_AT } from '../src/util/pid-lock.js'
+import { acquireLease, holderLive, parseLease, pidAlive, type LeaseHolder } from '../src/util/lease.js'
 import { acquireAgentLock, agentLockDir, agentLockPath, AGENT_LOCK_DIR_ENV } from '../src/daemon/agent-lock.js'
 import { acquireLeaderLock } from '../src/daemon/leader-lock.js'
+import { lockedDaemonPid } from '../src/daemon/service.js'
 import { runIntegration } from '../src/integration/run.js'
 import { Integration } from '../src/integration/integration.js'
 import { formatIntegrationStatus, readIntegrationStatus } from '../src/integration/status.js'
 import { runProbe } from '../src/util/probe.js'
-import { claudeIsLoggedIn, inspectClaudeRuntime, inspectCodexRuntime, codexIsLoggedIn } from '../src/presets/index.js'
-import type { RunOutcome, RunPreflight, RunRequest, RunRunner } from '../src/integration/runner.js'
+import { claudeIsLoggedIn, claudeSignIn, inspectClaudeRuntime, inspectCodexRuntime, codexIsLoggedIn } from '../src/presets/index.js'
+import type { RunOutcome, RunPreflight, RunPreflightOptions, RunRequest, RunRunner } from '../src/integration/runner.js'
 import { installFakeClaude, installFakeCodex } from './helpers/fake-runtimes.js'
 import { startServerDouble, until, type ServerDouble } from './helpers/server-double.js'
 
@@ -59,86 +60,204 @@ function sleeper(): ChildProcess {
   return spawn(process.execPath, ['-e', 'setTimeout(() => {}, 600000)'], { stdio: 'ignore' })
 }
 
-// ─── 2a. the lock primitive ─────────────────────────────────────────────────
+// ─── 2a. the lock primitive: a lease ────────────────────────────────────────
 
-describe('the pid lock: O_EXCL, its holder named by pid and start time, stale ones taken over atomically', () => {
-  it('acquired once; a second attempt is refused naming the holder; released, it can be taken again', () => {
+/** A pid that exists but this user may not signal (EPERM): init on POSIX, System on Windows. */
+const EPERM_PID = process.platform === 'win32' ? 4 : 1
+
+/** A lease file as another process (or another host) would have written it. */
+function leaseFile(file: string, h: { pid: number; renewed_at: number; host?: string; token?: string; home?: string }): string {
+  const content = `${h.pid}\n${JSON.stringify({ pid: h.pid, token: h.token ?? 'their-token', host: h.host ?? os.hostname(), home: h.home ?? '/their/home', acquired_at: new Date(h.renewed_at).toISOString(), renewed_at: h.renewed_at })}\n`
+  fs.writeFileSync(file, content)
+  return content
+}
+
+/** The leader lock of agent-core 0.4.1 and earlier, verbatim in behaviour: what an old daemon does with a new lock. */
+function oldAcquireLeaderLock(home: string): 'acquired' | 'refused' | 'stole' {
+  const lockPath = path.join(home, 'daemon.lock')
+  try {
+    const fd = fs.openSync(lockPath, 'wx')
+    fs.writeSync(fd, String(process.pid))
+    fs.closeSync(fd)
+    return 'acquired'
+  } catch {
+    /* exists */
+  }
+  let holderPid = 0
+  try {
+    holderPid = Number.parseInt(fs.readFileSync(lockPath, 'utf-8').trim(), 10)
+  } catch {
+    /* unreadable */
+  }
+  if (holderPid && pidAlive(holderPid)) return 'refused'
+  fs.writeFileSync(lockPath, String(process.pid))
+  return 'stole'
+}
+
+describe('the lease: O_EXCL, the bare pid first, renewed by its holder, taken over under a guard when it is stale', () => {
+  it('the file: the bare pid on its first line (what older readers parse), then the lease; refused while held; released, it can be taken again', async () => {
     const file = path.join(sandbox, 'x.lock')
-    const a = acquirePidLock(file, { home: '/h1', label: '@me' })
+    const a = await acquireLease(file, { home: '/h1', label: '@me' })
     expect(a.ok).toBe(true)
-    const holder = parseHolder(fs.readFileSync(file, 'utf-8'))
-    expect(holder).toMatchObject({ pid: process.pid, started_at: PROCESS_STARTED_AT, home: '/h1', label: '@me' })
+    const raw = fs.readFileSync(file, 'utf-8')
+    expect(Number.parseInt(raw.trim(), 10)).toBe(process.pid)
+    expect(raw.split('\n')[0]).toBe(String(process.pid))
+    expect(parseLease(raw)).toMatchObject({ pid: process.pid, host: os.hostname(), home: '/h1', label: '@me', token: expect.any(String), renewed_at: expect.any(Number) })
     if (posix()) expect(fs.statSync(file).mode & 0o777).toBe(0o600)
-    expect(acquirePidLock(file)).toMatchObject({ ok: false, holder: { pid: process.pid, home: '/h1' } })
-    if (a.ok) a.lock.release()
+    expect(await acquireLease(file)).toMatchObject({ ok: false, holder: { pid: process.pid, home: '/h1' } })
+    if (a.ok) a.lease.release()
     expect(fs.existsSync(file)).toBe(false)
-    expect(acquirePidLock(file).ok).toBe(true)
+    const again = await acquireLease(file)
+    expect(again.ok).toBe(true)
+    if (again.ok) again.lease.release()
   })
 
-  it('release never removes a lock that is no longer this process\'s', () => {
-    const file = path.join(sandbox, 'x.lock')
-    const a = acquirePidLock(file)
-    fs.writeFileSync(file, JSON.stringify({ pid: 4242, started_at: 1 }))
-    if (a.ok) a.lock.release()
-    expect(fs.readFileSync(file, 'utf-8')).toContain('4242')
+  it('old readers: the service reinstall finds the pid (both formats), and a 0.4.x daemon refuses a live lease instead of stealing it', async () => {
+    const home = path.join(sandbox, 'home')
+    const held = await acquireLeaderLock(home)
+    expect(held).not.toBeNull()
+    expect(lockedDaemonPid(home)).toBe(process.pid)
+    expect(oldAcquireLeaderLock(home)).toBe('refused')
+    expect(parseLease(fs.readFileSync(path.join(home, 'daemon.lock'), 'utf-8'))?.token).toBeTruthy() // untouched
+    held?.release()
+    fs.writeFileSync(path.join(home, 'daemon.lock'), '4242')
+    expect(lockedDaemonPid(home)).toBe(4242)
   })
 
-  it('a dead holder, a reused pid (another start time) and an old bare-pid lock of a dead process are stale; a live bare pid is not', () => {
-    const file = path.join(sandbox, 'x.lock')
-    fs.writeFileSync(file, JSON.stringify({ pid: deadPid(), started_at: Date.now() - 1000 }))
-    expect(acquirePidLock(file).ok).toBe(true)
-    fs.writeFileSync(file, JSON.stringify({ pid: process.pid, started_at: PROCESS_STARTED_AT - 3_600_000 }))
-    expect(acquirePidLock(file).ok).toBe(true)
-    fs.writeFileSync(file, String(deadPid()))
-    expect(acquirePidLock(file).ok).toBe(true)
+  it('liveness: a dead pid here is gone at once; a live pid that stopped renewing (a reboot reused it) is gone; EPERM with a fresh lease is held, with a stale one is not', () => {
+    const now = Date.now()
     const live = sleeper()
     try {
+      const h = (pid: number, renewed: number, host?: string): LeaseHolder => ({ pid, token: 't', host: host ?? os.hostname(), renewed_at: renewed })
+      expect(holderLive(h(deadPid(), now), now)).toBe(false)
+      expect(holderLive(h(live.pid ?? 0, now - 1_000), now)).toBe(true)
+      expect(holderLive(h(live.pid ?? 0, now - 120_000), now)).toBe(false) // reboot-stale: alive pid, no renewal
+      expect(pidAlive(EPERM_PID)).toBe(true)
+      expect(holderLive(h(EPERM_PID, now - 1_000), now)).toBe(true)
+      expect(holderLive(h(EPERM_PID, now - 120_000), now)).toBe(false) // reused by an elevated process
+      // Another host: its pid means nothing here; the lease alone decides.
+      expect(holderLive(h(deadPid(), now - 1_000, 'other-host'), now)).toBe(true)
+      expect(holderLive(h(deadPid(), now - 120_000, 'other-host'), now)).toBe(false)
+      // A lock from before leases: its pid alone.
+      expect(holderLive({ pid: live.pid ?? 0, token: null, host: null, renewed_at: null }, now)).toBe(true)
+      expect(holderLive({ pid: deadPid(), token: null, host: null, renewed_at: null }, now)).toBe(false)
+    } finally {
+      live.kill('SIGKILL')
+    }
+  })
+
+  it('no local time anywhere: the US fall-back hour (01:00–02:00 twice) does not make a fresh lease look stale', () => {
+    const prev = process.env['TZ']
+    process.env['TZ'] = 'America/New_York'
+    try {
+      // 2026-11-01 05:30Z is 01:30 EDT; an hour later is 01:30 EST.
+      const renewed = Date.UTC(2026, 10, 1, 5, 30)
+      const live = sleeper()
+      try {
+        expect(holderLive({ pid: live.pid ?? 0, token: 't', host: os.hostname(), renewed_at: renewed }, renewed + 20_000)).toBe(true)
+        expect(holderLive({ pid: live.pid ?? 0, token: 't', host: os.hostname(), renewed_at: renewed }, renewed + 3_600_000)).toBe(false)
+      } finally {
+        live.kill('SIGKILL')
+      }
+    } finally {
+      if (prev === undefined) delete process.env['TZ']
+      else process.env['TZ'] = prev
+    }
+  })
+
+  it('taken over: a dead holder, a stale lease of a live pid, a stale EPERM pid, an old bare pid of a dead process; refused: a fresh lease, a live bare pid', async () => {
+    const file = path.join(sandbox, 'x.lock')
+    const take = async (): Promise<boolean> => {
+      const r = await acquireLease(file)
+      if (r.ok) r.lease.release()
+      return r.ok
+    }
+    const live = sleeper()
+    try {
+      leaseFile(file, { pid: deadPid(), renewed_at: Date.now() })
+      expect(await take()).toBe(true)
+      leaseFile(file, { pid: live.pid ?? 0, renewed_at: Date.now() - 120_000 })
+      expect(await take()).toBe(true)
+      leaseFile(file, { pid: EPERM_PID, renewed_at: Date.now() - 120_000 })
+      expect(await take()).toBe(true)
+      fs.writeFileSync(file, String(deadPid()))
+      expect(await take()).toBe(true)
+      leaseFile(file, { pid: live.pid ?? 0, renewed_at: Date.now() })
+      expect(await acquireLease(file)).toMatchObject({ ok: false, holder: { pid: live.pid, home: '/their/home' } })
       fs.writeFileSync(file, String(live.pid))
-      expect(acquirePidLock(file)).toMatchObject({ ok: false, holder: { pid: live.pid, started_at: null } })
+      expect(await acquireLease(file)).toMatchObject({ ok: false, holder: { pid: live.pid, renewed_at: null } })
     } finally {
       live.kill('SIGKILL')
     }
   })
 
-  it('a live process is the holder only with its own start time: a recorded start an hour off is a reused pid', async () => {
-    const live = sleeper()
-    try {
-      await until(() => processStartedAt(live.pid ?? 0) !== null, 15_000)
-      const started = processStartedAt(live.pid ?? 0)
-      expect(started).not.toBeNull()
-      expect(Math.abs((started ?? 0) - Date.now())).toBeLessThan(60_000)
-      expect(holderAlive({ pid: live.pid ?? 0, started_at: started })).toBe(true)
-      expect(holderAlive({ pid: live.pid ?? 0, started_at: (started ?? 0) - 3_600_000 })).toBe(false)
-    } finally {
-      live.kill('SIGKILL')
-    }
-  }, 30_000)
+  it('renewed while held; a holder that finds its lease replaced, or removed, stands down at once', async () => {
+    const file = path.join(sandbox, 'x.lock')
+    const a = await acquireLease(file, {}, { renewMs: 50 })
+    if (!a.ok) throw new Error('not acquired')
+    const first = parseLease(fs.readFileSync(file, 'utf-8'))?.renewed_at ?? 0
+    await until(() => (parseLease(fs.readFileSync(file, 'utf-8'))?.renewed_at ?? 0) > first, 2_000)
+    let why: string | null = null
+    a.lease.onLost((w) => {
+      why = w
+    })
+    leaseFile(file, { pid: process.pid, renewed_at: Date.now(), token: 'someone-else' })
+    await until(() => why !== null, 2_000)
+    expect(a.lease.lost).toBe(true)
+    expect(why).toMatch(/names another holder/)
+    // The replacement is not touched by the old holder.
+    expect(parseLease(fs.readFileSync(file, 'utf-8'))?.token).toBe('someone-else')
+    fs.rmSync(file)
+    const b = await acquireLease(file, {}, { renewMs: 50 })
+    if (!b.ok) throw new Error('not acquired')
+    let gone: string | null = null
+    b.lease.onLost((w) => {
+      gone = w
+    })
+    fs.rmSync(file)
+    await until(() => gone !== null, 2_000)
+    expect(gone).toMatch(/was removed/)
+  })
 
-  it('a file being written (unparseable, fresh) is not taken; an old unparseable one is', () => {
+  it('a file being written (unparseable, fresh) is not taken; an old unparseable one is', async () => {
     const file = path.join(sandbox, 'x.lock')
     fs.writeFileSync(file, '')
-    expect(acquirePidLock(file).ok).toBe(false)
+    expect((await acquireLease(file)).ok).toBe(false)
     const old = new Date(Date.now() - 60_000)
     fs.utimesSync(file, old, old)
-    expect(acquirePidLock(file).ok).toBe(true)
+    const r = await acquireLease(file)
+    expect(r.ok).toBe(true)
+    if (r.ok) r.lease.release()
   })
 
-  it.skipIf(!stripTypes())('many processes taking over one stale lock at once: exactly one wins', async () => {
+  it('contended past every attempt (a live takeover in progress): no holder is named — never a dead one', async () => {
+    const file = path.join(sandbox, 'x.lock')
+    const live = sleeper()
+    try {
+      leaseFile(file, { pid: deadPid(), renewed_at: Date.now(), home: '/dead/home' })
+      leaseFile(`${file}.takeover`, { pid: live.pid ?? 0, renewed_at: Date.now() })
+      const r = await acquireLease(file)
+      expect(r).toMatchObject({ ok: false, holder: null })
+    } finally {
+      live.kill('SIGKILL')
+    }
+  })
+
+  it.skipIf(!stripTypes())('many processes taking over one stale lease at once: exactly one wins', async () => {
     const file = path.join(sandbox, 'race.lock')
     const go = path.join(sandbox, 'go')
     const out = path.join(sandbox, 'results.jsonl')
     const done = path.join(sandbox, 'done')
-    fs.writeFileSync(file, JSON.stringify({ pid: deadPid(), started_at: 1 }))
-    const lib = pathToFileURL(path.join(__dirname, '..', 'src', 'util', 'pid-lock.ts')).href
+    leaseFile(file, { pid: deadPid(), renewed_at: Date.now() })
+    const lib = pathToFileURL(path.join(__dirname, '..', 'src', 'util', 'lease.ts')).href
     const script = [
       "const fs = require('node:fs')",
       'const [lib, file, go, out, done] = process.argv.slice(1)',
-      'import(lib).then((m) => {',
-      '  while (!fs.existsSync(go)) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1)',
-      "  const r = m.acquirePidLock(file, { label: 'race' })",
+      'import(lib).then(async (m) => {',
+      '  while (!fs.existsSync(go)) await new Promise((r) => setTimeout(r, 1))',
+      "  const r = await m.acquireLease(file, { label: 'race' })",
       "  fs.appendFileSync(out, JSON.stringify({ pid: process.pid, ok: r.ok }) + '\\n')",
-      // Every contender stays alive until all have answered: a holder that left
-      // early would be a stale lock the slower ones may rightly take over.
+      // Every contender stays alive until all have answered.
       '  const poll = setInterval(() => { if (fs.existsSync(done)) { clearInterval(poll); process.exit(0) } }, 20)',
       '})',
     ].join('\n')
@@ -149,19 +268,20 @@ describe('the pid lock: O_EXCL, its holder named by pid and start time, stale on
     const results = fs.readFileSync(out, 'utf-8').trim().split('\n').map((l) => JSON.parse(l) as { pid: number; ok: boolean })
     fs.writeFileSync(done, '')
     expect(results.filter((r) => r.ok)).toHaveLength(1)
-    const winner = results.find((r) => r.ok)?.pid
-    expect(parseHolder(fs.readFileSync(file, 'utf-8'))?.pid).toBe(winner)
+    expect(parseLease(fs.readFileSync(file, 'utf-8'))?.pid).toBe(results.find((r) => r.ok)?.pid)
     await Promise.all(kids.map((k) => new Promise((r) => (k.exitCode !== null ? r(null) : k.once('exit', r)))))
   }, 90_000)
 
-  it('the home lock (leader lock) is the same primitive', () => {
+  it('the home lock (leader lock) is the same lease; an older release\'s stale bare-pid lock is taken over', async () => {
     const home = path.join(sandbox, 'home')
-    const a = acquireLeaderLock(home)
+    const a = await acquireLeaderLock(home)
     expect(a).not.toBeNull()
-    expect(acquireLeaderLock(home)).toBeNull()
+    expect(await acquireLeaderLock(home)).toBeNull()
     a?.release()
-    fs.writeFileSync(path.join(home, 'daemon.lock'), String(deadPid())) // an older release's stale lock
-    expect(acquireLeaderLock(home)).not.toBeNull()
+    fs.writeFileSync(path.join(home, 'daemon.lock'), String(deadPid()))
+    const b = await acquireLeaderLock(home)
+    expect(b).not.toBeNull()
+    b?.release()
   })
 })
 
@@ -169,7 +289,7 @@ function posix(): boolean {
   return process.platform !== 'win32'
 }
 
-/** Node runs TypeScript with type stripping (22.6+): the race test's children import the lock module itself. */
+/** Node runs TypeScript with type stripping (22.6+): the race test's children import the lease module itself. */
 function stripTypes(): boolean {
   return spawnSync(process.execPath, ['--experimental-strip-types', '--no-warnings', '-e', '1']).status === 0
 }
@@ -185,60 +305,179 @@ describe('the agent lock: one per agent, in a per-user folder, named by a hash o
     expect(agentLockDir({ [AGENT_LOCK_DIR_ENV]: path.join(sandbox, 'l') }, 'linux', '/home/a')).toBe(path.join(sandbox, 'l'))
   })
 
-  it('the same agent however spelled; another agent or server elsewhere; never the key', () => {
+  it('the same agent however spelled; another agent or server elsewhere; never the key', async () => {
     const env = { [AGENT_LOCK_DIR_ENV]: sandbox }
     const a = agentLockPath({ apiBase: 'https://api.agentchat.me', handle: 'probe' }, env)
     expect(agentLockPath({ apiBase: 'https://API.agentchat.me/', handle: '@Probe' }, env)).toBe(a)
     expect(agentLockPath({ apiBase: 'https://api.agentchat.me', handle: 'other' }, env)).not.toBe(a)
     expect(agentLockPath({ apiBase: 'http://127.0.0.1:9', handle: 'probe' }, env)).not.toBe(a)
     expect(path.basename(a)).toMatch(/^agent-[0-9a-f]{32}\.lock$/)
-    const held = acquireAgentLock({ apiBase: 'https://api.agentchat.me', handle: 'probe', home: '/h1' }, env)
+    const held = await acquireAgentLock({ apiBase: 'https://api.agentchat.me', handle: 'probe', home: '/h1' }, env)
     expect(held.ok).toBe(true)
     expect(fs.readFileSync(a, 'utf-8')).not.toContain(KEY)
-    expect(acquireAgentLock({ apiBase: 'https://api.agentchat.me', handle: 'probe', home: '/h2' }, env)).toMatchObject({ ok: false, holder: { home: path.resolve('/h1'), label: '@probe' } })
-    if (held.ok) held.lock.release()
+    expect(await acquireAgentLock({ apiBase: 'https://api.agentchat.me', handle: 'probe', home: '/h2' }, env)).toMatchObject({ ok: false, holder: { home: path.resolve('/h1'), label: '@probe' } })
+    if (held.ok) held.lease.release()
+  })
+})
+
+/** Two daemons, one agent: the supervisor-level cases. */
+describe('one agent, one listener: the supervisor', () => {
+  let double: ServerDouble
+  const okRunner = (): RunRunner => ({ name: 'fake-runtime', preflight: async () => ({ ok: true }), start: async () => ({ state: 'ok', exitCode: 0, durationMs: 1 }) })
+  const signIn = (home: string, key: string, apiBase: string, handle: string | null = 'probe'): void => {
+    fs.mkdirSync(home, { recursive: true })
+    fs.writeFileSync(path.join(home, 'credentials'), JSON.stringify({ api_key: key, ...(handle !== null ? { handle } : {}), api_base: apiBase }))
+  }
+  const daemon = (home: string, runner: RunRunner, extra: Record<string, unknown> = {}) => {
+    const controller = new AbortController()
+    const done = runIntegration({ home, client: CLIENT, manualPointer: '(POINTER)', workdir: path.join(home, 'w'), env: {}, standbyPollMs: 200, unservableRecheckMs: 300, lease: { renewMs: 100 }, runner, signal: controller.signal, ...extra })
+    return { stop: async () => { controller.abort(); return done }, done }
+  }
+  afterEach(async () => {
+    await double?.close()
   })
 
-  it('two homes holding one agent\'s key: the first serves it, the second stands by naming the first home and takes over when it stops', async () => {
-    const double = await startServerDouble({ tray: { waiting: 0 } })
+  it('two homes holding one agent\'s key: the first serves it, the second stands by naming the first home (status rewritten every poll) and takes over when it stops', async () => {
+    double = await startServerDouble({ tray: { waiting: 0 } })
     const home1 = path.join(sandbox, 'cli-home')
     const home2 = path.join(sandbox, 'integration-home')
-    for (const h of [home1, home2]) {
-      fs.mkdirSync(h, { recursive: true })
-      fs.writeFileSync(path.join(h, 'credentials'), JSON.stringify({ api_key: KEY, handle: 'probe', api_base: double.apiBase }))
-    }
-    const okRunner = (): RunRunner => ({ name: 'fake-runtime', preflight: async () => ({ ok: true }), start: async () => ({ state: 'ok', exitCode: 0, durationMs: 1 }) })
-    const first = new AbortController()
-    const second = new AbortController()
-    const base = (home: string) => ({ home, client: CLIENT, manualPointer: '(POINTER)', workdir: path.join(home, 'w'), env: {}, standbyPollMs: 300 })
-    const a = runIntegration({ ...base(home1), runner: okRunner(), signal: first.signal })
+    signIn(home1, KEY, double.apiBase)
+    signIn(home2, KEY, double.apiBase)
+    const a = daemon(home1, okRunner())
+    await until(() => readIntegrationStatus(home1)?.socket === 'ready', 10_000)
+    const b = daemon(home2, okRunner())
     try {
-      await until(() => readIntegrationStatus(home1)?.socket === 'ready', 10_000)
-      const b = runIntegration({ ...base(home2), runner: okRunner(), signal: second.signal })
-      try {
-        await until(() => (readIntegrationStatus(home2)?.standby ?? null) !== null, 10_000)
-        const standing = readIntegrationStatus(home2)
-        expect(standing?.socket).toBe('idle')
-        expect(standing?.standby).toMatchObject({ home: path.resolve(home1), pid: process.pid })
-        expect(standing?.last_error).toContain(`is served by ${path.resolve(home1)}`)
-        expect(formatIntegrationStatus(standing).join('\n')).toContain(`standby: ${path.resolve(home1)} (pid ${process.pid}) serves this agent`)
-        // Only one socket for the agent: the standing-by daemon never connects.
-        expect(double.served).toHaveLength(1)
-        // The first stops: the second takes over.
-        first.abort()
-        expect(await a).toBe(0)
-        await until(() => readIntegrationStatus(home2)?.socket === 'ready', 10_000)
-        expect(readIntegrationStatus(home2)?.standby ?? null).toBeNull()
-      } finally {
-        second.abort()
-        await b
-      }
+      await until(() => (readIntegrationStatus(home2)?.standby ?? null) !== null, 10_000)
+      const standing = readIntegrationStatus(home2)
+      expect(standing?.socket).toBe('idle')
+      expect(standing?.standby).toMatchObject({ home: path.resolve(home1), pid: process.pid })
+      expect(standing?.last_error).toContain(`is served by ${path.resolve(home1)}`)
+      expect(formatIntegrationStatus(standing).join('\n')).toContain(`standby: ${path.resolve(home1)} (pid ${process.pid}) serves this agent`)
+      // Rewritten every poll: never "the daemon may be down".
+      const t0 = standing?.updated_at ?? ''
+      await until(() => (readIntegrationStatus(home2)?.updated_at ?? '') > t0, 3_000)
+      expect(double.served).toHaveLength(1)
+      expect(await a.stop()).toBe(0)
+      await until(() => readIntegrationStatus(home2)?.socket === 'ready', 10_000)
+      expect(readIntegrationStatus(home2)?.standby ?? null).toBeNull()
     } finally {
-      first.abort()
-      await a
-      await double.close()
+      await a.stop()
+      await b.stop()
     }
   }, 40_000)
+
+  it('the holder whose key the server now refuses (rotated by recover in the other home) gives the agent up; the healthy standby takes over', async () => {
+    double = await startServerDouble({ tray: { waiting: 0 } })
+    const oldKey = 'ac_' + 'o'.repeat(40)
+    const newKey = 'ac_' + 'n'.repeat(40)
+    const home1 = path.join(sandbox, 'stale-home')
+    const home2 = path.join(sandbox, 'recovered-home')
+    signIn(home1, oldKey, double.apiBase)
+    signIn(home2, newKey, double.apiBase)
+    const a = daemon(home1, okRunner())
+    await until(() => readIntegrationStatus(home1)?.socket === 'ready', 10_000)
+    const b = daemon(home2, okRunner())
+    try {
+      await until(() => (readIntegrationStatus(home2)?.standby ?? null) !== null, 10_000)
+      double.refuseKey(oldKey)
+      double.kick(oldKey)
+      await until(() => readIntegrationStatus(home2)?.socket === 'ready', 15_000)
+      const gaveUp = readIntegrationStatus(home1)
+      expect(gaveUp?.socket).toBe('idle')
+      expect(gaveUp?.last_error).toMatch(/this home cannot serve @probe: the server refuses this home's key/)
+      expect(double.served.filter((x) => x.hello?.['api_key'] === newKey).length).toBeGreaterThanOrEqual(1)
+    } finally {
+      await a.stop()
+      await b.stop()
+    }
+  }, 40_000)
+
+  it('the holder whose runs fail for a runtime reason gives the agent up; the standby takes over; when the standby stops and this home checks out again, it serves again', async () => {
+    double = await startServerDouble({ tray: { waiting: 1 } })
+    const home1 = path.join(sandbox, 'broken-home')
+    const home2 = path.join(sandbox, 'healthy-home')
+    signIn(home1, KEY, double.apiBase)
+    signIn(home2, KEY, double.apiBase)
+    const broken = new ScriptedRunner({ state: 'ok', exitCode: 0, durationMs: 1 }, { ok: true })
+    const a = daemon(home1, broken, { runtimeRecheckMs: 50 })
+    await until(() => readIntegrationStatus(home1)?.socket === 'ready', 10_000)
+    const b = daemon(home2, okRunner())
+    try {
+      await until(() => (readIntegrationStatus(home2)?.standby ?? null) !== null, 10_000)
+      // Signed out: the next run does not start and the runtime's check says why.
+      broken.outcome = { state: 'not_started', exitCode: 1, durationMs: 1, detail: 'Not logged in' }
+      broken.check = { ok: false, detail: 'claude is not signed in (run `claude` once and sign in)' }
+      double.send({ type: 'message.new', payload: { id: 'm1', conversation_id: 'conv_1', sender: 'peer', content: { text: 'x' } } })
+      await until(() => readIntegrationStatus(home2)?.socket === 'ready', 15_000)
+      const gaveUp = readIntegrationStatus(home1)
+      expect(gaveUp?.socket).toBe('idle')
+      expect(gaveUp?.runs_failing?.reason).toBe('claude: claude is not signed in (run `claude` once and sign in)')
+      expect(formatIntegrationStatus(gaveUp).join('\n')).toContain('runs failing: claude: claude is not signed in')
+      // Signed in again, and the standby stops: this home takes the agent back.
+      broken.check = { ok: true }
+      broken.outcome = { state: 'ok', exitCode: 0, durationMs: 1 }
+      expect(await b.stop()).toBe(0)
+      await until(() => readIntegrationStatus(home1)?.socket === 'ready', 15_000)
+      expect(readIntegrationStatus(home1)?.runs_failing ?? null).toBeNull()
+    } finally {
+      await a.stop()
+      await b.stop()
+    }
+  }, 60_000)
+
+  it('the holder whose agent lock was replaced underneath it stands down at its next renewal: never two serving', async () => {
+    double = await startServerDouble({ tray: { waiting: 0 } })
+    const home1 = path.join(sandbox, 'h1')
+    signIn(home1, KEY, double.apiBase)
+    const a = daemon(home1, okRunner())
+    try {
+      await until(() => readIntegrationStatus(home1)?.socket === 'ready', 10_000)
+      const file = agentLockPath({ apiBase: double.apiBase, handle: 'probe' })
+      const other = sleeper()
+      try {
+        leaseFile(file, { pid: other.pid ?? 0, renewed_at: Date.now() + 60_000, home: '/the/other/home' })
+        await until(() => (readIntegrationStatus(home1)?.standby ?? null) !== null, 10_000)
+        expect(readIntegrationStatus(home1)?.standby).toMatchObject({ home: '/the/other/home', pid: other.pid })
+      } finally {
+        other.kill('SIGKILL')
+      }
+    } finally {
+      await a.stop()
+    }
+  }, 30_000)
+
+  it('an env-key standby asks the server who it is once, not on every poll', async () => {
+    double = await startServerDouble({ tray: { waiting: 0 }, meHandle: 'probe' })
+    const home1 = path.join(sandbox, 'h1')
+    const home2 = path.join(sandbox, 'h2')
+    fs.mkdirSync(home1, { recursive: true })
+    fs.mkdirSync(home2, { recursive: true })
+    // Both homes serve the agent of the key in the environment (no credentials file, no handle on disk).
+    const prev = { key: process.env['AGENTCHAT_API_KEY'], base: process.env['AGENTCHAT_API_BASE'] }
+    process.env['AGENTCHAT_API_KEY'] = KEY
+    process.env['AGENTCHAT_API_BASE'] = double.apiBase
+    const a = daemon(home1, okRunner())
+    let b: ReturnType<typeof daemon> | null = null
+    try {
+      await until(() => readIntegrationStatus(home1)?.socket === 'ready', 10_000)
+      b = daemon(home2, okRunner())
+      await until(() => (readIntegrationStatus(home2)?.standby ?? null) !== null, 10_000)
+      const asks = (): number => double.requests.filter((r) => r.startsWith('/v1/agents/me')).length
+      const before = asks()
+      const t0 = readIntegrationStatus(home2)?.updated_at ?? ''
+      // Several standby polls later: the status moved on, the server was not asked again.
+      await until(() => (readIntegrationStatus(home2)?.updated_at ?? '') > t0, 3_000)
+      await new Promise((r) => setTimeout(r, 800))
+      expect(asks()).toBe(before)
+    } finally {
+      await a.stop()
+      await b?.stop()
+      if (prev.key === undefined) delete process.env['AGENTCHAT_API_KEY']
+      else process.env['AGENTCHAT_API_KEY'] = prev.key
+      if (prev.base === undefined) delete process.env['AGENTCHAT_API_BASE']
+      else process.env['AGENTCHAT_API_BASE'] = prev.base
+    }
+  }, 30_000)
 })
 
 // ─── 1. runs failing, said plainly ──────────────────────────────────────────
@@ -351,6 +590,55 @@ describe('runs that keep failing for a runtime reason are said in status and doc
     expect(i.snapshot().runs_failing).toMatchObject({ reason: 'claude: unknown option --permission-prompts', runs_missed: 2 })
   }, 20_000)
 
+  it('a run that succeeds resets the window: fail → ok → fail within it is checked again at once', async () => {
+    double = await startServerDouble({ tray: { waiting: 0 } })
+    const runner = new ScriptedRunner({ state: 'not_started', exitCode: 1, durationMs: 1, detail: 'x' }, { ok: true })
+    const i = await start(runner, 60_000)
+    await until(() => i.snapshot().socket === 'ready', 5_000)
+    double.setTray({ waiting: 1 })
+    const checks0 = runner.preflights
+    wake('a')
+    await until(() => runner.starts === 1, 5_000)
+    await i.runtimeCheckSettled()
+    expect(runner.preflights).toBe(checks0 + 1)
+    runner.outcome = { state: 'ok', exitCode: 0, durationMs: 1 }
+    wake('b')
+    await until(() => runner.starts === 2, 5_000)
+    runner.outcome = { state: 'not_started', exitCode: 1, durationMs: 1, detail: 'x' }
+    runner.check = { ok: false, detail: 'unknown option --permission-prompts' }
+    wake('c')
+    await until(() => runner.starts === 3, 5_000)
+    await i.runtimeCheckSettled()
+    expect(runner.preflights).toBe(checks0 + 2)
+    expect(i.snapshot().runs_failing?.reason).toBe('claude: unknown option --permission-prompts')
+  }, 20_000)
+
+  it('stopping kills a runtime check in flight and waits for it (its probes do not outlive the integration)', async () => {
+    double = await startServerDouble({ tray: { waiting: 1 } })
+    let aborted = false
+    const runner: RunRunner & { starts: number } = {
+      name: 'claude',
+      starts: 0,
+      preflight: async (options?: RunPreflightOptions) => {
+        if (runner.starts === 0) return { ok: true }
+        // The recheck: hangs until the integration stops it.
+        await new Promise<void>((resolve) => options?.signal?.addEventListener('abort', () => resolve(), { once: true }))
+        aborted = options?.signal?.aborted === true
+        return { ok: false, detail: 'stopped' }
+      },
+      start: async () => {
+        runner.starts += 1
+        return { state: 'not_started', exitCode: 1, durationMs: 1, detail: 'x' }
+      },
+    }
+    const i = await start(runner, 60_000)
+    await until(() => runner.starts === 1, 5_000)
+    const t0 = Date.now()
+    expect(await i.stopAndWait(5_000)).toBe(true)
+    expect(Date.now() - t0).toBeLessThan(4_000)
+    expect(aborted).toBe(true)
+  }, 20_000)
+
   it('a run that fails while the runtime checks out is not a runtime problem: nothing is claimed', async () => {
     double = await startServerDouble({ tray: { waiting: 1 } })
     const runner = new ScriptedRunner({ state: 'failed', exitCode: 1, durationMs: 1, detail: 'the model errored' }, { ok: true })
@@ -412,6 +700,13 @@ describe('a probe that hangs is killed with everything it started, and answers',
         if (typeof answer === 'boolean') expect(answer).toBe(false)
         else expect(answer).toMatchObject({ ok: false, detail: expect.stringMatching(/did not answer within/) })
         expectGone(pids)
+        if (label === 'claude auth status') {
+          // Said as what it is: no answer, not "not signed in".
+          fs.rmSync(pids, { force: true })
+          const signIn = await claudeSignIn(path.join(sandbox, '.claude'), cmd, 5_000)
+          expect(signIn).toEqual({ signedIn: false, unanswered: 'claude auth status did not answer within 5 s (killed)' })
+          expectGone(pids)
+        }
       } finally {
         delete process.env['FAKE_RUNTIME_PROBE_HANG']
         delete process.env['FAKE_RUNTIME_PROBE_PIDS']

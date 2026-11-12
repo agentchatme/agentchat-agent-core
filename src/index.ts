@@ -181,6 +181,7 @@ export type {
   RunOutcomeState,
   RunKind,
   RunPreflight,
+  RunPreflightOptions,
   RunnerIdentity,
   RunnerFactory,
   RunnerSource,
@@ -226,7 +227,7 @@ export {
 } from './daemon/health.js'
 export { acquireLeaderLock, type LockHandle } from './daemon/leader-lock.js'
 export { AGENT_LOCK_DIR_ENV, agentLockDir, agentLockPath, acquireAgentLock, agentLockRefusal } from './daemon/agent-lock.js'
-export { acquirePidLock, lockHolder, holderAlive, pidAlive, processStartedAt, parseHolder, PROCESS_STARTED_AT, type LockHolder, type HeldLock, type LockAttempt } from './util/pid-lock.js'
+export { acquireLease, leaseHolder, holderLive, pidAlive, parseLease, LEASE_RENEW_MS, LEASE_STALE_MS, type Lease, type LeaseHolder, type LeaseAttempt, type LeaseOptions } from './util/lease.js'
 export {
   installService,
   uninstallService,

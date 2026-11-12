@@ -25,6 +25,8 @@ export interface ProbeOptions {
   readonly env?: NodeJS.ProcessEnv
   readonly timeoutMs: number
   readonly cwd?: string
+  /** Aborting it stops the probe as a timeout would (its tree killed, its exit waited for). */
+  readonly signal?: AbortSignal
 }
 
 /** After a probe is killed: how long its exit is waited for before it is given up on. */
@@ -51,6 +53,7 @@ export function runProbe(command: string, args: readonly string[], options: Prob
     let stdout = ''
     let stderr = ''
     let timedOut = false
+    let stopped = false
     let settled = false
     let giveUp: NodeJS.Timeout | null = null
     const settle = (result: ProbeResult): void => {
@@ -66,10 +69,11 @@ export function runProbe(command: string, args: readonly string[], options: Prob
     proc.stderr?.on('data', (chunk: Buffer) => {
       if (stderr.length < MAX_OUTPUT) stderr += chunk.toString('utf-8')
     })
-    const timer = setTimeout(() => {
-      timedOut = true
+    const stop = (error: Error, byTimeout: boolean): void => {
+      if (timedOut || settled) return
+      timedOut = byTimeout
+      stopped = true
       killProcessTree(proc, 'SIGKILL')
-      const error = new Error(`${command} ${args.join(' ')} did not answer within ${Math.round(options.timeoutMs / 1000)} s`)
       // Its exit (every pipe closed) is the answer; a tree that will not die is given up on.
       giveUp = setTimeout(() => {
         proc.stdout?.destroy()
@@ -77,10 +81,15 @@ export function runProbe(command: string, args: readonly string[], options: Prob
         settle({ error, status: null, stdout, stderr, timedOut })
       }, PROBE_KILL_WAIT_MS)
       proc.once('close', () => settle({ error, status: null, stdout, stderr, timedOut }))
-    }, options.timeoutMs)
+    }
+    const timer = setTimeout(() => stop(new Error(`${command} ${args.join(' ')} did not answer within ${Math.round(options.timeoutMs / 1000)} s`), true), options.timeoutMs)
+    const onAbort = (): void => stop(new Error(`${command} ${args.join(' ')} was stopped`), false)
+    if (options.signal?.aborted) onAbort()
+    else options.signal?.addEventListener('abort', onAbort, { once: true })
     proc.on('error', (err) => settle({ error: err, status: null, stdout, stderr, timedOut }))
     proc.on('close', (code) => {
-      if (!timedOut) settle({ status: code, stdout, stderr, timedOut })
+      options.signal?.removeEventListener('abort', onAbort)
+      if (!stopped) settle({ status: code, stdout, stderr, timedOut })
     })
   })
 }

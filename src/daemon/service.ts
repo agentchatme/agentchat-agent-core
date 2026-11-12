@@ -5,6 +5,7 @@ import * as path from 'node:path'
 import { log } from '../util/log.js'
 import { atomicWriteFile } from '../util/fsutil.js'
 import { spawnCommand, spawnCommandSync } from '../util/spawn.js'
+import { parseLease } from '../util/lease.js'
 
 // ─── Service lifecycle (systemd / launchd / Windows Startup) ─────────────────
 //
@@ -802,11 +803,15 @@ function killLauncher(label: string, mode: WinMode): { ok: boolean; out: string 
   return run(mode === 'win32' ? 'powershell' : 'powershell.exe', ['-NoProfile', '-Command', ps])
 }
 
-/** The pid in the daemon's leader lock, or null: the daemon the Startup launcher is keeping alive right now. */
-function lockedDaemonPid(home: string): number | null {
+/**
+ * The pid in the daemon's leader lock, or null: the daemon the Startup
+ * launcher is keeping alive right now. The lock's shared parser: its first
+ * line is the bare pid, in the lease format and in a lock from before it.
+ */
+export function lockedDaemonPid(home: string): number | null {
   try {
-    const pid = Number.parseInt(fs.readFileSync(path.join(home, 'daemon.lock'), 'utf-8').trim(), 10)
-    return Number.isInteger(pid) && pid > 0 ? pid : null
+    const pid = parseLease(fs.readFileSync(path.join(home, 'daemon.lock'), 'utf-8'))?.pid ?? null
+    return pid !== null && Number.isInteger(pid) && pid > 0 ? pid : null
   } catch {
     return null
   }

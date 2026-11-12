@@ -3,15 +3,16 @@ import * as fs from 'node:fs'
 import { log } from '../util/log.js'
 import { acquireLeaderLock } from '../daemon/leader-lock.js'
 import { acquireAgentLock, agentLockRefusal } from '../daemon/agent-lock.js'
-import type { HeldLock } from '../util/pid-lock.js'
+import type { Lease, LeaseOptions } from '../util/lease.js'
+import type { DaemonConfig } from '../daemon/config.js'
 import { resolveIdentity, credentialsPath } from '../identity/credentials.js'
 import { resolveDaemonConfig } from '../daemon/config.js'
 import { idle } from '../daemon/health.js'
 import type { IntegrationClient } from '../client-identity.js'
 import { Integration } from './integration.js'
 import { INTEGRATION_ENV, INTEGRATION_ENV_LEGACY, INTEGRATION_ENV_LEGACY_REMOVAL, integrationDisabledBy, resolveRunBudgetMs, resolveRunProfile, type RunProfile } from './profile.js'
-import { isRunnerFactory, type RunnerSource } from './runner.js'
-import { writeIntegrationStatus, type IntegrationStandby } from './status.js'
+import { isRunnerFactory, type RunRunner, type RunnerSource } from './runner.js'
+import { writeIntegrationStatus, type IntegrationRunsFailing, type IntegrationStandby } from './status.js'
 
 // ─── The resident supervisor ────────────────────────────────────────────────
 //
@@ -45,8 +46,12 @@ const POLL_MS = 5_000
 const TICK_MS = 250
 /** Ceiling for retry backoff when the runtime simply is not usable yet. */
 const MAX_BACKOFF_MS = 5 * 60_000
-/** While another daemon serves this agent: how often to look whether it still does. */
+/** While another daemon serves this agent: how often to look whether it still does (and rewrite the status file, so it never reads as a daemon that is down). */
 const STANDBY_POLL_MS = 30_000
+/** After giving the agent up because this home could not serve it: when to check again (the runtime; then the lease). */
+const UNSERVABLE_RECHECK_MS = 60_000
+/** A home whose key the server refused tries again this much later (a new hello with the same key). */
+const BLOCKED_RETRY_MS = 5 * 60_000
 /**
  * How long a shutdown waits for an interrupted run to end before the process
  * exits. The runner SIGTERMs the run's process group at once and SIGKILLs 5 s
@@ -96,6 +101,10 @@ export interface RunIntegrationOpts {
   standbyPollMs?: number
   /** Test seam: `IntegrationOptions.runtimeRecheckMs`. */
   runtimeRecheckMs?: number
+  /** Test seam: after giving the agent up, when to look again (60 s; 5 min after a refused key). */
+  unservableRecheckMs?: number
+  /** Test seam: the agent and home leases' timing (`LeaseOptions`). */
+  lease?: LeaseOptions
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
@@ -132,8 +141,17 @@ function boundDaemonLog(home: string): void {
   }
 }
 
-/** The agent is served by another daemon: not a failure, no backoff. */
+/** The agent is served by another daemon (or this home waits to serve again): not a failure, no backoff. */
 class StandbyError extends Error {}
+
+/** A home that gave its agent up because it could not serve it, and when it looks again. */
+interface Unservable {
+  readonly reason: string
+  readonly retryAt: number
+  readonly runsFailing: IntegrationRunsFailing | null
+  /** The server refused the key (else: runs were failing). */
+  readonly blocked: boolean
+}
 
 /**
  * Run the integration daemon. Returns only on a condition that makes running
@@ -153,9 +171,15 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
   if (process.env['AGENTCHAT_LOG_LEVEL'] === undefined) process.env['AGENTCHAT_LOG_LEVEL'] = 'info'
 
   // Taken for the PROCESS, not for a connection: one resident daemon per
-  // identity home, signed in or not.
-  const lock = acquireLeaderLock(home)
+  // identity home, signed in or not. A lease: should another daemon ever take
+  // it (this one stalled past the lease), this one stands down and exits.
+  const lock = await acquireLeaderLock(home, opts.lease ?? {})
   if (lock === null) return 1
+  let homeLost: string | null = null
+  lock.onLost((why) => {
+    homeLost = why
+    log.error(`lost this home's daemon lock (${why}) — another daemon serves ${home} now; this one exits`)
+  })
 
   const envKey = opts.credentialsFromHomeOnly !== true
   const identityOf = () => resolveIdentity(home, { envKey })
@@ -169,12 +193,21 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
   let lastFailure: string | null = null
   let shuttingDown = false
   /** The agent lock (one agent, one listener), held for as long as an integration is live. */
-  let agentLock: HeldLock | null = null
+  let agentLock: Lease | null = null
+  /** Set by the lease when a renewal finds it no longer this process's: stand down at once. */
+  let agentLost: string | null = null
   /** Another daemon serves this agent: who, for status. */
   let standby: IntegrationStandby | null = null
+  /** This home gave the agent up because it could not serve it; when to look again. */
+  let unservable: Unservable | null = null
+  /** The runner the last integration used: what checks the runtime while this home waits to serve again. */
+  let lastRunner: RunRunner | null = null
+  /** The resolved identity for the current credential: an env-key standby does not ask /v1/agents/me on every poll. */
+  let cachedCfg: { fp: string; cfg: DaemonConfig } | null = null
   const releaseAgent = (): void => {
     agentLock?.release()
     agentLock = null
+    agentLost = null
   }
 
   const offStatus = (handle: string | null): void =>
@@ -202,6 +235,7 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
       last_error: lastFailure,
       texts: null,
       standby,
+      runs_failing: unservable?.runsFailing ?? null,
     })
 
   const disconnect = (why: string): void => {
@@ -262,12 +296,15 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
     if (shuttingDown || opts.signal?.aborted) break
     const fp = fingerprint(home, envKey)
     const identityChanged = fp !== observedFingerprint
+    if (homeLost !== null) break
     if (identityChanged) {
       disconnect(fp === null ? 'signed out' : 'identity changed')
       observedFingerprint = fp
       failures = 0
       lastFailure = null
       standby = null
+      unservable = null
+      cachedCfg = null
       if (fp === null || disabled) offStatus(fp === null ? null : identityOf()?.handle ?? null)
     }
 
@@ -275,29 +312,65 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
       // Signed out, or never signed in. Idle.
     } else if (disabled) {
       // Signed in, switched off. Resident, silent.
-    } else if (fp !== liveFingerprint) {
+    } else if (live !== null && fp === liveFingerprint) {
+      // Serving. Stand down at once if the agent lock is no longer ours, and
+      // give the agent up while this home cannot serve it — so a healthy
+      // listener for the same agent (a standby) can take over.
+      const health = live.health()
+      if (agentLost !== null) {
+        const why = agentLost
+        disconnect(`the agent lock is no longer this home's (${why})`)
+        lastFailure = `@${cachedCfg?.cfg.handle ?? '?'}: ${why}; another listener serves this agent now`
+      } else if (!health.ok) {
+        const handle = cachedCfg?.cfg.handle ?? '?'
+        const blocked = health.runsFailing === null
+        const retryMs = opts.unservableRecheckMs ?? (blocked ? BLOCKED_RETRY_MS : UNSERVABLE_RECHECK_MS)
+        unservable = { reason: health.reason, retryAt: Date.now() + retryMs, runsFailing: health.runsFailing, blocked }
+        disconnect(`this home cannot serve @${handle} (${health.reason}): giving it up so a healthy listener can`)
+        lastFailure = `this home cannot serve @${handle}: ${health.reason}. It holds no socket and starts no run until that is fixed (checked again every ${Math.round(retryMs / 1000)} s); another listener for @${handle} may serve it meanwhile.`
+        log.warn(lastFailure)
+        offStatus(handle)
+      }
+    } else if (live === null) {
       try {
-        const cfg = await resolveDaemonConfig({ home, workdir, client: opts.client, envKey })
+        // Not before its time: a home that gave the agent up retries on its own clock.
+        if (unservable !== null && Date.now() < unservable.retryAt) throw new StandbyError(unservable.reason)
+        const waiting: Unservable | null = unservable
+        if (waiting !== null && !waiting.blocked && lastRunner !== null) {
+          // Runs were failing: the runtime must check out before this home asks for the agent again.
+          const pre = await lastRunner.preflight()
+          if (!pre.ok) {
+            const next: Unservable = { ...waiting, retryAt: Date.now() + (opts.unservableRecheckMs ?? UNSERVABLE_RECHECK_MS), reason: `runs failing: ${lastRunner.name}: ${pre.detail ?? 'its check failed'}` }
+            unservable = next
+            throw new StandbyError(next.reason)
+          }
+        }
+        if (cachedCfg === null || cachedCfg.fp !== fp) cachedCfg = { fp, cfg: await resolveDaemonConfig({ home, workdir, client: opts.client, envKey }) }
+        const cfg = cachedCfg.cfg
         // One agent, one listener: a daemon in another home that already
         // serves this agent keeps it; this one stands by (no socket, no run)
-        // and takes over when that one stops (its lock goes stale).
-        // The process's own environment decides the lock folder (a service and a
-        // shell agree on it); the switches `env` carries do not move it.
-        const attempt = acquireAgentLock({ apiBase: cfg.apiBase, handle: cfg.handle, home }, { ...process.env, ...env })
+        // and takes over when that one stops or gives it up. The lock folder
+        // comes from the process environment only: a service and a shell for
+        // the same user agree on it, whatever switches `env` carries.
+        const attempt = await acquireAgentLock({ apiBase: cfg.apiBase, handle: cfg.handle, home }, process.env, opts.lease ?? {})
         if (!attempt.ok) {
           const msg = agentLockRefusal({ handle: cfg.handle, home }, attempt.holder, attempt.path)
           standby = { home: attempt.holder?.home ?? null, pid: attempt.holder?.pid ?? null, since: attempt.holder?.acquired_at ?? null }
-          if (msg !== lastFailure) {
-            log.warn(msg)
-            lastFailure = msg
-            offStatus(cfg.handle)
-          }
+          if (msg !== lastFailure) log.warn(msg)
+          lastFailure = msg
           throw new StandbyError(msg)
         }
         if (standby !== null) log.info(`@${cfg.handle}: the other listener stopped; this one serves the agent now`)
+        if (unservable !== null) log.info(`@${cfg.handle}: this home can serve again; it holds the agent now`)
         standby = null
-        agentLock = attempt.lock
+        unservable = null
+        agentLock = attempt.lease
+        attempt.lease.onLost((why) => {
+          agentLost = why
+          nudged = true
+        })
         const runner = isRunnerFactory(opts.runner) ? opts.runner.create(cfg) : opts.runner
+        lastRunner = runner
         const candidate = new Integration({
           cfg,
           runner,
@@ -318,7 +391,11 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
         releaseAgent()
         live = null
         liveFingerprint = null
-        if (!(err instanceof StandbyError)) {
+        if (err instanceof StandbyError) {
+          // Standing by, or waiting to serve again: the status file is rewritten
+          // every poll, so `status` never reads it as a daemon that is down.
+          offStatus(cachedCfg?.cfg.handle ?? identityOf()?.handle ?? null)
+        } else {
           // Runtime not ready (host CLI missing or not signed in), network
           // down, whatever. Stay resident and try again later — exiting would
           // just make the service manager restart us in a loop. Backed off and
@@ -339,7 +416,7 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
     // sign-in connects in well under a second. Exponential backoff while a
     // start keeps failing, capped — the watcher still wakes us instantly when
     // credentials change, so backing off never delays a real sign-in.
-    const waitMs = standby !== null ? (opts.standbyPollMs ?? STANDBY_POLL_MS) : failures === 0 ? POLL_MS : Math.min(POLL_MS * 2 ** Math.min(failures, 6), MAX_BACKOFF_MS)
+    const waitMs = standby !== null || unservable !== null ? (opts.standbyPollMs ?? STANDBY_POLL_MS) : failures === 0 ? POLL_MS : Math.min(POLL_MS * 2 ** Math.min(failures, 6), MAX_BACKOFF_MS)
     nudged = false
     const deadline = Date.now() + waitMs
     while (!nudged && !shuttingDown && !opts.signal?.aborted && Date.now() < deadline) {
@@ -357,6 +434,7 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
   releaseAgent()
   idle(home)
   lock.release()
+  if (homeLost !== null) return 1
   if (shuttingDown) {
     log.info('shutdown complete')
     ;(opts.exit ?? process.exit)(0)

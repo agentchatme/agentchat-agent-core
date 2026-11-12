@@ -30,6 +30,8 @@ export {
   claudeUserStatePathFor,
   buildClaudeEnv,
   claudeIsLoggedIn,
+  claudeSignIn,
+  type ClaudeSignIn,
   inspectClaudeRuntime,
   deniedAncestorOf,
   claudeProfileArgs,

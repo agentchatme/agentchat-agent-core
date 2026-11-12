@@ -173,6 +173,8 @@ export class Integration {
   private runsFailing: IntegrationRunsFailing | null = null
   private lastRecheckAt = 0
   private recheckInFlight: Promise<void> | null = null
+  /** Aborts a runtime check in flight when the integration stops (its probes are killed, not left running). */
+  private readonly recheckAbort = new AbortController()
   private stopping = false
   private stopped: Promise<void> | null = null
 
@@ -314,7 +316,8 @@ export class Integration {
     this.stopping = true
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer)
     if (this.statusTimer) clearInterval(this.statusTimer)
-    this.stopped = this.loop.stop()
+    this.recheckAbort.abort()
+    this.stopped = Promise.all([this.loop.stop(), this.recheckInFlight ?? Promise.resolve()]).then(() => undefined)
     this.texts.stop()
     this.manual?.stop()
     this.socket = 'closed'
@@ -493,6 +496,8 @@ export class Integration {
       this.failingSince = null
       this.failingRuns = 0
       this.runsFailing = null
+      // A new failure after a good run is a new problem: checked at once, not after the old window.
+      this.lastRecheckAt = 0
       return
     }
     this.failingSince ??= endedAt
@@ -508,7 +513,7 @@ export class Integration {
 
   private async recheckRuntime(): Promise<void> {
     this.lastRecheckAt = Date.now()
-    const pre = await withDeadline(this.options.runner.preflight(), PREFLIGHT_DEADLINE_MS, () => ({
+    const pre = await withDeadline(this.options.runner.preflight({ signal: this.recheckAbort.signal }), PREFLIGHT_DEADLINE_MS, () => ({
       ok: false,
       detail: `preflight did not answer within ${Math.round(PREFLIGHT_DEADLINE_MS / 1000)} s`,
     })).catch((err: unknown) => ({ ok: false, detail: `preflight threw: ${err instanceof Error ? err.message : String(err)}` }))
@@ -528,6 +533,18 @@ export class Integration {
       }
     }
     this.writeStatus()
+  }
+
+  /**
+   * Whether this integration can serve its agent: not while the server refuses
+   * its key (socket `blocked`: rotated by `recover` elsewhere, revoked), nor
+   * while runs fail for a runtime reason (`runs_failing`). The supervisor then
+   * gives the agent up so a healthy listener for it can serve.
+   */
+  health(): { ok: true } | { ok: false; reason: string; runsFailing: IntegrationRunsFailing | null } {
+    if (this.socket === 'blocked') return { ok: false, reason: `the server refuses this home's key${this.lastError ? ` (${this.lastError})` : ''}`, runsFailing: null }
+    if (this.runsFailing !== null) return { ok: false, reason: `runs failing: ${this.runsFailing.reason}`, runsFailing: this.runsFailing }
+    return { ok: true }
   }
 
   /** Test seam: resolves when a runtime check started by a failed run has finished. */

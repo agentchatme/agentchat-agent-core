@@ -137,15 +137,21 @@ A run is classified `ok` (exit 0), `timed_out` (killed past its budget), `failed
 
 ### One agent, one listener
 
-Two identity homes can hold the same agent's key: a CLI listener's home and an integration's, say. If both held a socket, every message would be answered twice. So the first daemon to start for an agent holds its **agent lock**, and any other daemon for that agent holds no socket and starts no run. `status` names the home that serves the agent (`standby`, and the last error), `doctor` warns, and the standby daemon takes over when that one stops.
+Two identity homes can hold the same agent's key: a CLI listener's home and an integration's, say. If both held a socket, every message would be answered twice. So the first daemon to start for an agent holds its **agent lock**, and any other daemon for that agent holds no socket and starts no run. `status` names the home that serves the agent (`standby`, rewritten every poll), `doctor` warns, and the standby takes over when that one stops.
+
+**A holder that cannot serve gives the agent up**, so a healthy standby can take over. That is the case when the server refuses its key (socket `blocked`, a key rotated by `recover` in another home) or when runs fail for a runtime reason (`runs_failing`). It holds no socket meanwhile and checks again: every 60 s after failing runs (the runtime first), every 5 min after a refused key. It serves again when it is healthy and the lock is free.
 
 - **Where the lock lives:** one file per agent, `agent-<32 hex>.lock`, named by a hash of the API origin and the agent's handle (never the key). The folder is per user and owner-only, derived from the home folder alone so that a service and a shell agree on it:
   - macOS: `~/Library/Application Support/AgentChat/locks`
   - Windows: `%USERPROFILE%\AppData\Local\AgentChat\locks`
   - elsewhere: `~/.local/state/agentchat/locks`
-  - `AGENTCHAT_LOCK_DIR` overrides it, for tests and sandboxes. Two daemons given different folders do not see each other.
-- **How it is held:** the agent lock and each home's `daemon.lock` are created with O_EXCL. Each names its holder's pid and start time, so a reused pid is not mistaken for the holder.
-- **Stale locks:** a lock whose holder is gone is taken over atomically. Only the holder of a short-lived guard file may remove a stale lock, and no lock is ever overwritten in place.
+  - `AGENTCHAT_LOCK_DIR` in the process environment overrides it, for tests and sandboxes.
+- **A lease.** The agent lock and each home's `daemon.lock` are leases (`util/lease.ts`):
+  - **Format:** the first line is the holder's bare pid, so readers from before (the Windows service reinstall, a 0.4.x daemon) see the pid and refuse a live lock instead of stealing it. A line of JSON follows: token, host, home, `acquired_at`, `renewed_at`.
+  - **Created** with O_EXCL. The holder renews `renewed_at` every 10 s.
+  - **Gone:** a holder whose pid is dead on this host is gone at once. Anything else — a pid reused after a reboot, or one alive under another user (EPERM) — is gone when it has not renewed for 45 s. No process start-time probes (`ps`, PowerShell): time zones, DST and reboots cannot fool it.
+  - **Taking over** a stale lease, renewing one and releasing one all happen under a short O_EXCL guard. On every renewal the holder re-reads the file and stands down at once if it is no longer its own.
+- **Clock steps:** a backward step delays a takeover by at most the step. A forward step can let a contender take a live lease; the old holder's next renewal (≤ 10 s) then finds it is not its own and stands down, so at most one renewal of overlap.
 - **Limit:** two different OS users holding one agent's key do not see each other.
 
 ### When runs keep failing
