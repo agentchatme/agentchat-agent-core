@@ -356,9 +356,9 @@ export function formatIntegrationStatus(status: IntegrationStatus | null, now = 
     }`,
     ...(unservable !== null
       ? [
-          `  gave up: ${unservable.reason === 'key_refused' ? 'the server refuses this home\'s key' : 'runs fail for a runtime reason, and another listener for the agent was waiting'} — ${unservable.detail} (since ${unservable.since}). No socket, no run here; checked again at ${unservable.retry_at}${
-            unservable.reason === 'runs_failing' ? ' (the runtime first)' : ''
-          }; it serves again when that passes and no other listener holds the agent.`,
+          `  gave up: ${unservable.reason === 'key_refused' ? 'the server refuses this home\'s key' : 'runs fail for a runtime reason, and another listener for the agent was waiting'} — ${unservable.detail} (since ${unservable.since}). No socket, no run here while another listener can serve it; looks again at ${unservable.retry_at}${
+            unservable.reason === 'runs_failing' ? ' (the runtime checked first: a check that passes clears this)' : ' (signing in again here clears this at once)'
+          }, and takes the agent back whenever no other listener holds it.`,
         ]
       : []),
     ...(standby !== null

@@ -924,8 +924,8 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
         verdict: 'FAIL',
         detail:
           gaveUp.reason === 'key_refused'
-            ? `this home gave the agent up: the server refuses its key (${gaveUp.detail}); it tries again at ${gaveUp.retry_at} (every 5 min) and serves again once the key is accepted and no other listener holds the agent — sign in again here (login/recover), or log out if another home serves it`
-            : `this home gave the agent up: ${gaveUp.detail} (since ${gaveUp.since}); its runtime is checked again at ${gaveUp.retry_at} (every 60 s) and it serves again when that check passes and no other listener holds the agent`,
+            ? `this home gave the agent up: the server refuses its key (${gaveUp.detail}); it looks again at ${gaveUp.retry_at} (every 5 min) and takes the agent back whenever no other listener holds it, but only a key the server accepts can serve — sign in again here (login/recover; that clears this at once), or log out if another home serves the agent`
+            : `this home gave the agent up: ${gaveUp.detail} (since ${gaveUp.since}); its runtime is checked again at ${gaveUp.retry_at} (every 60 s) and a check that passes clears this; it takes the agent back whenever no other listener holds it`,
       })
     } else if (runsFailing !== null) {
       checks.push({

@@ -97,6 +97,8 @@ export interface RunIntegrationOpts {
   credentialsFromHomeOnly?: boolean
   /** See `IntegrationOptions.dismissIgnoredInvites` (default true). */
   dismissIgnoredInvites?: boolean
+  /** Test seam: while serving, how often to look again (5 s; the backoff after failed starts grows from it). */
+  pollMs?: number
   /** Test seam: while another daemon serves this agent, how often to look again (30 s). */
   standbyPollMs?: number
   /** Test seam: `IntegrationOptions.runtimeRecheckMs`. */
@@ -355,7 +357,7 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
           const retryMs = opts.unservableRecheckMs ?? (kind === 'key_refused' ? BLOCKED_RETRY_MS : UNSERVABLE_RECHECK_MS)
           unservable = { kind, detail: health.reason, since: new Date().toISOString(), retryAt: Date.now() + retryMs, runsFailing: health.runsFailing }
           disconnect(`this home cannot serve @${handle} (${health.reason}): giving it up to ${kind === 'key_refused' ? 'any healthy listener' : 'the healthy listener waiting for it'}`)
-          lastFailure = `this home cannot serve @${handle}: ${health.reason}. It holds no socket and starts no run; ${kind === 'runs_failing' ? 'the runtime is' : 'the key is'} checked again every ${Math.round(retryMs / 1000)} s, and it serves again when that passes and no other listener holds @${handle}.`
+          lastFailure = `this home cannot serve @${handle}: ${health.reason}. It holds no socket and starts no run while another listener can serve @${handle}; it looks again every ${Math.round(retryMs / 1000)} s${kind === 'runs_failing' ? ' (the runtime checked first: a check that passes clears this)' : ' (signing in again here clears this at once)'}, and takes @${handle} back whenever no other listener holds it.`
           log.warn(lastFailure)
           offStatus(handle)
         }
@@ -459,7 +461,8 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
     // sign-in connects in well under a second. Exponential backoff while a
     // start keeps failing, capped — the watcher still wakes us instantly when
     // credentials change, so backing off never delays a real sign-in.
-    const waitMs = homeLost !== null ? 0 : standby !== null || unservable !== null ? (opts.standbyPollMs ?? STANDBY_POLL_MS) : failures === 0 ? POLL_MS : Math.min(POLL_MS * 2 ** Math.min(failures, 6), MAX_BACKOFF_MS)
+    const pollMs = opts.pollMs ?? POLL_MS
+    const waitMs = homeLost !== null ? 0 : standby !== null || unservable !== null ? (opts.standbyPollMs ?? STANDBY_POLL_MS) : failures === 0 ? pollMs : Math.min(pollMs * 2 ** Math.min(failures, 6), MAX_BACKOFF_MS)
     nudged = false
     const deadline = Date.now() + waitMs
     while (!nudged && !shuttingDown && !opts.signal?.aborted && Date.now() < deadline) {

@@ -545,7 +545,8 @@ describe('one agent, one listener: the supervisor', () => {
     const home1 = path.join(sandbox, 'lone-home')
     signIn(home1, KEY, double.apiBase)
     const broken = new ScriptedRunner({ state: 'ok', exitCode: 0, durationMs: 1 }, { ok: true })
-    const a = daemon(home1, broken, { runtimeRecheckMs: 50 })
+    // The supervisor looks every 200 ms here, so the wait below spans several of its health checks.
+    const a = daemon(home1, broken, { runtimeRecheckMs: 50, pollMs: 200 })
     try {
       await until(() => readIntegrationStatus(home1)?.socket === 'ready', 10_000)
       // Markers of standbys that are not there: one whose process died, one that stopped renewing it. Nobody waits.
@@ -558,6 +559,7 @@ describe('one agent, one listener: the supervisor', () => {
       marker('/crashed/standby', deadPid())
       const old = marker('/silent/standby', process.pid)
       fs.utimesSync(old, new Date(Date.now() - 120_000), new Date(Date.now() - 120_000))
+      const connections = double.served.length
       broken.outcome = { state: 'not_started', exitCode: 1, durationMs: 1, detail: 'Not logged in' }
       broken.check = { ok: false, detail: 'claude is not signed in (run `claude` once and sign in)' }
       double.send({ type: 'message.new', payload: { id: 'm1', conversation_id: 'conv_1', sender: 'peer', content: { text: 'x' } } })
@@ -565,10 +567,12 @@ describe('one agent, one listener: the supervisor', () => {
       const starts = broken.starts
       double.send({ type: 'message.new', payload: { id: 'm2', conversation_id: 'conv_1', sender: 'peer', content: { text: 'y' } } })
       await until(() => broken.starts > starts, 10_000)
-      await new Promise((r) => setTimeout(r, 600)) // several supervisor polls
+      await new Promise((r) => setTimeout(r, 1_500)) // several supervisor polls
       const status = readIntegrationStatus(home1)
       expect(status?.socket).toBe('ready')
       expect(status?.unservable ?? null).toBeNull()
+      // The socket was never dropped: no give-up and take-back, not even a brief one.
+      expect(double.served.length).toBe(connections)
       expect(formatIntegrationStatus(status).join('\n')).toContain('the next run that succeeds clears this')
     } finally {
       await a.stop()
@@ -652,7 +656,8 @@ describe('one agent, one listener: the supervisor', () => {
     double = await startServerDouble({ tray: { waiting: 0 } })
     const home1 = path.join(sandbox, 'h-lost')
     signIn(home1, KEY, double.apiBase)
-    const a = daemon(home1, okRunner())
+    // A minute between polls: only the nudge can make the exit immediate.
+    const a = daemon(home1, okRunner(), { pollMs: 60_000 })
     await until(() => readIntegrationStatus(home1)?.socket === 'ready', 10_000)
     const other = sleeper()
     try {
@@ -936,13 +941,13 @@ describe('doctor says what clears a failing home: a run that succeeds, or (after
 
   it('gave up for failing runs: no run happens, so the runtime recheck (every 60 s) is what clears it', async () => {
     const out = await doctor(status({ socket: 'idle', runs_failing: failing, unservable: { reason: 'runs_failing', detail: 'runs failing: claude: claude is not signed in', since: at, retry_at: at } }))
-    expect(out).toMatch(/FAIL runs: this home gave the agent up: runs failing: claude: claude is not signed in .*checked again at .* \(every 60 s\)/)
+    expect(out).toMatch(/FAIL runs: this home gave the agent up: runs failing: claude: claude is not signed in .*checked again at .* \(every 60 s\) and a check that passes clears this/)
     expect(out).not.toContain('the next run that succeeds')
   })
 
   it('gave up for a refused key: tried again every 5 min; sign in again, or log out', async () => {
     const out = await doctor(status({ socket: 'idle', unservable: { reason: 'key_refused', detail: "the server refuses this home's key", since: at, retry_at: at } }))
-    expect(out).toMatch(/FAIL runs: this home gave the agent up: the server refuses its key .*\(every 5 min\).*sign in again here/)
+    expect(out).toMatch(/FAIL runs: this home gave the agent up: the server refuses its key .*\(every 5 min\).*sign in again here \(login\/recover; that clears this at once\)/)
     expect(out).not.toContain('the next run that succeeds')
   })
 })
@@ -1024,8 +1029,9 @@ describe('a probe that hangs is killed with everything it started, and answers',
         await until(() => fs.existsSync(pids), 60_000)
         stop.abort()
         const answer = await pending
+        // Said as stopped — never as a runtime missing from PATH or a user signed out.
         if ('signedIn' in answer) expect(answer).toEqual({ signedIn: false, unanswered: 'claude auth status was stopped' })
-        else expect(answer).toMatchObject({ ok: false, detail: expect.stringMatching(/was stopped/) })
+        else expect(answer).toEqual({ ok: false, detail: `${label} was stopped` })
         await expectGone(pids)
       } finally {
         delete process.env['FAKE_RUNTIME_PROBE_HANG']
