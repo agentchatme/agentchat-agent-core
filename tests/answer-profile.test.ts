@@ -4,12 +4,16 @@ import * as os from 'node:os'
 import * as path from 'node:path'
 import {
   ANSWER_SETTINGS,
+  CODEX_ANSWER_DISABLED_FEATURES,
   claudeCodePreset,
   claudeRunArgs,
+  codexPreset,
+  codexRunArgs,
+  LISTENER_KEY_ENV,
   workdirPaths,
   workdirReadRules,
 } from '../src/presets/index.js'
-import { installFakeClaude, readFakeRuns } from './helpers/fake-runtimes.js'
+import { installFakeClaude, installFakeCodex, readFakeRuns } from './helpers/fake-runtimes.js'
 
 // ─── The `answer` profile: what a peer-started run can reach ────────────────
 //
@@ -200,4 +204,105 @@ describe.skipIf(posix)('Claude Code answer on Windows', () => {
     expect(workdirReadRules('C:\\w')).toEqual([])
     assertClaudeAnswerIsConfined(claudeRunArgs('answer', { workdir: 'C:\\w' }), [])
   })
+})
+
+// ─── Codex `answer` ─────────────────────────────────────────────────────────
+//
+// Codex can restrict a sandbox's reads, but a shell needs `:minimal`, which also
+// opens /etc, /usr and read-write /tmp; so `answer` has no shell and no
+// local-file tool at all, and the sandbox (for apply_patch, which has no off
+// switch) reads the workdir only and writes nothing.
+
+/** Every `-c` value of an argv, in order. */
+function configOf(argv: readonly string[]): string[] {
+  return argv.flatMap((arg, i) => (argv[i - 1] === '-c' ? [arg] : []))
+}
+
+/** Every `--disable` feature of an argv. */
+function disabledOf(argv: readonly string[]): string[] {
+  return argv.flatMap((arg, i) => (argv[i - 1] === '--disable' ? [arg] : []))
+}
+
+function assertCodexAnswerIsConfined(argv: readonly string[], workdir: string): void {
+  // No legacy sandbox mode: `--sandbox read-only` reads the whole disk ($CODEX_HOME/.env included).
+  expect(argv).not.toContain('--sandbox')
+  expect(argv).not.toContain('-s')
+  expect(argv).not.toContain('--dangerously-bypass-approvals-and-sandbox')
+  expect(argv).not.toContain('--add-dir')
+  expect(argv).not.toContain('--enable')
+  expect(argv[argv.indexOf('-C') + 1]).toBe(workdir)
+  const config = configOf(argv)
+  expect(config).toContain('approval_policy="never"')
+  expect(config).not.toContain('approval_policy="on-request"')
+  expect(config.filter((c) => /^sandbox_mode\b|^sandbox_workspace_write\b|^features\./.test(c))).toEqual([])
+
+  // The shell, the local-file tools and every other way out are off.
+  const disabled = disabledOf(argv)
+  for (const feature of ['shell_tool', 'view_image', 'image_generation', 'plugins', 'apps', 'memories', 'browser_use', 'computer_use']) expect(disabled).toContain(feature)
+  expect(config).toContain('web_search="disabled"')
+  expect(config.filter((c) => c.startsWith('web_search=') || c.startsWith('tools.web_search'))).toEqual(['web_search="disabled"'])
+
+  // The one permission profile: read the workspace root, nothing else, no write, no network.
+  expect(config.filter((c) => c.startsWith('default_permissions='))).toEqual(['default_permissions="agentchat_answer"'])
+  expect(config.filter((c) => c.startsWith('permissions.'))).toEqual(['permissions.agentchat_answer.filesystem={ ":workspace_roots" = "read" }'])
+  for (const c of config) expect(c).not.toMatch(/":root"|":minimal"|"write"|network|danger-full-access|disk-full-read/)
+}
+
+describe('Codex answer: no shell, no local-file tool, AgentChat tools only (regression guard)', () => {
+  it('the argv never gains the shell, a whole-disk sandbox, the web or a local-file tool — with or without the hosted-server overrides', () => {
+    assertCodexAnswerIsConfined(codexRunArgs('answer', { workdir: '/w' }), '/w')
+    const listener = codexRunArgs('answer', { workdir: '/w', mcp: { url: 'https://api.example/mcp', keyEnv: LISTENER_KEY_ENV } })
+    assertCodexAnswerIsConfined(listener, '/w')
+    // The overrides touch only the agentchat server; the prompt stays the last positional.
+    expect(configOf(listener).filter((c) => c.startsWith('mcp_servers.')).every((c) => c.startsWith('mcp_servers.agentchat.'))).toBe(true)
+    expect(listener[listener.length - 1]).toBe('-')
+    expect([...CODEX_ANSWER_DISABLED_FEATURES]).toContain('shell_tool')
+  })
+
+  it('the guard itself trips on each way of re-opening the leak', () => {
+    const good = codexRunArgs('answer', { workdir: '/w' })
+    const without = (value: string): string[] => {
+      const at = good.indexOf(value)
+      return [...good.slice(0, at - 1), ...good.slice(at + 1)]
+    }
+    const bad = [
+      ['--sandbox', 'read-only', ...good],
+      [...good.slice(0, -1), '--dangerously-bypass-approvals-and-sandbox', '-'],
+      without('shell_tool'),
+      without('view_image'),
+      without('web_search="disabled"'),
+      without('default_permissions="agentchat_answer"'),
+      [...good.slice(0, -1), '-c', 'web_search="live"', '-'],
+      [...good.slice(0, -1), '-c', 'features.shell_tool=true', '-'],
+      [...good.slice(0, -1), '--enable', 'shell_tool', '-'],
+      good.map((a) => (a === 'permissions.agentchat_answer.filesystem={ ":workspace_roots" = "read" }' ? 'permissions.agentchat_answer.filesystem={ ":minimal" = "read", ":workspace_roots" = "read" }' : a)),
+      good.map((a) => (a === 'permissions.agentchat_answer.filesystem={ ":workspace_roots" = "read" }' ? 'permissions.agentchat_answer.filesystem={ ":root" = "read" }' : a)),
+      good.map((a) => (a === 'permissions.agentchat_answer.filesystem={ ":workspace_roots" = "read" }' ? 'permissions.agentchat_answer.filesystem={ ":workspace_roots" = "write" }' : a)),
+    ]
+    for (const argv of bad) expect(() => assertCodexAnswerIsConfined(argv, '/w')).toThrow()
+  })
+
+  it('the workdir is one argv element whatever it holds (spaces, a comma, a symlinked /tmp): never split, never quoted into a shell', () => {
+    for (const workdir of ['/tmp/a b/work', '/w,x', "/w'q\"x", path.join(sandbox, 'my work')]) {
+      const argv = codexRunArgs('answer', { workdir })
+      expect(argv[argv.indexOf('-C') + 1]).toBe(workdir)
+      assertCodexAnswerIsConfined(argv, workdir)
+      // The workdir appears exactly once: `:workspace_roots` names it, no rule repeats the path.
+      expect(argv.filter((a) => a.includes(workdir))).toEqual([workdir])
+    }
+  })
+
+  it('the preset runner (what the listener and the integration both start) passes the guard', async () => {
+    const fake = installFakeCodex(sandbox)
+    const env = { ...process.env, PATH: `${fake.binDir}${path.delimiter}${originalPath ?? ''}`, FAKE_RUNTIME_RECORD: fake.recordPath, CODEX_HOME: path.join(sandbox, '.codex') }
+    process.env['PATH'] = env['PATH']
+    const workdir = path.join(sandbox, 'work dir')
+    const runner = codexPreset.runner({ home: path.join(sandbox, 'home'), workdir, profile: 'answer', apiKey: KEY, apiBase: 'https://api.example', env })
+    expect(await runner.preflight()).toEqual({ ok: true })
+    expect((await runner.start({ kind: 'wake', prompt: 'WAKE', runId: 'r1', budgetMs: 20_000 })).state).toBe('ok')
+    const [run] = readFakeRuns(fake)
+    assertCodexAnswerIsConfined(run?.argv ?? [], workdir)
+    expect(JSON.stringify(run?.argv)).not.toContain(KEY)
+    expect(fs.realpathSync(run?.cwd ?? '')).toBe(fs.realpathSync(workdir))
+  }, 20_000)
 })

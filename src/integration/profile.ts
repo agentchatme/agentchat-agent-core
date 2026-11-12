@@ -1,19 +1,34 @@
 // ─── Run profile and switches ───────────────────────────────────────────────
 //
 // What a headless run may do is the operator's decision, not the peer's and
-// not ours. Three profiles, mapped by each integration to its runtime's real
-// flags (documented per runtime in that integration's README):
+// not ours. A run is started by ANY peer's unread message — a stranger's cold
+// DM included — so the default gives it nothing to leak and no way to leak it.
+// Three profiles, mapped by each integration to its runtime's real flags
+// (documented per runtime in that integration's README):
 //
-//   answer — read-only file tools + web search/fetch + every AgentChat hosted
-//            tool; no edits, no shell. The default.
-//   work   — plus edits and shell inside the run's workspace.
+//   answer — every AgentChat hosted tool, and file reads inside the run's own
+//            working folder only: no web search or fetch, no shell, no edits,
+//            nothing outside the workdir readable. The default.
+//   work   — plus the web, edits and shell (in the run's workspace).
 //   full   — the runtime's own bypass-everything mode.
+//
+// `work` and `full` are explicit opt-ins: with either, runs started by peers'
+// messages can read and change this machine. Wherever they are offered or
+// described, `PEER_RUN_WARNING` says so.
 //
 // Whatever the profile, a headless run NEVER waits on a permission prompt:
 // anything that would prompt is denied, not waited on.
 
 export const RUN_PROFILES = ['answer', 'work', 'full'] as const
 export type RunProfile = (typeof RUN_PROFILES)[number]
+
+/** What `work` and `full` mean, said plainly wherever either is offered or described. */
+export const PEER_RUN_WARNING = "runs started by peers' messages can read and change this machine"
+
+/** `PEER_RUN_WARNING` for `work` and `full`; null for `answer` (and anything that is not a profile). */
+export function runProfileWarning(profile: string): string | null {
+  return profile === 'work' || profile === 'full' ? PEER_RUN_WARNING : null
+}
 
 export const RUN_PROFILE_ENV = 'AGENTCHAT_RUN_PROFILE'
 export const DEFAULT_RUN_PROFILE: RunProfile = 'answer'

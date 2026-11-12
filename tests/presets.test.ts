@@ -103,10 +103,30 @@ describe('Claude Code flags (pinned: the integration and the listener share them
 })
 
 describe('Codex flags', () => {
-  it('answer, work, full', () => {
-    expect(codexRunArgs('answer', { workdir: '/w' })).toEqual(['exec', '--json', '--skip-git-repo-check', '--ephemeral', '-C', '/w', '--sandbox', 'read-only', '-c', 'approval_policy="never"', '-'])
-    expect(codexRunArgs('work', { workdir: '/w' })).toContain('workspace-write')
-    expect(codexRunArgs('full', { workdir: '/w' })).toContain('--dangerously-bypass-approvals-and-sandbox')
+  it('answer: no shell, no local-file tool, no web; the sandbox reads the workdir only and writes nothing', () => {
+    expect(codexRunArgs('answer', { workdir: '/w' })).toEqual([
+      'exec', '--json', '--skip-git-repo-check', '--ephemeral', '-C', '/w',
+      '-c', 'approval_policy="never"',
+      '-c', 'default_permissions="agentchat_answer"',
+      '-c', 'permissions.agentchat_answer.filesystem={ ":workspace_roots" = "read" }',
+      '-c', 'web_search="disabled"',
+      '--disable', 'shell_tool',
+      '--disable', 'view_image',
+      '--disable', 'image_generation',
+      '--disable', 'plugins',
+      '--disable', 'apps',
+      '--disable', 'memories',
+      '--disable', 'browser_use',
+      '--disable', 'browser_use_external',
+      '--disable', 'computer_use',
+      '--disable', 'in_app_browser',
+      '-',
+    ])
+  })
+
+  it('work and full are unchanged (the operator\'s explicit opt-in)', () => {
+    expect(codexRunArgs('work', { workdir: '/w' })).toEqual(['exec', '--json', '--skip-git-repo-check', '--ephemeral', '-C', '/w', '--sandbox', 'workspace-write', '-c', 'approval_policy="never"', '-'])
+    expect(codexRunArgs('full', { workdir: '/w' })).toEqual(['exec', '--json', '--skip-git-repo-check', '--ephemeral', '-C', '/w', '--dangerously-bypass-approvals-and-sandbox', '-'])
   })
 
   it('the hosted-server overrides name the key variable, never the key; the prompt stays the last positional', () => {

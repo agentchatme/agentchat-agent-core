@@ -39,7 +39,44 @@ import { withoutInheritedKey, type Preset, type PresetContext, type PresetInspec
 // The hosted AgentChat tools reach the run through `[mcp_servers.agentchat]`
 // (bearer token from an environment variable named in the config, never the
 // key itself), with `default_tools_approval_mode = "approve"` so they never
-// prompt. Web search follows the user's own `web_search` setting.
+// prompt (with `approval_policy = "never"`, an MCP tool call that needs
+// approval is denied: codex-rs/core/src/mcp_tool_call.rs).
+//
+// `answer` — started by any peer's message — must read nothing outside its
+// workdir and have no way out but the AgentChat tools. Codex can restrict a
+// sandbox's READS (a permission profile: `default_permissions` +
+// `[permissions.<name>.filesystem]`), but a shell needs `":minimal"` to run at
+// all, and on macOS that also opens /etc, /usr, /Library/Preferences and, for
+// the shell process, read-write /tmp and /var/tmp
+// (codex-rs/sandboxing/src/seatbelt_read_only_platform_defaults.sbpl,
+// seatbelt.rs:27-33; on Linux /etc, /usr, /bin, … in linux-sandbox/src/bwrap.rs).
+// So `answer` has NO shell and no local-file tool (verified against the
+// openai/codex sources at rust-v0.154.0):
+//
+//   --disable shell_tool            no exec_command / write_stdin
+//                                   (core/src/tools/spec_plan.rs:1083-1088;
+//                                   `unified_exec` cannot be turned off by user
+//                                   config, but it is registered only past
+//                                   this check)
+//   --disable view_image, image_generation
+//                                   the image tools that read local files
+//   --disable plugins, apps         plugin-bundled MCP servers and skills (a
+//                                   computer-use server among them) and the
+//                                   ChatGPT connectors (`codex_apps`)
+//   --disable memories              the local memory store in CODEX_HOME
+//   --disable browser_use, browser_use_external, computer_use, in_app_browser
+//                                   no tool of their own in 0.154.0; off so a
+//                                   later build cannot add one to `answer`
+//   -c web_search="disabled"        the hosted web search (the top-level key;
+//                                   `tools.web_search=false` is parsed and
+//                                   ignored, config_toml.rs:655-670)
+//   -c default_permissions=… + -c permissions.<name>.filesystem={ ":workspace_roots" = "read" }
+//                                   for what cannot be turned off: apply_patch
+//                                   (no feature flag) reads through the sandbox,
+//                                   so it reads only the workdir (`-C`), writes
+//                                   nothing; no network. Replaces
+//                                   `--sandbox read-only`, which reads the whole
+//                                   disk ($CODEX_HOME/.env included).
 
 export const CODEX_PRESET = 'codex'
 
@@ -98,10 +135,46 @@ export function codexIsLoggedIn(codexHome: string, command = 'codex'): PresetIns
   return status.status === 0 ? { ok: true, detail: detail || 'signed in' } : { ok: false, detail: detail || 'codex is not signed in (run `codex login`)' }
 }
 
+/** The permission profile an `answer` run is given: its own name, so a user's profiles are never selected. */
+export const CODEX_ANSWER_PERMISSIONS = 'agentchat_answer'
+
+/** Its filesystem table: read the workspace root (the `-C` workdir) and nothing else; no write anywhere. */
+export const CODEX_ANSWER_FILESYSTEM = '{ ":workspace_roots" = "read" }'
+
+/**
+ * Codex features an `answer` run turns off: every model-visible tool that runs
+ * a command, reads a local file or reaches out beside the hosted AgentChat
+ * tools (see the header). Names as `codex features list` prints them (0.154.0).
+ */
+export const CODEX_ANSWER_DISABLED_FEATURES = [
+  'shell_tool',
+  'view_image',
+  'image_generation',
+  'plugins',
+  'apps',
+  'memories',
+  'browser_use',
+  'browser_use_external',
+  'computer_use',
+  'in_app_browser',
+] as const
+
 export function codexProfileArgs(profile: RunProfile): string[] {
   switch (profile) {
     case 'answer':
-      return ['--sandbox', 'read-only', '-c', 'approval_policy="never"']
+      return [
+        '-c',
+        'approval_policy="never"',
+        '-c',
+        `default_permissions="${CODEX_ANSWER_PERMISSIONS}"`,
+        '-c',
+        `permissions.${CODEX_ANSWER_PERMISSIONS}.filesystem=${CODEX_ANSWER_FILESYSTEM}`,
+        '-c',
+        'web_search="disabled"',
+        ...CODEX_ANSWER_DISABLED_FEATURES.flatMap((feature) => ['--disable', feature]),
+      ]
+    // `work` and `full` are the operator's explicit opt-in: a run started by
+    // any peer's message can then read and change this machine.
     case 'work':
       return ['--sandbox', 'workspace-write', '-c', 'approval_policy="never"']
     case 'full':
@@ -271,8 +344,9 @@ export const codexPreset: Preset = {
   },
   label: 'Codex',
   runtime: 'codex',
-  // A read-only sandbox reads the whole filesystem.
   serviceEnv: ['CODEX_HOME'],
+  // `work` and `full` read the whole filesystem (an `answer` run reads only its
+  // workdir): true, because the field is one for every profile.
   readsIdentityHome: true,
   inspect(env = process.env, command = 'codex') {
     const home = codexHomeFrom(env)

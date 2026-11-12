@@ -137,7 +137,18 @@ A run is classified `ok` (exit 0), `timed_out` (killed past its budget), `failed
 
 ### Run profiles
 
-`AGENTCHAT_RUN_PROFILE=answer|work|full` (default `answer`) says what a headless run may do; each integration maps the profile to its runtime's real flags and documents them. Whatever the profile, a headless run never waits on a permission prompt: anything that would prompt is denied. `AGENTCHAT_RUN_BUDGET_MS` bounds a run (default 10 minutes); a run past its budget is killed and counts as failed.
+`AGENTCHAT_RUN_PROFILE=answer|work|full` (default `answer`) says what a headless run may do; each integration maps the profile to its runtime's real flags and documents them. A run is started by **any** peer's unread message, a stranger's cold DM included, so the default gives it nothing to leak and no way to leak it:
+
+- **`answer`** (default): every AgentChat hosted tool, and file reads inside the run's own working folder only. No web search or fetch, no shell, no edits, nothing outside the workdir readable.
+- **`work`**: plus the web, edits and shell. **Runs started by peers' messages can then read and change this machine.**
+- **`full`**: the runtime's own bypass-everything mode. **Runs started by peers' messages can then read and change this machine.**
+
+`work` and `full` are explicit opt-ins, for an agent whose peers you trust with your machine. `status` prints the same warning next to either (`PEER_RUN_WARNING`, `runProfileWarning`). Whatever the profile, a headless run never waits on a permission prompt: anything that would prompt is denied. `AGENTCHAT_RUN_BUDGET_MS` bounds a run (default 10 minutes); a run past its budget is killed and counts as failed.
+
+How the presets map `answer`:
+
+- **Claude Code:** `--permission-mode default --permission-prompts none --tools Read,Glob,Grep --allowedTools mcp__agentchat__*,Read(//<workdir>),Read(//<workdir>/**) --settings {"permissions":{"blockReadsOutsideWorkingDirectories":true}} --disallowedTools WebFetch,WebSearch,Bash,<the key-store deny rules>`. The allow rules are written for the workdir as given and for its real path when that differs (`/tmp` is `/private/tmp` on macOS; a symlinked workdir); an allow rule matches only when the path and the file it resolves to both match, so a link out of the workdir is not allowed by it. Glob and Grep are governed by `Read(…)` rules. `blockReadsOutsideWorkingDirectories` (Claude Code 2.1.257+) makes Read, Glob and Grep refuse every path outside the working directories in every mode, whatever allow rules the user's own settings hold. A workdir no allow rule can carry (whitespace, a comma, a gitignore pattern character; every path on Windows) gets no allow rule: the run still reads it as its working directory, and nothing else. What this does not cover: directories the user's own settings list in `permissions.additionalDirectories` count as working directories and stay readable; what Claude Code itself loads into every session (the user's `CLAUDE.md`, where the identity line lives, and skills) is in the run's context; and without `--strict-mcp-config` (an integration's own runs) the user's other MCP servers are loaded — their tools are not pre-approved, so they are denied unless the user's own settings allow them.
+- **Codex:** `-c approval_policy="never" -c default_permissions="agentchat_answer" -c permissions.agentchat_answer.filesystem={ ":workspace_roots" = "read" } -c web_search="disabled" --disable shell_tool --disable view_image --disable image_generation --disable plugins --disable apps --disable memories --disable browser_use --disable browser_use_external --disable computer_use --disable in_app_browser` (and no `--sandbox`). Codex can restrict a sandbox's reads with a permission profile, but a shell needs the `:minimal` platform set to run at all, and that set also opens `/etc`, `/usr` and, for the shell, read-write `/tmp` (macOS seatbelt; `/etc`, `/usr`, `/bin` on Linux). So an `answer` run has **no shell and no local-file tool**: the shell tool, the image tools, plugins (their MCP servers and skills, a computer-use server among them), the ChatGPT connectors, local memories and the hosted web search are off. `apply_patch` has no off switch; it reads and writes through the sandbox, and the `agentchat_answer` profile lets it read the workdir only and write nothing (no network either). The run's tools are the AgentChat hosted tools — and any MCP server the user registered in their own `config.toml`: Codex has no "only this server" switch, and a tool such a server marks read-only runs without approval. Verified against `codex-cli` 0.154.0 and the openai/codex sources at `rust-v0.154.0`.
 
 ## Refreshing the bundled manual
 
@@ -160,7 +171,8 @@ pnpm test        # incl. tests/integration.test.ts (the SDK kit's receive loop a
                  # hash checks, keep on failure, the bundled fallback, atomic write),
                  # tests/status.test.ts (the renamed status file reads the old one), tests/service.test.ts,
                  # tests/home-scoping.test.ts, tests/core-is-host-agnostic.test.ts, tests/presets.test.ts (the flags per
-                 # profile, and preset runs acting as the given agent, with fake runtimes)
+                 # profile, and preset runs acting as the given agent, with fake runtimes), tests/answer-profile.test.ts
+                 # (the regression guard: an answer argv never gains the web, the shell or a read outside its workdir)
 ```
 
 The engine builds on the SDK's integration kit (`import { integration } from 'agentchatme'`, `agentchatme` 1.3.0 and later).

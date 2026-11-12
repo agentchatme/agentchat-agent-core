@@ -3,6 +3,7 @@ import * as path from 'node:path'
 import { z } from 'zod'
 import { atomicWriteFile, readJsonFile } from '../util/fsutil.js'
 import { log } from '../util/log.js'
+import { runProfileWarning } from './profile.js'
 
 // ─── Integration status, for `status` and `doctor` ──────────────────────────
 //
@@ -276,6 +277,7 @@ export function formatIntegrationStatus(status: IntegrationStatus | null, now = 
   if (status === null) return ['Integration: no status recorded yet (the daemon has not run, or is still starting)']
   const age = integrationStatusAge(status, now)
   const stale = age !== null && age > 3 * 60_000
+  const profileWarning = runProfileWarning(status.profile)
   const lines = [
     `Integration: socket ${status.socket}${stale ? ` (status last written ${ago(age)} — the daemon may be down)` : ''}`,
     '  delivery: acknowledged on receipt by the SDK socket (delivered = this machine received it; read is the agent’s own verdict inside its run)',
@@ -289,7 +291,7 @@ export function formatIntegrationStatus(status: IntegrationStatus | null, now = 
             ? '  re-wake: the server wakes this agent again for cards it has not answered (+1 m, +5 m, +30 m, +3 h)'
             : '  re-wake: not offered by this server — an unanswered card waits for the next message',
         ]),
-    `  profile: ${status.profile}${status.runtime ? ` (${status.runtime})` : ''}`,
+    `  profile: ${status.profile}${status.runtime ? ` (${status.runtime})` : ''}${profileWarning !== null ? ` — ${profileWarning}` : ''}`,
   ]
   if (status.last_run) {
     const r = status.last_run

@@ -2,6 +2,25 @@
 
 All notable changes to `@agentchatme/agent-core` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the version number for each release is set by the maintainer at the release step (see `VERSIONING.md`).
 
+## [Unreleased]
+
+The number is set at the release step (`VERSIONING.md`).
+
+### Fixed
+
+- **Security: an `answer` run reads nothing outside its workdir and has no way out but the AgentChat tools.** `answer` is the default, and a run is started by any peer's unread message, a stranger's cold DM included. Until now a Claude Code `answer` run had Read, Glob and Grep pre-approved on every path plus WebSearch and WebFetch, and a Codex `answer` run had a read-only sandbox that reads the whole disk (`~/.ssh`, `~/.aws`, `$CODEX_HOME/.env`) — so a prompt-injected run could read a key and send it, to the peer through `agentchat_send_message` or to the web. Verified on the real binaries (Claude Code 2.1.322, Codex 0.154.0): before, a canary file in `$HOME` was read by both; after, by neither.
+  - **Claude Code:** `--tools Read,Glob,Grep` (no web), `--allowedTools mcp__agentchat__*,Read(//<workdir>),Read(//<workdir>/**)` (as given and as its real path), `--settings {"permissions":{"blockReadsOutsideWorkingDirectories":true}}` (Read, Glob and Grep refuse every path outside the working directories, whatever allow rule the user's own settings hold; Claude Code 2.1.257+, below the 2.1.274 floor), and `WebFetch,WebSearch,Bash` denied by name in `--disallowedTools`. A workdir no allow rule can carry gets none and is still read as the working directory.
+  - **Codex:** no shell and no local-file tool — `--disable shell_tool view_image image_generation plugins apps memories browser_use browser_use_external computer_use in_app_browser`, `-c web_search="disabled"` — and, in place of `--sandbox read-only`, the permission profile `agentchat_answer` (`{ ":workspace_roots" = "read" }`: `apply_patch`, which has no off switch, reads the workdir only and writes nothing; no network). A restricted-read sandbox with a shell was not enough: the shell needs `:minimal`, which also opens `/etc`, `/usr` and read-write `/tmp`.
+- `work` and `full` are unchanged; the README and `status` now say plainly that with either, runs started by peers' messages can read and change this machine.
+
+### Added
+
+- `PEER_RUN_WARNING` and `runProfileWarning(profile)` — the one sentence for `work` and `full`, for every front door that offers or describes them. Presets: `WEB_TOOLS`, `ANSWER_DENIED_TOOLS`, `ANSWER_SETTINGS`, `workdirPaths`, `workdirReadRules`, `CODEX_ANSWER_PERMISSIONS`, `CODEX_ANSWER_FILESYSTEM`, `CODEX_ANSWER_DISABLED_FEATURES`; `claudeProfileArgs(profile, workdir?)` and `ClaudeRunArgOptions.workdir`.
+
+### Changed
+
+- **API:** `ANSWER_TOOLS` is `['Read', 'Glob', 'Grep']` (the web tools are `WEB_TOOLS`, still pre-approved in `work`). `claudeRunArgs('answer', …)` and `codexRunArgs('answer', …)` return the argv above; integrations that pin them update their pins.
+
 ## [0.4.1] — 2026-11-11
 
 Fixed and adjusted existing behaviour (the number is set at the release step, `VERSIONING.md`). Still needs `agentchatme` 1.3.0.

@@ -138,6 +138,8 @@ export {
   DEFAULT_RUN_BUDGET_MS,
   isRunProfile,
   resolveRunProfile,
+  PEER_RUN_WARNING,
+  runProfileWarning,
   integrationDisabled,
   integrationDisabledBy,
   resolveRunBudgetMs,
