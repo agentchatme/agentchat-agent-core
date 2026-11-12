@@ -139,19 +139,23 @@ A run is classified `ok` (exit 0), `timed_out` (killed past its budget), `failed
 
 Two identity homes can hold the same agent's key: a CLI listener's home and an integration's, say. If both held a socket, every message would be answered twice. So the first daemon to start for an agent holds its **agent lock**, and any other daemon for that agent holds no socket and starts no run. `status` names the home that serves the agent (`standby`, rewritten every poll), `doctor` warns, and the standby takes over when that one stops.
 
-**A holder that cannot serve gives the agent up**, so a healthy standby can take over. That is the case when the server refuses its key (socket `blocked`, a key rotated by `recover` in another home) or when runs fail for a runtime reason (`runs_failing`). It holds no socket meanwhile and checks again: every 60 s after failing runs (the runtime first), every 5 min after a refused key. It serves again when it is healthy and the lock is free.
+**A holder that cannot serve gives the agent up.** If the server refuses its key (socket `blocked`, say a key rotated by `recover` in another home), it gives the agent up at once. If its runs fail for a runtime reason (`runs_failing`), it gives the agent up only when a healthy listener for the agent is actually waiting: a standby keeps a fresh marker beside the lease. A lone install keeps its socket: wakes keep arriving, are counted, and start runs, and the next run that succeeds clears it. A home that gave the agent up says so in status (`unservable`: `key_refused` or `runs_failing`, the detail, since, `retry_at`). It holds no socket and checks again: every 60 s after failing runs (the runtime first, within a deadline), every 5 min after a refused key. It serves again when that check passes and no other listener holds the agent.
 
 - **Where the lock lives:** one file per agent, `agent-<32 hex>.lock`, named by a hash of the API origin and the agent's handle (never the key). The folder is per user and owner-only, derived from the home folder alone so that a service and a shell agree on it:
   - macOS: `~/Library/Application Support/AgentChat/locks`
   - Windows: `%USERPROFILE%\AppData\Local\AgentChat\locks`
   - elsewhere: `~/.local/state/agentchat/locks`
   - `AGENTCHAT_LOCK_DIR` in the process environment overrides it, for tests and sandboxes.
-- **A lease.** The agent lock and each home's `daemon.lock` are leases (`util/lease.ts`):
+- **A lease.** The agent lock and each home's `daemon.lock` are leases (`util/lease.ts`).
   - **Format:** the first line is the holder's bare pid, so readers from before (the Windows service reinstall, a 0.4.x daemon) see the pid and refuse a live lock instead of stealing it. A line of JSON follows: token, host, home, `acquired_at`, `renewed_at`.
-  - **Created** with O_EXCL. The holder renews `renewed_at` every 10 s.
-  - **Gone:** a holder whose pid is dead on this host is gone at once. Anything else — a pid reused after a reboot, or one alive under another user (EPERM) — is gone when it has not renewed for 45 s. No process start-time probes (`ps`, PowerShell): time zones, DST and reboots cannot fool it.
-  - **Taking over** a stale lease, renewing one and releasing one all happen under a short O_EXCL guard. On every renewal the holder re-reads the file and stands down at once if it is no longer its own.
-- **Clock steps:** a backward step delays a takeover by at most the step. A forward step can let a contender take a live lease; the old holder's next renewal (≤ 10 s) then finds it is not its own and stands down, so at most one renewal of overlap.
+  - **Created** with O_EXCL. The holder rewrites the lease every 10 s.
+- **When a holder is gone, by what a contender observes.** A contender never compares the holder's wall clock with its own. A lease is stale only when its content (token and `renewed_at`) has not changed for 45 s on the contender's own monotonic clock since it first saw that content (the Kubernetes leader-election rule).
+  - **Sleep and clocks:** a monotonic clock stops while the machine sleeps, so after a laptop wakes, the holder's next renewal (≤ 10 s) comes before anyone can judge it stale. Wall-clock steps and another host's skew play no part.
+  - **Dead pid:** a holder whose pid is dead on this host is gone at once.
+  - **Old locks:** a lock from before leases (a bare pid) is judged by its pid, unless the file predates this boot (its pid may belong to someone else now).
+  - **No probes:** there are no start-time probes (`ps`, PowerShell).
+- **Takeover, renewal, release:** all happen under a short O_EXCL guard. On every renewal the holder re-reads the file and stands down at once if it is no longer its own. A renewal that fails (the lock folder removed, a full disk) is counted in status (`lease_errors`) and never crashes the daemon. A lease that cannot be renewed for 45 s is given up cleanly.
+- **The Windows/WSL reinstall** stops the pid in `daemon.lock` (`DAEMON_LOCK_FILE`) only while that holder is really there.
 - **Limit:** two different OS users holding one agent's key do not see each other.
 
 ### When runs keep failing
@@ -162,7 +166,9 @@ The socket can be fine while every run fails: the runtime was signed out, its bi
 runs failing: claude: claude is not signed in (run `claude` once and sign in) — since <time>, N run(s) missed
 ```
 
-`doctor` reports a FAIL check `runs`, and `integration.status.json` carries `runs_failing` (`reason`, `since`, `runs_missed`, `checked_at`). Wakes still start runs and are counted: each one is the quickest way back. The next run that succeeds clears it.
+`doctor` reports a FAIL check `runs`, and `integration.status.json` carries `runs_failing` (`reason`, `since`, `runs_missed`, `checked_at`). Wakes still start runs and are counted: each one is the quickest way back. The next run that succeeds clears it. The one exception is a healthy listener for the same agent waiting in another home: then this home hands the agent over (`unservable`, above), and its runtime recheck clears it.
+
+A runtime check in flight is stopped, its probes killed, when the daemon or the integration stops. A `claude auth status` that hangs is reported as not answering ("did not answer within 10 s"), not as signed out.
 
 The runtime probes (`inspectClaudeRuntime`, `claudeIsLoggedIn`, `inspectCodexRuntime`, `codexIsLoggedIn`, `Preset.inspect`) are async (`runProbe`). A probe that hangs is killed with everything it started: its process group on POSIX, `taskkill /T /F` on Windows, where the npm `.cmd` shim and the real process differ. Its exit is waited for, within a bound. A synchronous probe could only kill the shim, and then sat blocking the daemon.
 

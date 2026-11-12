@@ -82,6 +82,8 @@ export interface IntegrationOptions {
   readonly runnerDeadlineSlackMs?: number
   /** Injectable for tests; `RUNTIME_RECHECK_MS`. */
   readonly runtimeRecheckMs?: number
+  /** What the supervisor adds to every status this integration writes (its locks' renewal errors). */
+  readonly statusExtra?: () => Partial<IntegrationStatus>
   /** Injectable for tests; defaults to an SDK client for `cfg`. */
   readonly api?: AgentChatClient
   /** Injectable for tests: the socket (built with `ackOnReceipt` and the v1 capabilities otherwise). */
@@ -125,7 +127,7 @@ function reasonOf(source: kit.WakeSource, frameReason: string | undefined): stri
 }
 
 /** `work`, or `onTimeout()` once `ms` have passed — whichever first. A late result is dropped. */
-function withDeadline<T>(work: Promise<T>, ms: number, onTimeout: () => T): Promise<T> {
+export function withDeadline<T>(work: Promise<T>, ms: number, onTimeout: () => T): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     let done = false
     const timer = setTimeout(() => {
@@ -364,6 +366,8 @@ export class Integration {
       workdir: this.options.cfg.workdir,
       standby: null,
       runs_failing: this.runsFailing,
+      unservable: null,
+      ...(this.options.statusExtra?.() ?? {}),
       socket: this.stopping ? 'closed' : this.socket,
       wakes: status.coalescer.wakes,
       wakes_absorbed: status.coalescer.absorbed,
@@ -426,7 +430,8 @@ export class Integration {
         this.options.runner.start({
           kind,
           wake,
-          prompt: `${request.prompt}\n\n${this.options.manualPointer}`,
+          // No pointer, no trailing blank lines.
+          prompt: this.options.manualPointer.trim().length > 0 ? `${request.prompt}\n\n${this.options.manualPointer}` : request.prompt,
           runId,
           ...(identityLine !== undefined && identityLine.trim().length > 0 ? { identityLine } : {}),
           budgetMs,

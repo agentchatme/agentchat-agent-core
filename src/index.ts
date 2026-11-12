@@ -163,6 +163,7 @@ export {
   type IntegrationCycle,
   type IntegrationStandby,
   type IntegrationRunsFailing,
+  type IntegrationUnservable,
   FAILED_CYCLE_OUTCOMES,
   REPEATED_FAILED_CYCLES,
   failedCyclesInARow,
@@ -225,9 +226,9 @@ export {
   idle,
   HEARTBEAT_FILE,
 } from './daemon/health.js'
-export { acquireLeaderLock, type LockHandle } from './daemon/leader-lock.js'
-export { AGENT_LOCK_DIR_ENV, agentLockDir, agentLockPath, acquireAgentLock, agentLockRefusal } from './daemon/agent-lock.js'
-export { acquireLease, leaseHolder, holderLive, pidAlive, parseLease, LEASE_RENEW_MS, LEASE_STALE_MS, type Lease, type LeaseHolder, type LeaseAttempt, type LeaseOptions } from './util/lease.js'
+export { acquireLeaderLock, DAEMON_LOCK_FILE, type LockHandle } from './daemon/leader-lock.js'
+export { AGENT_LOCK_DIR_ENV, agentLockDir, agentLockPath, acquireAgentLock, agentLockRefusal, standbyMarkerPath, markStandby, clearStandby, standbyWaiting, STANDBY_MARKER_FRESH_MS } from './daemon/agent-lock.js'
+export { acquireLease, leaseHolder, holderLive, pidAlive, parseLease, bootedAt, resetLeaseObservations, LEASE_RENEW_MS, LEASE_STALE_MS, type Lease, type LeaseHolder, type LeaseAttempt, type LeaseOptions } from './util/lease.js'
 export {
   installService,
   uninstallService,

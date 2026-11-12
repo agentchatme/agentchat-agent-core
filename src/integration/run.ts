@@ -2,17 +2,17 @@ import * as path from 'node:path'
 import * as fs from 'node:fs'
 import { log } from '../util/log.js'
 import { acquireLeaderLock } from '../daemon/leader-lock.js'
-import { acquireAgentLock, agentLockRefusal } from '../daemon/agent-lock.js'
+import { acquireAgentLock, agentLockPath, agentLockRefusal, clearStandby, markStandby, standbyWaiting } from '../daemon/agent-lock.js'
 import type { Lease, LeaseOptions } from '../util/lease.js'
 import type { DaemonConfig } from '../daemon/config.js'
 import { resolveIdentity, credentialsPath } from '../identity/credentials.js'
 import { resolveDaemonConfig } from '../daemon/config.js'
 import { idle } from '../daemon/health.js'
 import type { IntegrationClient } from '../client-identity.js'
-import { Integration } from './integration.js'
+import { Integration, PREFLIGHT_DEADLINE_MS, withDeadline } from './integration.js'
 import { INTEGRATION_ENV, INTEGRATION_ENV_LEGACY, INTEGRATION_ENV_LEGACY_REMOVAL, integrationDisabledBy, resolveRunBudgetMs, resolveRunProfile, type RunProfile } from './profile.js'
 import { isRunnerFactory, type RunRunner, type RunnerSource } from './runner.js'
-import { writeIntegrationStatus, type IntegrationRunsFailing, type IntegrationStandby } from './status.js'
+import { writeIntegrationStatus, type IntegrationRunsFailing, type IntegrationStandby, type IntegrationStatus, type IntegrationUnservable } from './status.js'
 
 // ─── The resident supervisor ────────────────────────────────────────────────
 //
@@ -146,11 +146,11 @@ class StandbyError extends Error {}
 
 /** A home that gave its agent up because it could not serve it, and when it looks again. */
 interface Unservable {
-  readonly reason: string
+  readonly kind: IntegrationUnservable['reason']
+  readonly detail: string
+  readonly since: string
   readonly retryAt: number
   readonly runsFailing: IntegrationRunsFailing | null
-  /** The server refused the key (else: runs were failing). */
-  readonly blocked: boolean
 }
 
 /**
@@ -170,14 +170,21 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
   // is wrong, and an empty log is useless for "is the integration working?".
   if (process.env['AGENTCHAT_LOG_LEVEL'] === undefined) process.env['AGENTCHAT_LOG_LEVEL'] = 'info'
 
+  // Wakes the loop's wait early (a credential change, a lost lock).
+  let nudged = false
+  // Stops checks in flight (a give-up recheck's probes) when the daemon stops.
+  const stopChecks = new AbortController()
+  opts.signal?.addEventListener('abort', () => stopChecks.abort(), { once: true })
+
   // Taken for the PROCESS, not for a connection: one resident daemon per
   // identity home, signed in or not. A lease: should another daemon ever take
-  // it (this one stalled past the lease), this one stands down and exits.
+  // it (this one stalled past the lease), this one stands down and exits now.
   const lock = await acquireLeaderLock(home, opts.lease ?? {})
   if (lock === null) return 1
   let homeLost: string | null = null
   lock.onLost((why) => {
     homeLost = why
+    nudged = true
     log.error(`lost this home's daemon lock (${why}) — another daemon serves ${home} now; this one exits`)
   })
 
@@ -204,10 +211,20 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
   let lastRunner: RunRunner | null = null
   /** The resolved identity for the current credential: an env-key standby does not ask /v1/agents/me on every poll. */
   let cachedCfg: { fp: string; cfg: DaemonConfig } | null = null
+  /** The agent lock's file (for the standby marker beside it), once the identity is known. */
+  let agentLockFile: string | null = null
   const releaseAgent = (): void => {
     agentLock?.release()
     agentLock = null
     agentLost = null
+  }
+  const stopWaiting = (): void => {
+    if (agentLockFile !== null) clearStandby(agentLockFile, home)
+  }
+  /** Lock renewals that failed, for status: the home lock's and the agent lock's. */
+  const leaseErrors = (): NonNullable<IntegrationStatus['lease_errors']> | null => {
+    const count = lock.renewErrors + (agentLock?.renewErrors ?? 0)
+    return count === 0 ? null : { count, last: agentLock?.lastRenewError ?? lock.lastRenewError }
   }
 
   const offStatus = (handle: string | null): void =>
@@ -236,6 +253,8 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
       texts: null,
       standby,
       runs_failing: unservable?.runsFailing ?? null,
+      unservable: unservable === null ? null : { reason: unservable.kind, detail: unservable.detail, since: unservable.since, retry_at: new Date(unservable.retryAt).toISOString() },
+      lease_errors: leaseErrors(),
     })
 
   const disconnect = (why: string): void => {
@@ -253,6 +272,7 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
   const shutdown = (sig: string): void => {
     if (shuttingDown) return
     shuttingDown = true
+    stopChecks.abort()
     log.info(`${sig} — shutting down`)
   }
   const onSigint = (): void => shutdown('SIGINT')
@@ -263,7 +283,6 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
   // Best-effort accelerator so signing in connects in about a second instead of
   // waiting out a poll. fs.watch is unreliable on some filesystems, so the poll
   // below is the real guarantee and this is pure upside.
-  let nudged = false
   try {
     fs.mkdirSync(home, { recursive: true })
     const watcher = fs.watch(home, (_event, filename) => {
@@ -302,9 +321,11 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
       observedFingerprint = fp
       failures = 0
       lastFailure = null
+      stopWaiting()
       standby = null
       unservable = null
       cachedCfg = null
+      agentLockFile = null
       if (fp === null || disabled) offStatus(fp === null ? null : identityOf()?.handle ?? null)
     }
 
@@ -323,30 +344,39 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
         lastFailure = `@${cachedCfg?.cfg.handle ?? '?'}: ${why}; another listener serves this agent now`
       } else if (!health.ok) {
         const handle = cachedCfg?.cfg.handle ?? '?'
-        const blocked = health.runsFailing === null
-        const retryMs = opts.unservableRecheckMs ?? (blocked ? BLOCKED_RETRY_MS : UNSERVABLE_RECHECK_MS)
-        unservable = { reason: health.reason, retryAt: Date.now() + retryMs, runsFailing: health.runsFailing, blocked }
-        disconnect(`this home cannot serve @${handle} (${health.reason}): giving it up so a healthy listener can`)
-        lastFailure = `this home cannot serve @${handle}: ${health.reason}. It holds no socket and starts no run until that is fixed (checked again every ${Math.round(retryMs / 1000)} s); another listener for @${handle} may serve it meanwhile.`
-        log.warn(lastFailure)
-        offStatus(handle)
+        const kind: Unservable['kind'] = health.runsFailing === null ? 'key_refused' : 'runs_failing'
+        // A refused key cannot serve at all: given up whatever waits. Failing
+        // runs are given up only to a healthy listener that is actually
+        // waiting; a lone install keeps its socket — wakes keep arriving, are
+        // counted and start runs (each the quickest way back).
+        if (kind === 'key_refused' || (agentLockFile !== null && standbyWaiting(agentLockFile, home))) {
+          const retryMs = opts.unservableRecheckMs ?? (kind === 'key_refused' ? BLOCKED_RETRY_MS : UNSERVABLE_RECHECK_MS)
+          unservable = { kind, detail: health.reason, since: new Date().toISOString(), retryAt: Date.now() + retryMs, runsFailing: health.runsFailing }
+          disconnect(`this home cannot serve @${handle} (${health.reason}): giving it up to ${kind === 'key_refused' ? 'any healthy listener' : 'the healthy listener waiting for it'}`)
+          lastFailure = `this home cannot serve @${handle}: ${health.reason}. It holds no socket and starts no run; ${kind === 'runs_failing' ? 'the runtime is' : 'the key is'} checked again every ${Math.round(retryMs / 1000)} s, and it serves again when that passes and no other listener holds @${handle}.`
+          log.warn(lastFailure)
+          offStatus(handle)
+        }
       }
     } else if (live === null) {
       try {
         // Not before its time: a home that gave the agent up retries on its own clock.
-        if (unservable !== null && Date.now() < unservable.retryAt) throw new StandbyError(unservable.reason)
+        if (unservable !== null && Date.now() < unservable.retryAt) throw new StandbyError(unservable.detail)
         const waiting: Unservable | null = unservable
-        if (waiting !== null && !waiting.blocked && lastRunner !== null) {
-          // Runs were failing: the runtime must check out before this home asks for the agent again.
-          const pre = await lastRunner.preflight()
-          if (!pre.ok) {
-            const next: Unservable = { ...waiting, retryAt: Date.now() + (opts.unservableRecheckMs ?? UNSERVABLE_RECHECK_MS), reason: `runs failing: ${lastRunner.name}: ${pre.detail ?? 'its check failed'}` }
-            unservable = next
-            throw new StandbyError(next.reason)
-          }
+        if (waiting !== null && waiting.kind === 'runs_failing' && lastRunner !== null) {
+          // Runs were failing: the runtime is checked first (bounded, stopped with the daemon).
+          const before: Unservable = waiting
+          const checker = lastRunner
+          const pre = await withDeadline(checker.preflight({ signal: stopChecks.signal }), PREFLIGHT_DEADLINE_MS, () => ({ ok: false, detail: `preflight did not answer within ${Math.round(PREFLIGHT_DEADLINE_MS / 1000)} s` })).catch(
+            (err: unknown) => ({ ok: false, detail: `preflight threw: ${err instanceof Error ? err.message : String(err)}` }),
+          )
+          if (shuttingDown || opts.signal?.aborted) throw new StandbyError('stopping')
+          if (pre.ok) unservable = null
+          else unservable = { ...before, detail: `runs failing: ${checker.name}: ${pre.detail ?? 'its check failed'}`, retryAt: Date.now() + (opts.unservableRecheckMs ?? UNSERVABLE_RECHECK_MS) }
         }
         if (cachedCfg === null || cachedCfg.fp !== fp) cachedCfg = { fp, cfg: await resolveDaemonConfig({ home, workdir, client: opts.client, envKey }) }
         const cfg = cachedCfg.cfg
+        agentLockFile = agentLockPath({ apiBase: cfg.apiBase, handle: cfg.handle })
         // One agent, one listener: a daemon in another home that already
         // serves this agent keeps it; this one stands by (no socket, no run)
         // and takes over when that one stops or gives it up. The lock folder
@@ -354,14 +384,23 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
         // the same user agree on it, whatever switches `env` carries.
         const attempt = await acquireAgentLock({ apiBase: cfg.apiBase, handle: cfg.handle, home }, process.env, opts.lease ?? {})
         if (!attempt.ok) {
+          const current: Unservable | null = unservable
+          if (current !== null) {
+            // Still unable to serve, and another listener holds the agent: wait, without saying it is healthy.
+            unservable = { ...current, retryAt: Date.now() + (opts.unservableRecheckMs ?? (current.kind === 'key_refused' ? BLOCKED_RETRY_MS : UNSERVABLE_RECHECK_MS)) }
+            throw new StandbyError(current.detail)
+          }
           const msg = agentLockRefusal({ handle: cfg.handle, home }, attempt.holder, attempt.path)
           standby = { home: attempt.holder?.home ?? null, pid: attempt.holder?.pid ?? null, since: attempt.holder?.acquired_at ?? null }
           if (msg !== lastFailure) log.warn(msg)
           lastFailure = msg
+          // A healthy standby says it is waiting (the holder hands over failing runs only to one).
+          markStandby(attempt.path, home)
           throw new StandbyError(msg)
         }
+        stopWaiting()
         if (standby !== null) log.info(`@${cfg.handle}: the other listener stopped; this one serves the agent now`)
-        if (unservable !== null) log.info(`@${cfg.handle}: this home can serve again; it holds the agent now`)
+        if (unservable !== null) log.info(`@${cfg.handle}: no other listener holds the agent; this home serves it again (${unservable.detail})`)
         standby = null
         unservable = null
         agentLock = attempt.lease
@@ -381,6 +420,7 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
           budgetMs,
           ...(opts.dismissIgnoredInvites !== undefined ? { dismissIgnoredInvites: opts.dismissIgnoredInvites } : {}),
           ...(opts.runtimeRecheckMs !== undefined ? { runtimeRecheckMs: opts.runtimeRecheckMs } : {}),
+          statusExtra: () => ({ lease_errors: leaseErrors() }),
         })
         await candidate.start()
         live = candidate
@@ -416,7 +456,7 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
     // sign-in connects in well under a second. Exponential backoff while a
     // start keeps failing, capped — the watcher still wakes us instantly when
     // credentials change, so backing off never delays a real sign-in.
-    const waitMs = standby !== null || unservable !== null ? (opts.standbyPollMs ?? STANDBY_POLL_MS) : failures === 0 ? POLL_MS : Math.min(POLL_MS * 2 ** Math.min(failures, 6), MAX_BACKOFF_MS)
+    const waitMs = homeLost !== null ? 0 : standby !== null || unservable !== null ? (opts.standbyPollMs ?? STANDBY_POLL_MS) : failures === 0 ? POLL_MS : Math.min(POLL_MS * 2 ** Math.min(failures, 6), MAX_BACKOFF_MS)
     nudged = false
     const deadline = Date.now() + waitMs
     while (!nudged && !shuttingDown && !opts.signal?.aborted && Date.now() < deadline) {
@@ -432,6 +472,7 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
     live = null
   }
   releaseAgent()
+  stopWaiting()
   idle(home)
   lock.release()
   if (homeLost !== null) return 1

@@ -917,7 +917,17 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
     // Runs failing for a runtime reason, as the daemon's own recheck found
     // (signed out, the binary gone, a flag an upgrade dropped).
     const runsFailing = integration?.runs_failing ?? null
-    if (runsFailing !== null) {
+    const gaveUp = integration?.unservable ?? null
+    if (gaveUp !== null) {
+      checks.push({
+        name: 'runs',
+        verdict: 'FAIL',
+        detail:
+          gaveUp.reason === 'key_refused'
+            ? `this home gave the agent up: the server refuses its key (${gaveUp.detail}); it tries again at ${gaveUp.retry_at} (every 5 min) and serves again once the key is accepted and no other listener holds the agent — sign in again here (login/recover), or log out if another home serves it`
+            : `this home gave the agent up: ${gaveUp.detail} (since ${gaveUp.since}); its runtime is checked again at ${gaveUp.retry_at} (every 60 s) and it serves again when that check passes and no other listener holds the agent`,
+      })
+    } else if (runsFailing !== null) {
       checks.push({
         name: 'runs',
         verdict: 'FAIL',

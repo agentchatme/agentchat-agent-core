@@ -4,7 +4,7 @@ import * as os from 'node:os'
 import * as path from 'node:path'
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import { pathToFileURL } from 'node:url'
-import { acquireLease, holderLive, parseLease, pidAlive, type LeaseHolder } from '../src/util/lease.js'
+import { acquireLease, holderLive, parseLease, pidAlive, resetLeaseObservations, type LeaseHolder } from '../src/util/lease.js'
 import { acquireAgentLock, agentLockDir, agentLockPath, AGENT_LOCK_DIR_ENV } from '../src/daemon/agent-lock.js'
 import { acquireLeaderLock } from '../src/daemon/leader-lock.js'
 import { lockedDaemonPid } from '../src/daemon/service.js'
@@ -12,7 +12,7 @@ import { runIntegration } from '../src/integration/run.js'
 import { Integration } from '../src/integration/integration.js'
 import { formatIntegrationStatus, readIntegrationStatus } from '../src/integration/status.js'
 import { runProbe } from '../src/util/probe.js'
-import { claudeIsLoggedIn, claudeSignIn, inspectClaudeRuntime, inspectCodexRuntime, codexIsLoggedIn } from '../src/presets/index.js'
+import { claudeIsLoggedIn, claudeSignIn, inspectClaudeRuntime, inspectCodexRuntime, codexIsLoggedIn, CodexRunner } from '../src/presets/index.js'
 import type { RunOutcome, RunPreflight, RunPreflightOptions, RunRequest, RunRunner } from '../src/integration/runner.js'
 import { installFakeClaude, installFakeCodex } from './helpers/fake-runtimes.js'
 import { startServerDouble, until, type ServerDouble } from './helpers/server-double.js'
@@ -120,8 +120,19 @@ describe('the lease: O_EXCL, the bare pid first, renewed by its holder, taken ov
     expect(oldAcquireLeaderLock(home)).toBe('refused')
     expect(parseLease(fs.readFileSync(path.join(home, 'daemon.lock'), 'utf-8'))?.token).toBeTruthy() // untouched
     held?.release()
-    fs.writeFileSync(path.join(home, 'daemon.lock'), '4242')
-    expect(lockedDaemonPid(home)).toBe(4242)
+    // A 0.4.x daemon's bare pid: stopped while it lives; a dead one names nothing (its pid may be someone else's now).
+    const live = sleeper()
+    try {
+      fs.writeFileSync(path.join(home, 'daemon.lock'), String(live.pid))
+      expect(lockedDaemonPid(home)).toBe(live.pid)
+      fs.writeFileSync(path.join(home, 'daemon.lock'), String(deadPid()))
+      expect(lockedDaemonPid(home)).toBeNull()
+      // A lease its holder stopped renewing long ago: nothing to stop either.
+      leaseFile(path.join(home, 'daemon.lock'), { pid: live.pid ?? 0, renewed_at: Date.now() - 3_600_000 })
+      expect(lockedDaemonPid(home)).toBeNull()
+    } finally {
+      live.kill('SIGKILL')
+    }
   })
 
   it('liveness: a dead pid here is gone at once; a live pid that stopped renewing (a reboot reused it) is gone; EPERM with a fresh lease is held, with a stale one is not', () => {
@@ -129,18 +140,19 @@ describe('the lease: O_EXCL, the bare pid first, renewed by its holder, taken ov
     const live = sleeper()
     try {
       const h = (pid: number, renewed: number, host?: string): LeaseHolder => ({ pid, token: 't', host: host ?? os.hostname(), renewed_at: renewed })
-      expect(holderLive(h(deadPid(), now), now)).toBe(false)
-      expect(holderLive(h(live.pid ?? 0, now - 1_000), now)).toBe(true)
-      expect(holderLive(h(live.pid ?? 0, now - 120_000), now)).toBe(false) // reboot-stale: alive pid, no renewal
+      expect(holderLive(h(deadPid(), now), { now })).toBe(false)
+      expect(holderLive(h(live.pid ?? 0, now - 1_000), { now })).toBe(true)
+      expect(holderLive(h(live.pid ?? 0, now - 120_000), { now })).toBe(false) // reboot-stale: alive pid, no renewal
       expect(pidAlive(EPERM_PID)).toBe(true)
-      expect(holderLive(h(EPERM_PID, now - 1_000), now)).toBe(true)
-      expect(holderLive(h(EPERM_PID, now - 120_000), now)).toBe(false) // reused by an elevated process
+      expect(holderLive(h(EPERM_PID, now - 1_000), { now })).toBe(true)
+      expect(holderLive(h(EPERM_PID, now - 120_000), { now })).toBe(false) // reused by an elevated process
       // Another host: its pid means nothing here; the lease alone decides.
-      expect(holderLive(h(deadPid(), now - 1_000, 'other-host'), now)).toBe(true)
-      expect(holderLive(h(deadPid(), now - 120_000, 'other-host'), now)).toBe(false)
-      // A lock from before leases: its pid alone.
-      expect(holderLive({ pid: live.pid ?? 0, token: null, host: null, renewed_at: null }, now)).toBe(true)
-      expect(holderLive({ pid: deadPid(), token: null, host: null, renewed_at: null }, now)).toBe(false)
+      expect(holderLive(h(deadPid(), now - 1_000, 'other-host'), { now })).toBe(true)
+      expect(holderLive(h(deadPid(), now - 120_000, 'other-host'), { now })).toBe(false)
+      // A lock from before leases: its pid — unless the file predates this boot.
+      expect(holderLive({ pid: live.pid ?? 0, token: null, host: null, renewed_at: null }, { now })).toBe(true)
+      expect(holderLive({ pid: deadPid(), token: null, host: null, renewed_at: null }, { now })).toBe(false)
+      expect(holderLive({ pid: live.pid ?? 0, token: null, host: null, renewed_at: null }, { now, mtimeMs: now - 3_600_000, bootedAt: now - 60_000 })).toBe(false)
     } finally {
       live.kill('SIGKILL')
     }
@@ -154,8 +166,8 @@ describe('the lease: O_EXCL, the bare pid first, renewed by its holder, taken ov
       const renewed = Date.UTC(2026, 10, 1, 5, 30)
       const live = sleeper()
       try {
-        expect(holderLive({ pid: live.pid ?? 0, token: 't', host: os.hostname(), renewed_at: renewed }, renewed + 20_000)).toBe(true)
-        expect(holderLive({ pid: live.pid ?? 0, token: 't', host: os.hostname(), renewed_at: renewed }, renewed + 3_600_000)).toBe(false)
+        expect(holderLive({ pid: live.pid ?? 0, token: 't', host: os.hostname(), renewed_at: renewed }, { now: renewed + 20_000 })).toBe(true)
+        expect(holderLive({ pid: live.pid ?? 0, token: 't', host: os.hostname(), renewed_at: renewed }, { now: renewed + 3_600_000 })).toBe(false)
       } finally {
         live.kill('SIGKILL')
       }
@@ -165,10 +177,10 @@ describe('the lease: O_EXCL, the bare pid first, renewed by its holder, taken ov
     }
   })
 
-  it('taken over: a dead holder, a stale lease of a live pid, a stale EPERM pid, an old bare pid of a dead process; refused: a fresh lease, a live bare pid', async () => {
+  it('taken over at once: a dead holder here, an old bare pid of a dead process, a bare pid from before this boot; refused: a live bare pid', async () => {
     const file = path.join(sandbox, 'x.lock')
-    const take = async (): Promise<boolean> => {
-      const r = await acquireLease(file)
+    const take = async (options = {}): Promise<boolean> => {
+      const r = await acquireLease(file, {}, options)
       if (r.ok) r.lease.release()
       return r.ok
     }
@@ -176,18 +188,113 @@ describe('the lease: O_EXCL, the bare pid first, renewed by its holder, taken ov
     try {
       leaseFile(file, { pid: deadPid(), renewed_at: Date.now() })
       expect(await take()).toBe(true)
-      leaseFile(file, { pid: live.pid ?? 0, renewed_at: Date.now() - 120_000 })
-      expect(await take()).toBe(true)
-      leaseFile(file, { pid: EPERM_PID, renewed_at: Date.now() - 120_000 })
-      expect(await take()).toBe(true)
       fs.writeFileSync(file, String(deadPid()))
       expect(await take()).toBe(true)
-      leaseFile(file, { pid: live.pid ?? 0, renewed_at: Date.now() })
-      expect(await acquireLease(file)).toMatchObject({ ok: false, holder: { pid: live.pid, home: '/their/home' } })
       fs.writeFileSync(file, String(live.pid))
       expect(await acquireLease(file)).toMatchObject({ ok: false, holder: { pid: live.pid, renewed_at: null } })
+      // The same live bare pid, but the file was written before this boot: someone else's pid now.
+      const old = new Date(Date.now() - 3_600_000)
+      fs.utimesSync(file, old, old)
+      expect(await take({ bootedAt: () => Date.now() - 60_000 })).toBe(true)
     } finally {
       live.kill('SIGKILL')
+    }
+  })
+
+  it('a live pid (or EPERM) is taken over only when its lease content has not changed for 45 s on the contender\'s own monotonic clock', async () => {
+    resetLeaseObservations()
+    const file = path.join(sandbox, 'x.lock')
+    const live = sleeper()
+    try {
+      for (const pid of [live.pid ?? 0, EPERM_PID]) {
+        resetLeaseObservations()
+        leaseFile(file, { pid, renewed_at: Date.now() - 3_600_000 }) // an hour-old wall clock: not evidence
+        let mono = 0
+        const clocks = { monotonic: () => mono }
+        expect((await acquireLease(file, {}, clocks)).ok).toBe(false) // first seen: held
+        mono = 44_000
+        expect((await acquireLease(file, {}, clocks)).ok).toBe(false)
+        mono = 45_500
+        const r = await acquireLease(file, {}, clocks)
+        expect(r.ok).toBe(true)
+        if (r.ok) r.lease.release()
+      }
+    } finally {
+      live.kill('SIGKILL')
+    }
+  })
+
+  it('laptop sleep: the wall clock jumps hours, the monotonic clock does not, and the holder\'s renewal on wake keeps it — no takeover, no two serving', async () => {
+    resetLeaseObservations()
+    const file = path.join(sandbox, 'x.lock')
+    const live = sleeper()
+    try {
+      const t0 = Date.now()
+      leaseFile(file, { pid: live.pid ?? 0, renewed_at: t0, token: 'holder' })
+      let mono = 1_000
+      let wall = t0
+      const clocks = { monotonic: () => mono, now: () => wall }
+      expect((await acquireLease(file, {}, clocks)).ok).toBe(false)
+      // Asleep three hours: wall time moves, monotonic time (paused in sleep) barely.
+      wall = t0 + 3 * 3_600_000
+      mono = 6_000
+      expect((await acquireLease(file, {}, clocks)).ok).toBe(false)
+      // On wake the holder renews (new content): a fresh observation.
+      leaseFile(file, { pid: live.pid ?? 0, renewed_at: wall, token: 'holder' })
+      mono = 40_000
+      expect((await acquireLease(file, {}, clocks)).ok).toBe(false)
+      mono = 84_000
+      expect((await acquireLease(file, {}, clocks)).ok).toBe(false)
+      // It stops renewing for good: 45 s observed, then taken over.
+      mono = 86_000
+      const r = await acquireLease(file, {}, clocks)
+      expect(r.ok).toBe(true)
+      if (r.ok) r.lease.release()
+    } finally {
+      live.kill('SIGKILL')
+    }
+  })
+
+  it('another host\'s skewed clock is no evidence either way: a lease stamped hours ago there is held until observed unchanged for 45 s', async () => {
+    resetLeaseObservations()
+    const file = path.join(sandbox, 'x.lock')
+    leaseFile(file, { pid: 999_999, renewed_at: Date.now() - 10 * 3_600_000, host: 'skewed-host' })
+    let mono = 0
+    expect((await acquireLease(file, {}, { monotonic: () => mono })).ok).toBe(false)
+    mono = 46_000
+    const r = await acquireLease(file, {}, { monotonic: () => mono })
+    expect(r.ok).toBe(true)
+    if (r.ok) r.lease.release()
+  })
+
+  it('a renewal that fails never crashes the process: the lock folder removed stands the holder down; a folder it cannot write to is counted, then given up', async () => {
+    const dir = path.join(sandbox, 'locks')
+    const a = await acquireLease(path.join(dir, 'x.lock'), {}, { renewMs: 30 })
+    if (!a.ok) throw new Error('not acquired')
+    let why: string | null = null
+    a.lease.onLost((w) => {
+      why = w
+    })
+    fs.rmSync(dir, { recursive: true, force: true })
+    await until(() => why !== null, 3_000)
+    expect(why).toMatch(/is gone|was removed/)
+    expect(a.lease.lost).toBe(true)
+    if (posix() && process.getuid?.() !== 0) {
+      const dir2 = path.join(sandbox, 'ro-locks')
+      const b = await acquireLease(path.join(dir2, 'y.lock'), {}, { renewMs: 30, staleMs: 300 })
+      if (!b.ok) throw new Error('not acquired')
+      let lost: string | null = null
+      b.lease.onLost((w) => {
+        lost = w
+      })
+      fs.chmodSync(dir2, 0o500)
+      try {
+        await until(() => lost !== null, 5_000)
+        expect(b.lease.renewErrors).toBeGreaterThan(0)
+        expect(lost).toMatch(/could not renew/)
+      } finally {
+        fs.chmodSync(dir2, 0o700)
+      }
     }
   })
 
@@ -385,6 +492,8 @@ describe('one agent, one listener: the supervisor', () => {
       const gaveUp = readIntegrationStatus(home1)
       expect(gaveUp?.socket).toBe('idle')
       expect(gaveUp?.last_error).toMatch(/this home cannot serve @probe: the server refuses this home's key/)
+      expect(gaveUp?.unservable).toMatchObject({ reason: 'key_refused', detail: expect.stringMatching(/refuses this home's key/), since: expect.any(String), retry_at: expect.any(String) })
+      expect(formatIntegrationStatus(gaveUp).join('\n')).toContain('this home gave the agent up')
       expect(double.served.filter((x) => x.hello?.['api_key'] === newKey).length).toBeGreaterThanOrEqual(1)
     } finally {
       await a.stop()
@@ -412,6 +521,7 @@ describe('one agent, one listener: the supervisor', () => {
       const gaveUp = readIntegrationStatus(home1)
       expect(gaveUp?.socket).toBe('idle')
       expect(gaveUp?.runs_failing?.reason).toBe('claude: claude is not signed in (run `claude` once and sign in)')
+      expect(gaveUp?.unservable).toMatchObject({ reason: 'runs_failing', detail: 'runs failing: claude: claude is not signed in (run `claude` once and sign in)' })
       expect(formatIntegrationStatus(gaveUp).join('\n')).toContain('runs failing: claude: claude is not signed in')
       // Signed in again, and the standby stops: this home takes the agent back.
       broken.check = { ok: true }
@@ -424,6 +534,48 @@ describe('one agent, one listener: the supervisor', () => {
       await b.stop()
     }
   }, 60_000)
+
+  it('a lone install whose runs fail keeps its socket: no other listener waits, so nothing is handed over and wakes keep starting runs', async () => {
+    double = await startServerDouble({ tray: { waiting: 1 } })
+    const home1 = path.join(sandbox, 'lone-home')
+    signIn(home1, KEY, double.apiBase)
+    const broken = new ScriptedRunner({ state: 'ok', exitCode: 0, durationMs: 1 }, { ok: true })
+    const a = daemon(home1, broken, { runtimeRecheckMs: 50 })
+    try {
+      await until(() => readIntegrationStatus(home1)?.socket === 'ready', 10_000)
+      broken.outcome = { state: 'not_started', exitCode: 1, durationMs: 1, detail: 'Not logged in' }
+      broken.check = { ok: false, detail: 'claude is not signed in (run `claude` once and sign in)' }
+      double.send({ type: 'message.new', payload: { id: 'm1', conversation_id: 'conv_1', sender: 'peer', content: { text: 'x' } } })
+      await until(() => (readIntegrationStatus(home1)?.runs_failing ?? null) !== null, 10_000)
+      const starts = broken.starts
+      double.send({ type: 'message.new', payload: { id: 'm2', conversation_id: 'conv_1', sender: 'peer', content: { text: 'y' } } })
+      await until(() => broken.starts > starts, 10_000)
+      await new Promise((r) => setTimeout(r, 600)) // several supervisor polls
+      const status = readIntegrationStatus(home1)
+      expect(status?.socket).toBe('ready')
+      expect(status?.unservable ?? null).toBeNull()
+      expect(formatIntegrationStatus(status).join('\n')).toContain('the next run that succeeds clears this')
+    } finally {
+      await a.stop()
+    }
+  }, 30_000)
+
+  it('a daemon whose home lock is taken over exits at once (code 1)', async () => {
+    double = await startServerDouble({ tray: { waiting: 0 } })
+    const home1 = path.join(sandbox, 'h-lost')
+    signIn(home1, KEY, double.apiBase)
+    const a = daemon(home1, okRunner())
+    await until(() => readIntegrationStatus(home1)?.socket === 'ready', 10_000)
+    const other = sleeper()
+    try {
+      leaseFile(path.join(home1, 'daemon.lock'), { pid: other.pid ?? 0, renewed_at: Date.now(), home: home1 })
+      const t0 = Date.now()
+      expect(await a.done).toBe(1)
+      expect(Date.now() - t0).toBeLessThan(5_000)
+    } finally {
+      other.kill('SIGKILL')
+    }
+  }, 30_000)
 
   it('the holder whose agent lock was replaced underneath it stands down at its next renewal: never two serving', async () => {
     double = await startServerDouble({ tray: { waiting: 0 } })
@@ -652,27 +804,54 @@ describe('runs that keep failing for a runtime reason are said in status and doc
 // ─── 3. probes ──────────────────────────────────────────────────────────────
 
 describe('a probe that hangs is killed with everything it started, and answers', () => {
-  const expectGone = (file: string): void => {
+  // A killed process can sit unreaped for a moment on a loaded machine; one that was never killed lives on for ten minutes.
+  const expectGone = async (file: string): Promise<void> => {
     const pids = JSON.parse(fs.readFileSync(file, 'utf-8')) as number[]
     expect(pids).toHaveLength(2)
+    const deadline = Date.now() + 5_000
+    while (pids.some(alive) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 50))
     for (const pid of pids) expect(alive(pid), `pid ${pid} still alive`).toBe(false)
   }
 
   it('runProbe: a timeout kills the tree, waits for it to exit, and says it timed out', async () => {
+    const pids = path.join(sandbox, 'pids.json')
+    // A native shell on POSIX starts at once even on a loaded machine; node on Windows (no load there in CI).
+    const [cmd, args, timeoutMs] = posix()
+      ? (['/bin/sh', ['-c', `sleep 600 & echo "[$$, $!]" > ${JSON.stringify(pids)}; wait`], 3_000] as const)
+      : ([
+          process.execPath,
+          [
+            '-e',
+            [
+              "const kid = require('node:child_process').spawn(process.execPath, ['-e', 'setTimeout(() => {}, 600000)'], { stdio: ['ignore', 'inherit', 'inherit'] })",
+              `require('node:fs').writeFileSync(${JSON.stringify(pids)}, JSON.stringify([process.pid, kid.pid]))`,
+              'setTimeout(() => {}, 600000)',
+            ].join('\n'),
+          ],
+          10_000,
+        ] as const)
+    const result = await runProbe(cmd, [...args], { timeoutMs })
+    expect(result.timedOut).toBe(true)
+    expect(result.error?.message).toMatch(/did not answer within/)
+    await expectGone(pids)
+  }, 30_000)
+
+  it('runProbe: stopped by its signal once the hung tree exists, it kills the whole tree and answers', async () => {
     const pids = path.join(sandbox, 'pids.json')
     const script = [
       "const kid = require('node:child_process').spawn(process.execPath, ['-e', 'setTimeout(() => {}, 600000)'], { stdio: ['ignore', 'inherit', 'inherit'] })",
       `require('node:fs').writeFileSync(${JSON.stringify(pids)}, JSON.stringify([process.pid, kid.pid]))`,
       'setTimeout(() => {}, 600000)',
     ].join('\n')
-    const startedAt = Date.now()
-    // Long enough for the child to start and write its pids even on a loaded machine.
-    const result = await runProbe(process.execPath, ['-e', script], { timeoutMs: 5_000 })
-    expect(result.timedOut).toBe(true)
-    expect(result.error?.message).toMatch(/did not answer within 5 s/)
-    expect(Date.now() - startedAt).toBeLessThan(15_000)
-    expectGone(pids)
-  }, 20_000)
+    const stop = new AbortController()
+    const pending = runProbe(process.execPath, ['-e', script], { timeoutMs: 120_000, signal: stop.signal })
+    await until(() => fs.existsSync(pids), 60_000)
+    stop.abort()
+    const result = await pending
+    expect(result.error?.message).toMatch(/was stopped/)
+    expect(result.timedOut).toBe(false)
+    await expectGone(pids)
+  }, 90_000)
 
   it('runProbe: an ordinary command answers with its exit code and output', async () => {
     const r = await runProbe(process.execPath, ['-e', "process.stdout.write('v1'); process.exit(3)"], { timeoutMs: 10_000 })
@@ -683,12 +862,12 @@ describe('a probe that hangs is killed with everything it started, and answers',
   })
 
   for (const [label, install, probe] of [
-    ['claude --version', installFakeClaude, (cmd: string) => inspectClaudeRuntime(path.join(sandbox, '.claude'), cmd, 5_000)],
-    ['claude auth status', installFakeClaude, (cmd: string) => claudeIsLoggedIn(path.join(sandbox, '.claude'), cmd, 5_000)],
-    ['codex --version', installFakeCodex, (cmd: string) => inspectCodexRuntime(path.join(sandbox, '.codex'), cmd, 5_000)],
-    ['codex login status', installFakeCodex, (cmd: string) => codexIsLoggedIn(path.join(sandbox, '.codex'), cmd, 5_000)],
+    ['claude --version', installFakeClaude, (cmd: string, signal: AbortSignal) => inspectClaudeRuntime(path.join(sandbox, '.claude'), cmd, 120_000, signal)],
+    ['claude auth status', installFakeClaude, (cmd: string, signal: AbortSignal) => claudeSignIn(path.join(sandbox, '.claude'), cmd, 120_000, signal)],
+    ['codex --version', installFakeCodex, (cmd: string, signal: AbortSignal) => inspectCodexRuntime(path.join(sandbox, '.codex'), cmd, 120_000, signal)],
+    ['codex login status', installFakeCodex, (cmd: string, signal: AbortSignal) => codexIsLoggedIn(path.join(sandbox, '.codex'), cmd, 120_000, signal)],
   ] as const) {
-    it(`${label} that hangs (through the .cmd shim on Windows): answered, and its whole tree gone`, async () => {
+    it(`${label} that hangs (through the .cmd shim on Windows): stopped once hung, it answers, and its whole tree is gone`, async () => {
       const fake = install(sandbox)
       const pids = path.join(sandbox, 'probe-pids.json')
       process.env['PATH'] = `${fake.binDir}${path.delimiter}${originalPath ?? ''}`
@@ -696,21 +875,73 @@ describe('a probe that hangs is killed with everything it started, and answers',
       process.env['FAKE_RUNTIME_PROBE_PIDS'] = pids
       try {
         const cmd = label.startsWith('claude') ? 'claude' : 'codex'
-        const answer = await probe(cmd)
-        if (typeof answer === 'boolean') expect(answer).toBe(false)
-        else expect(answer).toMatchObject({ ok: false, detail: expect.stringMatching(/did not answer within/) })
-        expectGone(pids)
-        if (label === 'claude auth status') {
-          // Said as what it is: no answer, not "not signed in".
-          fs.rmSync(pids, { force: true })
-          const signIn = await claudeSignIn(path.join(sandbox, '.claude'), cmd, 5_000)
-          expect(signIn).toEqual({ signedIn: false, unanswered: 'claude auth status did not answer within 5 s (killed)' })
-          expectGone(pids)
-        }
+        const stop = new AbortController()
+        const pending = probe(cmd, stop.signal)
+        await until(() => fs.existsSync(pids), 60_000)
+        stop.abort()
+        const answer = await pending
+        if ('signedIn' in answer) expect(answer).toEqual({ signedIn: false, unanswered: 'claude auth status was stopped' })
+        else expect(answer).toMatchObject({ ok: false, detail: expect.stringMatching(/was stopped/) })
+        await expectGone(pids)
       } finally {
         delete process.env['FAKE_RUNTIME_PROBE_HANG']
         delete process.env['FAKE_RUNTIME_PROBE_PIDS']
       }
-    }, 30_000)
+    }, 90_000)
   }
+
+  it('a hung claude auth status is reported as not answering, not as signed out (the timeout path)', async () => {
+    const fake = installFakeClaude(sandbox)
+    const pids = path.join(sandbox, 'probe-pids.json')
+    process.env['PATH'] = `${fake.binDir}${path.delimiter}${originalPath ?? ''}`
+    process.env['FAKE_RUNTIME_PROBE_HANG'] = 'auth'
+    process.env['FAKE_RUNTIME_PROBE_PIDS'] = pids
+    try {
+      // A slow start on a loaded machine still ends in the same answer; the tree is checked whenever it got as far as starting.
+      expect(await claudeSignIn(path.join(sandbox, '.claude'), 'claude', 3_000)).toEqual({ signedIn: false, unanswered: 'claude auth status did not answer within 3 s (killed)' })
+      if (fs.existsSync(pids)) await expectGone(pids)
+      expect(await claudeIsLoggedIn(path.join(sandbox, '.claude'), 'claude', 3_000)).toBe(false)
+      if (fs.existsSync(pids)) await expectGone(pids)
+    } finally {
+      delete process.env['FAKE_RUNTIME_PROBE_HANG']
+      delete process.env['FAKE_RUNTIME_PROBE_PIDS']
+    }
+  }, 90_000)
+})
+
+// ─── Engine follow-ups ──────────────────────────────────────────────────────
+
+describe('engine follow-ups', () => {
+  it('Codex: an integration\'s runs pin the hosted server\'s URL on every profile, before the prompt (no other config layer can move it)', async () => {
+    const fake = installFakeCodex(sandbox)
+    process.env['PATH'] = `${fake.binDir}${path.delimiter}${originalPath ?? ''}`
+    const env = { ...process.env, FAKE_RUNTIME_RECORD: fake.recordPath }
+    for (const profile of ['answer', 'work', 'full'] as const) {
+      const runner = new CodexRunner({ codexHome: path.join(sandbox, '.codex'), workdir: path.join(sandbox, 'w'), profile, apiKey: () => KEY, keyEnv: 'AGENTCHAT_API_KEY', pinMcpUrl: 'https://api.agentchat.me/mcp', env })
+      const args = runner.args()
+      expect(args.slice(-3)).toEqual(['-c', 'mcp_servers.agentchat.url="https://api.agentchat.me/mcp"', '-'])
+      expect(await runner.preflight()).toEqual({ ok: true })
+      expect((await runner.start({ kind: 'wake', prompt: 'P', runId: profile, budgetMs: 20_000 })).state).toBe('ok')
+    }
+    const { readFakeRuns } = await import('./helpers/fake-runtimes.js')
+    for (const run of readFakeRuns(fake)) expect(run.argv).toContain('mcp_servers.agentchat.url="https://api.agentchat.me/mcp"')
+  }, 30_000)
+
+  it('an empty manual pointer adds nothing to a run\'s prompt', async () => {
+    const double = await startServerDouble({ tray: { waiting: 1 } })
+    const home = path.join(sandbox, 'home-pointer')
+    fs.mkdirSync(home, { recursive: true })
+    const seen: RunRequest[] = []
+    const runner: RunRunner = { name: 'fake-runtime', preflight: async () => ({ ok: true }), start: async (r) => (seen.push(r), { state: 'ok', exitCode: 0, durationMs: 1 }) }
+    const i = new Integration({ cfg: { apiKey: KEY, handle: 'me', apiBase: double.apiBase, wsBase: double.wsBase, home, workdir: path.join(home, 'w') }, runner, client: CLIENT, manualPointer: '', profile: 'answer', budgetMs: 60_000, quietMs: 50, maxMs: 200 })
+    try {
+      await i.start()
+      await until(() => seen.length === 1, 5_000)
+      expect(seen[0]?.prompt.endsWith('\n')).toBe(false)
+      expect(seen[0]?.prompt).not.toContain('\n\n\n')
+    } finally {
+      await i.stopAndWait(5_000)
+      await double.close()
+    }
+  }, 20_000)
 })

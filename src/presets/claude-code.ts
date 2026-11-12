@@ -248,6 +248,7 @@ export async function claudeIsLoggedIn(configDirOverride?: string, command = 'cl
 export async function inspectClaudeRuntime(configDirOverride?: string, command = 'claude', timeoutMs = PROBE_TIMEOUT_MS, signal?: AbortSignal): Promise<PresetInspection> {
   const version = await runProbe(command, ['--version'], { timeoutMs, env: claudeProcessEnv(configDirOverride, process.env), ...(signal !== undefined ? { signal } : {}) })
   if (version.timedOut) return { ok: false, detail: `claude --version did not answer within ${Math.round(timeoutMs / 1000)} s (killed)` }
+  if (signal?.aborted) return { ok: false, detail: 'claude --version was stopped' }
   if (version.error) return { ok: false, detail: `claude CLI not found on PATH (${version.error.message})` }
   const rendered = (version.stdout || version.stderr).trim()
   if (version.status !== 0) return { ok: false, detail: rendered || `claude --version exited ${version.status}` }

@@ -114,6 +114,7 @@ export const CODEX_PROBE_TIMEOUT_MS = 10_000
 export async function inspectCodexRuntime(codexHome: string, command = 'codex', timeoutMs = CODEX_PROBE_TIMEOUT_MS, signal?: AbortSignal): Promise<PresetInspection> {
   const result = await runProbe(command, ['--version'], { timeoutMs, env: { ...process.env, CODEX_HOME: codexHome }, ...(signal !== undefined ? { signal } : {}) })
   if (result.timedOut) return { ok: false, detail: `codex --version did not answer within ${Math.round(timeoutMs / 1000)} s (killed)` }
+  if (signal?.aborted) return { ok: false, detail: 'codex --version was stopped' }
   if (result.error) return { ok: false, detail: `codex CLI not found on PATH (${result.error.message})` }
   const rendered = (result.stdout || result.stderr).trim()
   if (result.status !== 0) return { ok: false, detail: rendered || `codex --version exited ${result.status}` }
@@ -203,6 +204,11 @@ export function codexClientHeadersToml(clientVersion: string = VERSION): string 
   return `{ ${pairs.join(', ')} }`
 }
 
+/** `-c mcp_servers.agentchat.url="<url>"`: the hosted server's URL pinned for one run, whatever another config layer says. */
+export function codexPinnedUrlArgs(url: string): string[] {
+  return ['-c', `mcp_servers.${CODEX_MCP_SERVER_NAME}.url=${JSON.stringify(url)}`]
+}
+
 /** The `-c` overrides that make `[mcp_servers.agentchat]` this agent's, for one run. TOML values, no key in them. */
 export function codexMcpOverrideArgs(override: CodexMcpOverride): string[] {
   const table = `mcp_servers.${CODEX_MCP_SERVER_NAME}`
@@ -250,6 +256,15 @@ export interface CodexRunnerOptions {
   readonly keyEnv: string
   /** Point the hosted server at this agent for each run (`-c` overrides); absent, config.toml decides. */
   readonly mcp?: CodexMcpOverride
+  /**
+   * Without `mcp` (an integration's own runs): the hosted server's URL
+   * (`<api base>/mcp`), pinned on every run with `-c mcp_servers.agentchat.url=…`
+   * so no other config layer — a trusted project's `.codex/config.toml`
+   * among them — can point the agentchat server, and the key its bearer
+   * variable carries, anywhere else. A layer that gives it a `command`
+   * instead makes the merged table invalid: the run does not start.
+   */
+  readonly pinMcpUrl?: string
   /** Test seam: the binary to run. */
   readonly command?: string
   readonly env?: NodeJS.ProcessEnv
@@ -436,7 +451,10 @@ export class CodexRunner implements RunRunner {
 
   /** The exact argv one run uses — exported for tests to pin per profile. An `answer` run adds `answerMcpDisables()` before the prompt. */
   args(): string[] {
-    return codexRunArgs(this.options.profile, { workdir: this.workdir(), ...(this.options.mcp !== undefined ? { mcp: this.options.mcp } : {}) })
+    const args = codexRunArgs(this.options.profile, { workdir: this.workdir(), ...(this.options.mcp !== undefined ? { mcp: this.options.mcp } : {}) })
+    if (this.options.mcp !== undefined || this.options.pinMcpUrl === undefined) return args
+    // The prompt stays the last positional.
+    return [...args.slice(0, -1), ...codexPinnedUrlArgs(this.options.pinMcpUrl), CODEX_PROMPT_FROM_STDIN]
   }
 
   /** The child environment: Codex's home and the key the hosted server needs, under the configured name. */

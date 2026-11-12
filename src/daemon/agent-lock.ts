@@ -1,8 +1,9 @@
 import * as crypto from 'node:crypto'
+import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import { normalizeHandle } from '../skill/identity-line.js'
-import { acquireLease, type LeaseAttempt, type LeaseHolder, type LeaseOptions } from '../util/lease.js'
+import { acquireLease, parseLease, pidAlive, type LeaseAttempt, type LeaseHolder, type LeaseOptions } from '../util/lease.js'
 
 // ─── One agent, one listener ────────────────────────────────────────────────
 //
@@ -72,4 +73,82 @@ export function agentLockRefusal(agent: { handle: string; home: string }, holder
       ? `another listener (its lock ${file} is being taken over right now)`
       : `${holder.home !== undefined ? holder.home : 'another identity home'} (pid ${holder.pid}${holder.host !== null ? ` on ${holder.host}` : ''}${holder.acquired_at !== undefined ? `, since ${holder.acquired_at}` : ''})`
   return `@${normalizeHandle(agent.handle)} is served by ${who}: this one (${path.resolve(agent.home)}) holds no socket and starts no run while it does, so no message is answered twice. Stop that one, or log out here; this one takes over when it stops.`
+}
+
+// ─── Standby markers: a healthy listener is waiting ─────────────────────────
+//
+// A holder whose runs fail for a runtime reason gives the agent up only when a
+// healthy listener for it is actually waiting — a lone install keeps its socket
+// (wakes keep arriving, are counted, and each starts a run). A standby says it
+// is waiting with a marker beside the lease (`<lock>.standby-<hash of its home>`),
+// rewritten on every standby poll and removed when it stops waiting. A marker
+// older than STANDBY_MARKER_FRESH_MS, or one whose pid is dead on this host, is
+// nobody. A refused key is given up whatever waits: that home cannot serve.
+
+/** How fresh a standby marker must be to count (three standby polls). */
+export const STANDBY_MARKER_FRESH_MS = 90_000
+
+function hostnameOf(): string {
+  try {
+    return os.hostname()
+  } catch {
+    return ''
+  }
+}
+
+/** The marker a standby in `home` keeps beside the agent lock at `lockFile`. */
+export function standbyMarkerPath(lockFile: string, home: string): string {
+  return `${lockFile}.standby-${crypto.createHash('sha256').update(path.resolve(home)).digest('hex').slice(0, 16)}`
+}
+
+/** Say (again) that the standby in `home` is waiting to serve the agent. Best effort; never throws. */
+export function markStandby(lockFile: string, home: string): void {
+  const file = standbyMarkerPath(lockFile, home)
+  const content = `${process.pid}\n${JSON.stringify({ pid: process.pid, host: hostnameOf(), home: path.resolve(home), at: Date.now() })}\n`
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 })
+    const temp = `${file}.${crypto.randomUUID()}`
+    fs.writeFileSync(temp, content, { mode: 0o600 })
+    fs.renameSync(temp, file)
+  } catch {
+    /* no marker: the holder simply keeps serving */
+  }
+}
+
+/** The standby in `home` no longer waits (it serves now, or stops). Never throws. */
+export function clearStandby(lockFile: string, home: string): void {
+  try {
+    fs.rmSync(standbyMarkerPath(lockFile, home), { force: true })
+  } catch {
+    /* gone already */
+  }
+}
+
+/** Whether a healthy standby other than `home` is waiting for the agent at `lockFile`. */
+export function standbyWaiting(lockFile: string, home: string, now: number = Date.now()): boolean {
+  const own = standbyMarkerPath(lockFile, home)
+  const prefix = `${path.basename(lockFile)}.standby-`
+  let names: string[]
+  try {
+    names = fs.readdirSync(path.dirname(lockFile))
+  } catch {
+    return false
+  }
+  for (const name of names) {
+    if (!name.startsWith(prefix) || name.includes('.', prefix.length)) continue
+    const file = path.join(path.dirname(lockFile), name)
+    if (file === own) continue
+    try {
+      const st = fs.statSync(file)
+      if (Math.abs(now - st.mtimeMs) >= STANDBY_MARKER_FRESH_MS) continue
+      const marker = parseLease(fs.readFileSync(file, 'utf-8'))
+      if (marker === null) continue
+      const sameHost = marker.host === null || marker.host === hostnameOf()
+      if (sameHost && !pidAlive(marker.pid)) continue
+      return true
+    } catch {
+      continue
+    }
+  }
+  return false
 }

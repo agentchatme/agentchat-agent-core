@@ -98,6 +98,26 @@ export interface IntegrationStatus {
    * run succeeds. Null or absent when runs are fine (or an older daemon wrote the file).
    */
   runs_failing?: IntegrationRunsFailing | null
+  /**
+   * This home gave its agent up because it cannot serve it — the server
+   * refuses its key, or its runs fail for a runtime reason while a healthy
+   * listener for the agent waits — and holds no socket until a recheck passes.
+   * Null or absent when it serves (or stands by for another).
+   */
+  unservable?: IntegrationUnservable | null
+  /** Lock renewals that failed (the lock folder gone, a full disk, permissions), and the last message; null or absent when none did. */
+  lease_errors?: { readonly count: number; readonly last: string | null } | null
+}
+
+export interface IntegrationUnservable {
+  /** `key_refused`: the server refuses this home's key. `runs_failing`: the runtime's own check fails. */
+  readonly reason: 'key_refused' | 'runs_failing'
+  /** What was said: the refusal, or the runtime check's words. */
+  readonly detail: string
+  /** When this home gave the agent up. */
+  readonly since: string
+  /** When it checks again (the runtime first, for `runs_failing`). */
+  readonly retry_at: string
 }
 
 export interface IntegrationStandby {
@@ -204,6 +224,8 @@ const StatusSchema = z
     capabilities: z.array(z.string()).nullable().optional(),
     standby: z.object({ home: z.string().nullable(), pid: z.number().nullable(), since: z.string().nullable() }).nullable().optional(),
     runs_failing: z.object({ reason: z.string(), since: z.string(), runs_missed: z.number(), checked_at: z.string() }).nullable().optional(),
+    unservable: z.object({ reason: z.enum(['key_refused', 'runs_failing']), detail: z.string(), since: z.string(), retry_at: z.string() }).nullable().optional(),
+    lease_errors: z.object({ count: z.number(), last: z.string().nullable() }).nullable().optional(),
     recent_cycles: z
       .array(z.object({ at: z.string(), outcome: z.string(), cards: z.number(), invites: z.number(), failure: z.string().nullable() }))
       .nullable()
@@ -243,6 +265,8 @@ function normalize(raw: z.infer<typeof StatusSchema>): IntegrationStatus {
     intake_paused: raw.intake_paused ?? null,
     standby: raw.standby ?? null,
     runs_failing: raw.runs_failing ?? null,
+    unservable: raw.unservable ?? null,
+    lease_errors: raw.lease_errors ?? null,
   }
 }
 
@@ -319,15 +343,36 @@ export function formatIntegrationStatus(status: IntegrationStatus | null, now = 
   const profileWarning = runProfileWarning(status.profile)
   const standby = status.standby ?? null
   const failing = status.runs_failing ?? null
+  const unservable = status.unservable ?? null
   const lines = [
     `Integration: socket ${status.socket}${stale ? ` (status last written ${ago(age)} — the daemon may be down)` : ''}${
-      standby !== null ? ' — standing by: another listener serves this agent' : failing !== null ? ' — but runs are failing (below)' : ''
+      unservable !== null
+        ? ' — this home gave the agent up (below)'
+        : standby !== null
+          ? ' — standing by: another listener serves this agent'
+          : failing !== null
+            ? ' — but runs are failing (below)'
+            : ''
     }`,
+    ...(unservable !== null
+      ? [
+          `  gave up: ${unservable.reason === 'key_refused' ? 'the server refuses this home\'s key' : 'runs fail for a runtime reason, and another listener for the agent was waiting'} — ${unservable.detail} (since ${unservable.since}). No socket, no run here; checked again at ${unservable.retry_at}${
+            unservable.reason === 'runs_failing' ? ' (the runtime first)' : ''
+          }; it serves again when that passes and no other listener holds the agent.`,
+        ]
+      : []),
     ...(standby !== null
       ? [`  standby: ${standby.home ?? 'another identity home'}${standby.pid !== null ? ` (pid ${standby.pid})` : ''} serves this agent${standby.since !== null ? ` since ${standby.since}` : ''}; this one holds no socket and starts no run while it does (no message is answered twice), and takes over when it stops`]
       : []),
     ...(failing !== null
-      ? [`  runs failing: ${failing.reason} — since ${failing.since} (${ago(Math.max(0, now - Date.parse(failing.since)))}), ${failing.runs_missed} run(s) missed; checked ${ago(Math.max(0, now - Date.parse(failing.checked_at)))}. Wakes still arrive and are counted; the next run that succeeds clears this.`]
+      ? [
+          `  runs failing: ${failing.reason} — since ${failing.since} (${ago(Math.max(0, now - Date.parse(failing.since)))}), ${failing.runs_missed} run(s) missed; checked ${ago(Math.max(0, now - Date.parse(failing.checked_at)))}. ${
+            unservable !== null ? 'The runtime recheck clears this.' : 'Wakes still arrive, are counted and start runs; the next run that succeeds clears this.'
+          }`,
+        ]
+      : []),
+    ...(status.lease_errors !== undefined && status.lease_errors !== null && status.lease_errors.count > 0
+      ? [`  lock: ${status.lease_errors.count} renewal(s) failed${status.lease_errors.last ? ` (last: ${status.lease_errors.last})` : ''}; a lock that cannot be renewed for 45 s is given up`]
       : []),
     '  delivery: acknowledged on receipt by the SDK socket (delivered = this machine received it; read is the agent’s own verdict inside its run)',
     `  wakes: ${status.wakes} (${status.wakes_absorbed} absorbed into a pending run), invites: ${status.invites}`,

@@ -14,8 +14,11 @@ import { acquireLease, type Lease, type LeaseOptions } from '../util/lease.js'
 
 export type LockHandle = Lease
 
+/** The leader lock's file name in an identity home (consumers that stop or inspect a daemon read it). */
+export const DAEMON_LOCK_FILE = 'daemon.lock'
+
 export async function acquireLeaderLock(home: string, options: LeaseOptions = {}): Promise<LockHandle | null> {
-  const lockPath = path.join(home, 'daemon.lock')
+  const lockPath = path.join(home, DAEMON_LOCK_FILE)
   const attempt = await acquireLease(lockPath, { home: path.resolve(home) }, options)
   if (attempt.ok) return attempt.lease
   log.error(`another agentchat daemon already holds ${lockPath}${attempt.holder !== null ? ` (pid ${attempt.holder.pid})` : ''}`)
