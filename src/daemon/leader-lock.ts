@@ -1,6 +1,6 @@
 import * as path from 'node:path'
 import { log } from '../util/log.js'
-import { acquireLease, type Lease, type LeaseOptions } from '../util/lease.js'
+import { acquireLease, leaseStartupObserveMs, type Lease, type LeaseOptions } from '../util/lease.js'
 
 // ─── Single-instance lock (per identity home) ───────────────────────────────
 //
@@ -17,9 +17,17 @@ export type LockHandle = Lease
 /** The leader lock's file name in an identity home (consumers that stop or inspect a daemon read it). */
 export const DAEMON_LOCK_FILE = 'daemon.lock'
 
+/**
+ * Take the home's leader lock, once, as a daemon starts. A held lease is
+ * watched for the stale window plus a renewal before refusing (unless
+ * `options.observeMs` says otherwise): a holder that is there renews within it
+ * (refused, within one renewal), and one whose pid was reused — a reboot, a
+ * logoff that killed the daemon — is taken over by this process instead of
+ * leaving a service to restart into the same first look for ever.
+ */
 export async function acquireLeaderLock(home: string, options: LeaseOptions = {}): Promise<LockHandle | null> {
   const lockPath = path.join(home, DAEMON_LOCK_FILE)
-  const attempt = await acquireLease(lockPath, { home: path.resolve(home) }, options)
+  const attempt = await acquireLease(lockPath, { home: path.resolve(home) }, { observeMs: leaseStartupObserveMs(options), ...options })
   if (attempt.ok) return attempt.lease
   log.error(`another agentchat daemon already holds ${lockPath}${attempt.holder !== null ? ` (pid ${attempt.holder.pid})` : ''}`)
   return null

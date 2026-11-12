@@ -18,11 +18,21 @@ import * as path from 'node:path'
 // holder's wall clock with its own (the Kubernetes leader-election rule): a
 // lease is stale when its content (token + renewed_at) has not changed for
 // STALE_MS on the contender's own monotonic clock since it first saw that
-// content. A monotonic clock does not run while the machine sleeps, so after a
-// laptop wakes the holder's next renewal (≤ RENEW_MS) arrives before any
-// contender can judge it stale; wall-clock steps and another host's skew do not
-// enter at all. One shortcut: a holder whose pid is dead on this host is gone
-// at once.
+// content. Wall-clock steps and another host's skew do not enter.
+//
+// Sleep is not the same everywhere: Node's monotonic clock stops while a Linux
+// machine is suspended but keeps running through a macOS sleep. So a contender
+// waking from sleep can find an unchanged lease that already looks STALE_MS
+// old, before the holder (woken at the same moment) has fired its overdue
+// renewal. A stale verdict by observation is therefore confirmed by a second
+// look CONFIRM (1.5 renewals) later: a holder that is there has renewed by then.
+//
+// Shortcuts: a holder whose pid is dead on this host is gone at once, and so is
+// a lease on this host last written before the current boot (its pid belongs to
+// someone else now). A daemon starting up keeps observing for the stale window
+// plus a renewal before it refuses (`observeMs`): a lease whose pid was reused
+// is then taken over by that same process, not left to a restart that would
+// begin observing from scratch (and refuse again, for ever).
 //
 // Taking over a stale lease, renewing one and releasing one all happen under a
 // short O_EXCL guard (`<file>.takeover`), and no one but the holder writes the
@@ -66,10 +76,17 @@ export interface LeaseOptions {
   readonly staleMs?: number
   /** Test seam: the wall clock (for `renewed_at` and file ages). */
   readonly now?: () => number
-  /** Test seam: the monotonic clock (ms) staleness is observed on. Defaults to `performance.now()`, which does not run while the machine sleeps. */
+  /** Test seam: the monotonic clock (ms) staleness is observed on. Defaults to `performance.now()` (on macOS it runs on through sleep; hence the second look). */
   readonly monotonic?: () => number
   /** Test seam: when this machine booted (epoch ms). */
   readonly bootedAt?: () => number
+  /**
+   * Keep observing a held lease for up to this long before refusing (default
+   * 0: one look). A holder seen renewing in that time is there: refused at once.
+   */
+  readonly observeMs?: number
+  /** Stops the waits (observing, confirming): the attempt is refused. */
+  readonly signal?: AbortSignal
 }
 
 const WRITE_GRACE_MS = 5_000
@@ -80,6 +97,30 @@ const ATTEMPTS = 40
 const BACKOFF_MS = 25
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
+
+/** Sleep `ms`, or less if `signal` fires. */
+function pause(ms: number, signal: AbortSignal | undefined): Promise<void> {
+  if (signal?.aborted === true) return Promise.resolve()
+  return new Promise((resolve) => {
+    const done = (): void => {
+      clearTimeout(timer)
+      signal?.removeEventListener('abort', done)
+      resolve()
+    }
+    const timer = setTimeout(done, ms)
+    signal?.addEventListener('abort', done, { once: true })
+  })
+}
+
+/** How long after a stale verdict by observation the second look comes: a holder that is there renews within it. */
+export function leaseConfirmMs(renewMs: number = LEASE_RENEW_MS): number {
+  return Math.round(renewMs * 1.5)
+}
+
+/** How long a daemon starting up observes a held lease before it refuses: the stale window plus a renewal. */
+export function leaseStartupObserveMs(options: { renewMs?: number; staleMs?: number } = {}): number {
+  return (options.staleMs ?? LEASE_STALE_MS) + (options.renewMs ?? LEASE_RENEW_MS)
+}
 
 function hostname(): string {
   try {
@@ -155,20 +196,32 @@ export function holderLive(holder: LeaseHolder, at: { now?: number; staleMs?: nu
 const observations = new Map<string, { readonly signature: string; readonly firstSeen: number }>()
 
 /**
- * The observed judgement a contender takes over by: 'held', 'stale', or
- * 'writing' (a file being created right now).
+ * The judgement a contender takes over by: 'held'; 'stale' (certain: a dead
+ * pid here, a lease from before this boot, a bare pid that is gone);
+ * 'observed' (unchanged for the stale window: confirmed by a second look before
+ * a takeover); or 'writing' (a file being created right now).
  */
-function judge(file: string, holder: LeaseHolder | null, ctx: { now: number; mono: number; staleMs: number; booted: number }): 'held' | 'stale' | 'writing' {
+function judge(file: string, holder: LeaseHolder | null, ctx: { now: number; mono: number; staleMs: number; booted: number }): 'held' | 'stale' | 'observed' | 'writing' {
   if (holder === null) return mtimeOf(file) !== null && ctx.now - (mtimeOf(file) ?? 0) < WRITE_GRACE_MS ? 'writing' : 'stale'
   if (holder.renewed_at === null) return legacyLive(holder, mtimeOf(file), ctx.booted) ? 'held' : 'stale'
-  if (sameHost(holder) && !pidAlive(holder.pid)) return 'stale'
+  if (sameHost(holder)) {
+    if (!pidAlive(holder.pid)) return 'stale'
+    // Last written (by its renewal and by its own clock) before this machine booted: that process is gone.
+    const mtime = mtimeOf(file)
+    if (mtime !== null && mtime < ctx.booted - BOOT_MARGIN_MS && holder.renewed_at < ctx.booted - BOOT_MARGIN_MS) return 'stale'
+  }
   const signature = `${holder.token ?? ''}\u0000${holder.renewed_at}`
   const seen = observations.get(file)
   if (seen === undefined || seen.signature !== signature) {
     observations.set(file, { signature, firstSeen: ctx.mono })
     return 'held'
   }
-  return ctx.mono - seen.firstSeen >= ctx.staleMs ? 'stale' : 'held'
+  return ctx.mono - seen.firstSeen >= ctx.staleMs ? 'observed' : 'held'
+}
+
+/** What changes on every renewal: the content observation is keyed on. */
+function signatureOf(holder: LeaseHolder | null): string | null {
+  return holder === null || holder.renewed_at === null ? null : `${holder.token ?? ''}\u0000${holder.renewed_at}`
 }
 
 function readRaw(file: string): string | null {
@@ -259,34 +312,63 @@ function withGuard(file: string, now: number, fn: () => void): boolean {
 
 /**
  * Acquire the lease at `file`. Refused (naming the holder) while a holder is
- * there; a stale one — by the observed rule — is taken over under the guard.
- * Async: it waits on other processes without blocking this one.
+ * there; a stale one — by the observed rule, confirmed by a second look — is
+ * taken over under the guard. With `observeMs`, a held lease is watched that
+ * long before refusing. Async: it waits without blocking this process.
  */
 export async function acquireLease(file: string, info: { home?: string; label?: string } = {}, options: LeaseOptions = {}): Promise<LeaseAttempt> {
   const now = options.now ?? Date.now
   const mono = options.monotonic ?? (() => performance.now())
   const staleMs = options.staleMs ?? LEASE_STALE_MS
+  const renewMs = options.renewMs ?? LEASE_RENEW_MS
   const booted = (options.bootedAt ?? (() => bootedAt(now())))()
+  const signal = options.signal
+  const observeUntil = performance.now() + (options.observeMs ?? 0)
+  const pollMs = Math.max(50, Math.min(1_000, Math.round(renewMs / 4)))
+  let firstSignature: string | null = null
+  /** The content a second look found unchanged: a takeover contended under the guard does not look again. */
+  let confirmed: string | null = null
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 })
   const token = crypto.randomUUID()
   const acquiredAt = new Date(now()).toISOString()
   const render = (renewedAt: number): string =>
     `${process.pid}\n${JSON.stringify({ pid: process.pid, token, host: hostname(), ...info, acquired_at: acquiredAt, renewed_at: renewedAt })}\n`
-  for (let attempt = 0; attempt < ATTEMPTS; attempt++) {
+  let attempt = 0
+  while (attempt < ATTEMPTS) {
     if (createExclusive(file, render(now()))) {
       observations.delete(file)
       return { ok: true, lease: startLease(file, token, render, options) }
     }
     const raw = readRaw(file)
-    if (raw === null) continue // removed in between: create again
+    if (raw === null) {
+      attempt += 1 // removed in between: create again
+      continue
+    }
     const holder = parseLease(raw)
     const verdict = judge(file, holder, { now: now(), mono: mono(), staleMs, booted })
     if (verdict === 'writing') {
+      attempt += 1
       await sleep(BACKOFF_MS)
       continue
     }
-    if (verdict === 'held') return { ok: false, path: file, holder }
+    if (verdict === 'observed' && raw !== confirmed) {
+      // Unchanged for the stale window — or the machine slept on a clock that
+      // kept counting. A second look, once a holder that is there has renewed.
+      await pause(leaseConfirmMs(renewMs), signal)
+      if (signal?.aborted === true) return { ok: false, path: file, holder }
+      if (readRaw(file) !== raw) continue // it renewed (or changed hands): judged afresh
+      confirmed = raw
+    } else if (verdict === 'held') {
+      const signature = signatureOf(holder)
+      // Seen renewing while observed: the holder is there.
+      if (firstSignature !== null && signature !== firstSignature) return { ok: false, path: file, holder }
+      firstSignature ??= signature
+      if (signature === null || performance.now() >= observeUntil || signal?.aborted === true) return { ok: false, path: file, holder }
+      await pause(pollMs, signal)
+      continue
+    }
     // Stale: removed under the guard, if it is still the very file judged stale.
+    attempt += 1
     if (!withGuard(file, now(), () => removeIfStill(file, raw))) await sleep(BACKOFF_MS)
   }
   // Contended past every attempt: name a holder only if one is there by a one-look judgement.

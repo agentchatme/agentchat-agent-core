@@ -4,7 +4,7 @@ import * as os from 'node:os'
 import * as path from 'node:path'
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import { pathToFileURL } from 'node:url'
-import { acquireLease, holderLive, parseLease, pidAlive, resetLeaseObservations, type LeaseHolder } from '../src/util/lease.js'
+import { acquireLease, holderLive, leaseConfirmMs, leaseStartupObserveMs, parseLease, pidAlive, resetLeaseObservations, type LeaseHolder } from '../src/util/lease.js'
 import { acquireAgentLock, agentLockDir, agentLockPath, AGENT_LOCK_DIR_ENV, standbyMarkerPath } from '../src/daemon/agent-lock.js'
 import { acquireLeaderLock } from '../src/daemon/leader-lock.js'
 import { lockedDaemonPid } from '../src/daemon/service.js'
@@ -215,7 +215,7 @@ describe('the lease: O_EXCL, the bare pid first, renewed by its holder, taken ov
         resetLeaseObservations()
         leaseFile(file, { pid, renewed_at: Date.now() - 3_600_000 }) // an hour-old wall clock: not evidence
         let mono = 0
-        const clocks = { monotonic: () => mono }
+        const clocks = { monotonic: () => mono, renewMs: 20 } // the second look after a stale verdict: 30 ms here
         expect((await acquireLease(file, {}, clocks)).ok).toBe(false) // first seen: held
         mono = 44_000
         expect((await acquireLease(file, {}, clocks)).ok).toBe(false)
@@ -229,32 +229,122 @@ describe('the lease: O_EXCL, the bare pid first, renewed by its holder, taken ov
     }
   })
 
-  it('laptop sleep: the wall clock jumps hours, the monotonic clock does not, and the holder\'s renewal on wake keeps it — no takeover, no two serving', async () => {
+  it('a stale verdict by observation is confirmed by a second look 1.5 renewals later: a holder that renews in between keeps its lease', async () => {
+    expect(leaseConfirmMs()).toBe(15_000)
     resetLeaseObservations()
     const file = path.join(sandbox, 'x.lock')
     const live = sleeper()
     try {
-      const t0 = Date.now()
-      leaseFile(file, { pid: live.pid ?? 0, renewed_at: t0, token: 'holder' })
-      let mono = 1_000
-      let wall = t0
-      const clocks = { monotonic: () => mono, now: () => wall }
-      expect((await acquireLease(file, {}, clocks)).ok).toBe(false)
-      // Asleep three hours: wall time moves, monotonic time (paused in sleep) barely.
-      wall = t0 + 3 * 3_600_000
-      mono = 6_000
-      expect((await acquireLease(file, {}, clocks)).ok).toBe(false)
-      // On wake the holder renews (new content): a fresh observation.
-      leaseFile(file, { pid: live.pid ?? 0, renewed_at: wall, token: 'holder' })
-      mono = 40_000
-      expect((await acquireLease(file, {}, clocks)).ok).toBe(false)
-      mono = 84_000
-      expect((await acquireLease(file, {}, clocks)).ok).toBe(false)
-      // It stops renewing for good: 45 s observed, then taken over.
-      mono = 86_000
-      const r = await acquireLease(file, {}, clocks)
+      leaseFile(file, { pid: live.pid ?? 0, renewed_at: Date.now(), token: 'holder' })
+      let mono = 0
+      const opts = { monotonic: () => mono, renewMs: 200 }
+      expect((await acquireLease(file, {}, opts)).ok).toBe(false)
+      // Unchanged for the window, as a clock that ran on through a macOS sleep says on wake.
+      mono = 46_000
+      const t0 = performance.now()
+      const pending = acquireLease(file, {}, opts)
+      await new Promise((r) => setTimeout(r, 50))
+      leaseFile(file, { pid: live.pid ?? 0, renewed_at: Date.now(), token: 'holder' }) // the holder, awake too, renews
+      expect((await pending).ok).toBe(false)
+      expect(performance.now() - t0).toBeGreaterThanOrEqual(250)
+      // Unchanged through the second look as well: gone, taken over.
+      mono = 100_000
+      const r = await acquireLease(file, {}, opts)
       expect(r.ok).toBe(true)
       if (r.ok) r.lease.release()
+    } finally {
+      live.kill('SIGKILL')
+    }
+  })
+
+  it.skipIf(!posix() || !stripTypes())('sleep on a clock that keeps running (macOS): the standby wakes first and finds the lease unchanged past the window, the holder renews late — no takeover, no two serving', async () => {
+    const file = path.join(sandbox, 'sleep.lock')
+    const holderOut = path.join(sandbox, 'holder.txt')
+    const contenderOut = path.join(sandbox, 'contender.txt')
+    const done = path.join(sandbox, 'done')
+    const lib = pathToFileURL(path.join(__dirname, '..', 'src', 'util', 'lease.ts')).href
+    const timing = '{ renewMs: 500, staleMs: 1500 }'
+    const holderScript = [
+      "const fs = require('node:fs')",
+      'const [lib, file, out, done] = process.argv.slice(1)',
+      'import(lib).then(async (m) => {',
+      `  const r = await m.acquireLease(file, { label: 'holder' }, ${timing})`,
+      "  if (!r.ok) { fs.appendFileSync(out, 'refused\\n'); process.exit(3) }",
+      "  r.lease.onLost((why) => fs.appendFileSync(out, 'lost ' + why + '\\n'))",
+      "  fs.appendFileSync(out, 'held\\n')",
+      '  const poll = setInterval(() => { if (fs.existsSync(done)) { clearInterval(poll); r.lease.release(); process.exit(0) } }, 20)',
+      '})',
+      'setTimeout(() => process.exit(2), 120000).unref()',
+    ].join('\n')
+    const contenderScript = [
+      "const fs = require('node:fs')",
+      'const [lib, file, out, done] = process.argv.slice(1)',
+      'import(lib).then(async (m) => {',
+      '  let looks = 0',
+      '  while (!fs.existsSync(done)) {',
+      `    const r = await m.acquireLease(file, { label: 'contender' }, ${timing})`,
+      "    if (r.ok) { fs.appendFileSync(out, 'took\\n'); r.lease.release(); break }",
+      "    if (++looks === 1) fs.appendFileSync(out, 'watching\\n')",
+      '    await new Promise((resolve) => setTimeout(resolve, 100))',
+      '  }',
+      '  process.exit(0)',
+      '})',
+      'setTimeout(() => process.exit(2), 120000).unref()',
+    ].join('\n')
+    const spawnScript = (script: string, out: string): ChildProcess => spawn(process.execPath, ['--experimental-strip-types', '--no-warnings', '-e', script, lib, file, out, done], { stdio: 'ignore' })
+    const read = (f: string): string => (fs.existsSync(f) ? fs.readFileSync(f, 'utf-8') : '')
+    const exited = (k: ChildProcess): Promise<unknown> => new Promise((r) => (k.exitCode !== null || k.signalCode !== null ? r(null) : k.once('exit', r)))
+    const holder = spawnScript(holderScript, holderOut)
+    let contender: ChildProcess | null = null
+    try {
+      await until(() => read(holderOut).includes('held'), 30_000)
+      contender = spawnScript(contenderScript, contenderOut)
+      await until(() => read(contenderOut).includes('watching'), 30_000)
+      await new Promise((r) => setTimeout(r, 700))
+      // Both asleep, on clocks that keep counting (a stopped process's monotonic clock runs on, as macOS's does in sleep).
+      holder.kill('SIGSTOP')
+      contender.kill('SIGSTOP')
+      await new Promise((r) => setTimeout(r, 2_500))
+      // The standby wakes first; the holder's overdue renewal comes a moment later.
+      contender.kill('SIGCONT')
+      await new Promise((r) => setTimeout(r, 150))
+      holder.kill('SIGCONT')
+      await new Promise((r) => setTimeout(r, 2_000))
+      expect(read(contenderOut)).not.toContain('took')
+      expect(read(holderOut)).not.toContain('lost')
+    } finally {
+      fs.writeFileSync(done, '')
+      for (const k of [holder, contender]) {
+        if (k === null) continue
+        try {
+          k.kill('SIGCONT')
+        } catch {
+          /* gone */
+        }
+      }
+      await Promise.race([Promise.all([exited(holder), contender === null ? null : exited(contender)]), new Promise((r) => setTimeout(r, 3_000))])
+      for (const k of [holder, contender]) if (k !== null && k.exitCode === null && k.signalCode === null) k.kill('SIGKILL')
+    }
+  }, 60_000)
+
+  it('a lease on this host last written before this boot is stale at once (its pid is someone else\'s now); another host\'s, or one written since, is not', async () => {
+    resetLeaseObservations()
+    const file = path.join(sandbox, 'x.lock')
+    const live = sleeper()
+    try {
+      const old = Date.now() - 3 * 3_600_000
+      const bootedAt = (): number => Date.now() - 3_600_000
+      leaseFile(file, { pid: live.pid ?? 0, renewed_at: old })
+      fs.utimesSync(file, new Date(old), new Date(old))
+      const r = await acquireLease(file, {}, { bootedAt })
+      expect(r.ok).toBe(true)
+      if (r.ok) r.lease.release()
+      leaseFile(file, { pid: live.pid ?? 0, renewed_at: old, host: 'other-host' })
+      fs.utimesSync(file, new Date(old), new Date(old))
+      expect((await acquireLease(file, {}, { bootedAt })).ok).toBe(false)
+      resetLeaseObservations()
+      leaseFile(file, { pid: live.pid ?? 0, renewed_at: old }) // touched since the boot
+      expect((await acquireLease(file, {}, { bootedAt })).ok).toBe(false)
     } finally {
       live.kill('SIGKILL')
     }
@@ -265,9 +355,9 @@ describe('the lease: O_EXCL, the bare pid first, renewed by its holder, taken ov
     const file = path.join(sandbox, 'x.lock')
     leaseFile(file, { pid: 999_999, renewed_at: Date.now() - 10 * 3_600_000, host: 'skewed-host' })
     let mono = 0
-    expect((await acquireLease(file, {}, { monotonic: () => mono })).ok).toBe(false)
+    expect((await acquireLease(file, {}, { monotonic: () => mono, renewMs: 20 })).ok).toBe(false)
     mono = 46_000
-    const r = await acquireLease(file, {}, { monotonic: () => mono })
+    const r = await acquireLease(file, {}, { monotonic: () => mono, renewMs: 20 })
     expect(r.ok).toBe(true)
     if (r.ok) r.lease.release()
   })
@@ -392,17 +482,34 @@ describe('the lease: O_EXCL, the bare pid first, renewed by its holder, taken ov
     }
   }, 90_000)
 
-  it('the home lock (leader lock) is the same lease; an older release\'s stale bare-pid lock is taken over', async () => {
+  it('the home lock (leader lock) is the same lease; a holder seen renewing is refused within a renewal; an older release\'s stale bare-pid lock is taken over', async () => {
     const home = path.join(sandbox, 'home')
-    const a = await acquireLeaderLock(home)
+    const a = await acquireLeaderLock(home, { renewMs: 100, staleMs: 600 })
     expect(a).not.toBeNull()
-    expect(await acquireLeaderLock(home)).toBeNull()
+    const t0 = performance.now()
+    expect(await acquireLeaderLock(home, { renewMs: 100, staleMs: 600 })).toBeNull()
+    expect(performance.now() - t0).toBeLessThan(600) // refused on its renewal, not at the end of the window
     a?.release()
     fs.writeFileSync(path.join(home, 'daemon.lock'), String(deadPid()))
     const b = await acquireLeaderLock(home)
     expect(b).not.toBeNull()
     b?.release()
   })
+
+  it('a fresh start observes a held daemon.lock before refusing: pid 1 / EPERM renewed 3 h ago is taken over by the same process within the stale window plus a renewal', async () => {
+    expect(leaseStartupObserveMs()).toBe(55_000)
+    const home = path.join(sandbox, 'home')
+    fs.mkdirSync(home, { recursive: true })
+    resetLeaseObservations() // a new process: nothing observed yet
+    leaseFile(path.join(home, 'daemon.lock'), { pid: EPERM_PID, renewed_at: Date.now() - 3 * 3_600_000 })
+    const t0 = performance.now()
+    const b = await acquireLeaderLock(home, { renewMs: 100, staleMs: 600 })
+    const took = performance.now() - t0
+    expect(b).not.toBeNull()
+    expect(took).toBeGreaterThanOrEqual(600) // observed for the window, not taken on sight
+    expect(took).toBeLessThan(10_000)
+    b?.release()
+  }, 30_000)
 })
 
 function posix(): boolean {
@@ -660,23 +767,120 @@ describe('one agent, one listener: the supervisor', () => {
     }
   }, 30_000)
 
-  it('a daemon whose home lock is taken over exits at once (code 1)', async () => {
-    double = await startServerDouble({ tray: { waiting: 0 } })
+  it('a daemon whose home lock is taken over stops serving at once (a wake right after starts no run) and exits (code 1)', async () => {
+    double = await startServerDouble({ tray: { waiting: 1 } })
     const home1 = path.join(sandbox, 'h-lost')
     signIn(home1, KEY, double.apiBase)
-    // A minute between polls: only the nudge can make the exit immediate.
-    const a = daemon(home1, okRunner(), { pollMs: 60_000 })
+    const runner = new ScriptedRunner({ state: 'ok', exitCode: 0, durationMs: 1 }, { ok: true })
+    // A minute between polls (only the nudge makes the exit prompt) and a 2 s loop tick (only the lease's own stop is at once).
+    const a = daemon(home1, runner, { pollMs: 60_000, tickMs: 2_000, lease: { renewMs: 50 } })
     await until(() => readIntegrationStatus(home1)?.socket === 'ready', 10_000)
+    await new Promise((r) => setTimeout(r, 500))
     const other = sleeper()
     try {
+      const starts = runner.starts
       leaseFile(path.join(home1, 'daemon.lock'), { pid: other.pid ?? 0, renewed_at: Date.now(), home: home1 })
       const t0 = Date.now()
+      await new Promise((r) => setTimeout(r, 300))
+      double.send({ type: 'message.new', payload: { id: 'm-after', conversation_id: 'conv_1', sender: 'peer', content: { text: 'x' } } })
       expect(await a.done).toBe(1)
       expect(Date.now() - t0).toBeLessThan(5_000)
+      expect(runner.starts).toBe(starts)
     } finally {
       other.kill('SIGKILL')
     }
   }, 30_000)
+
+  it('a lost agent lock stops the integration at once: a wake right after the loss starts no run, before the loop next looks', async () => {
+    double = await startServerDouble({ tray: { waiting: 1 } })
+    const home1 = path.join(sandbox, 'h-lost-agent')
+    signIn(home1, KEY, double.apiBase)
+    const runner = new ScriptedRunner({ state: 'ok', exitCode: 0, durationMs: 1 }, { ok: true })
+    const a = daemon(home1, runner, { tickMs: 3_000, lease: { renewMs: 50 } })
+    const other = sleeper()
+    try {
+      await until(() => readIntegrationStatus(home1)?.socket === 'ready', 10_000)
+      await new Promise((r) => setTimeout(r, 500))
+      const starts = runner.starts
+      leaseFile(agentLockPath({ apiBase: double.apiBase, handle: 'probe' }), { pid: other.pid ?? 0, renewed_at: Date.now(), home: '/the/other/home' })
+      await new Promise((r) => setTimeout(r, 400)) // its next renewal (50 ms) finds it lost
+      double.send({ type: 'message.new', payload: { id: 'm-after', conversation_id: 'conv_1', sender: 'peer', content: { text: 'x' } } })
+      await new Promise((r) => setTimeout(r, 1_000))
+      expect(runner.starts).toBe(starts)
+      expect(readIntegrationStatus(home1)?.socket).not.toBe('ready')
+    } finally {
+      other.kill('SIGKILL')
+      await a.stop()
+    }
+  }, 30_000)
+
+  it('a standby in the middle of a second look (15 s at the real renewal interval) stops at once with the daemon', async () => {
+    double = await startServerDouble({ tray: { waiting: 0 } })
+    const home1 = path.join(sandbox, 'confirming-home')
+    signIn(home1, KEY, double.apiBase)
+    const other = sleeper()
+    try {
+      // An agent lock held by a live pid that never renews: observed stale after 300 ms here, then the 15 s second look.
+      leaseFile(agentLockPath({ apiBase: double.apiBase, handle: 'probe' }), { pid: other.pid ?? 0, renewed_at: Date.now(), home: '/the/other/home' })
+      const a = daemon(home1, okRunner(), { lease: { renewMs: 10_000, staleMs: 300 } })
+      await until(() => (readIntegrationStatus(home1)?.standby ?? null) !== null, 10_000)
+      await new Promise((r) => setTimeout(r, 1_000)) // well into the second look
+      const t0 = Date.now()
+      expect(await a.stop()).toBe(0)
+      expect(Date.now() - t0).toBeLessThan(3_000)
+    } finally {
+      other.kill('SIGKILL')
+    }
+  }, 30_000)
+
+  it('a daemon.lock whose pid was reused (pid 1 / EPERM, renewed 3 h ago): a fresh start takes it over within the stale window plus a renewal, instead of exiting into a restart loop', async () => {
+    double = await startServerDouble({ tray: { waiting: 0 } })
+    const home1 = path.join(sandbox, 'rebooted-home')
+    signIn(home1, KEY, double.apiBase)
+    leaseFile(path.join(home1, 'daemon.lock'), { pid: EPERM_PID, renewed_at: Date.now() - 3 * 3_600_000, home: home1 })
+    resetLeaseObservations() // a new process: nothing observed yet
+    const t0 = Date.now()
+    const a = daemon(home1, okRunner(), { lease: { renewMs: 100, staleMs: 600 } })
+    try {
+      await until(() => readIntegrationStatus(home1)?.socket === 'ready', 15_000)
+      expect(Date.now() - t0).toBeGreaterThanOrEqual(600)
+      expect(parseLease(fs.readFileSync(path.join(home1, 'daemon.lock'), 'utf-8'))?.pid).toBe(process.pid)
+    } finally {
+      await a.stop()
+    }
+  }, 30_000)
+
+  it('a standby whose own runtime does not check out does not offer to take over: the holder whose runs fail keeps serving; once the standby checks out, it hands over', async () => {
+    double = await startServerDouble({ tray: { waiting: 1 } })
+    const home1 = path.join(sandbox, 'failing-holder')
+    const home2 = path.join(sandbox, 'signed-out-standby')
+    signIn(home1, KEY, double.apiBase)
+    signIn(home2, KEY, double.apiBase)
+    const held = new ScriptedRunner({ state: 'ok', exitCode: 0, durationMs: 1 }, { ok: true })
+    const a = daemon(home1, held, { runtimeRecheckMs: 50, pollMs: 200 })
+    await until(() => readIntegrationStatus(home1)?.socket === 'ready', 10_000)
+    const waiting = new ScriptedRunner({ state: 'ok', exitCode: 0, durationMs: 1 }, { ok: false, detail: 'claude is not signed in (run `claude` once and sign in)' })
+    const b = daemon(home2, waiting, { runtimeRecheckMs: 300 })
+    try {
+      await until(() => /does not check out \(claude: claude is not signed in/.test(readIntegrationStatus(home2)?.last_error ?? ''), 10_000)
+      expect(fs.existsSync(standbyMarkerPath(agentLockPath({ apiBase: double.apiBase, handle: 'probe' }), home2))).toBe(false)
+      // The holder's runs fail, and no standby that could serve waits: it keeps its socket.
+      held.outcome = { state: 'not_started', exitCode: 1, durationMs: 1, detail: 'Not logged in' }
+      held.check = { ok: false, detail: 'claude is not signed in (run `claude` once and sign in)' }
+      double.send({ type: 'message.new', payload: { id: 'm1', conversation_id: 'conv_1', sender: 'peer', content: { text: 'x' } } })
+      await until(() => (readIntegrationStatus(home1)?.runs_failing ?? null) !== null, 10_000)
+      await new Promise((r) => setTimeout(r, 1_500)) // several of the holder's health checks
+      expect(readIntegrationStatus(home1)?.socket).toBe('ready')
+      expect(readIntegrationStatus(home1)?.unservable ?? null).toBeNull()
+      // The standby signs in: its next check passes, it says it waits, and the holder hands over.
+      waiting.check = { ok: true }
+      await until(() => readIntegrationStatus(home2)?.socket === 'ready', 15_000)
+      expect(readIntegrationStatus(home1)?.unservable?.reason).toBe('runs_failing')
+    } finally {
+      await a.stop()
+      await b.stop()
+    }
+  }, 60_000)
 
   it('the holder whose agent lock was replaced underneath it stands down at its next renewal: never two serving', async () => {
     double = await startServerDouble({ tray: { waiting: 0 } })
