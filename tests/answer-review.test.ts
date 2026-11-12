@@ -325,10 +325,28 @@ describe('L3 and L5 — the Codex listing: reused while its config files do not 
       ...more,
     })
 
-  it('the files the key is made of: system, managed, requirements, the user\'s config.toml, every config.toml / .codex/config.toml from the workdir up', () => {
-    const files = codexConfigLayerFiles('/h/.codex', '/a/b', 'linux')
-    expect(files).toEqual(['/etc/codex/config.toml', '/etc/codex/managed_config.toml', '/etc/codex/requirements.toml', '/h/.codex/config.toml', '/a/b/config.toml', '/a/b/.codex/config.toml', '/a/.codex/config.toml', '/.codex/config.toml'])
+  it('the files the key is made of, per platform: system, managed, requirements, the user\'s config.toml, every config.toml / .codex/config.toml from the workdir up', () => {
+    // Built with that platform's separators and roots, whatever the host.
+    expect(codexConfigLayerFiles('/h/.codex', '/a/b', 'linux')).toEqual([
+      '/etc/codex/config.toml', '/etc/codex/managed_config.toml', '/etc/codex/requirements.toml',
+      '/h/.codex/config.toml',
+      '/a/b/config.toml', '/a/b/.codex/config.toml', '/a/.codex/config.toml', '/.codex/config.toml',
+    ])
     expect(codexConfigLayerFiles('/h/.codex', '/a', 'darwin')).toContain('/Library/Managed Preferences/com.openai.codex.plist')
+    // Windows: %ProgramData%\OpenAI\Codex (C:\ProgramData when unset), no managed_config.toml, up to the drive root.
+    expect(codexConfigLayerFiles('C:\\Users\\r\\.codex', 'D:\\a\\b', 'win32', { ProgramData: 'E:\\PD' })).toEqual([
+      'E:\\PD\\OpenAI\\Codex\\config.toml', 'E:\\PD\\OpenAI\\Codex\\requirements.toml',
+      'C:\\Users\\r\\.codex\\config.toml',
+      'D:\\a\\b\\config.toml', 'D:\\a\\b\\.codex\\config.toml', 'D:\\a\\.codex\\config.toml', 'D:\\.codex\\config.toml',
+    ])
+    expect(codexConfigLayerFiles('C:\\h', 'C:\\w', 'win32', {})[0]).toBe('C:\\ProgramData\\OpenAI\\Codex\\config.toml')
+    // The host's own list: its separators, its workdir chain ending at its root.
+    const host = codexConfigLayerFiles(path.join(sandbox, '.codex'), path.join(sandbox, 'work'))
+    expect(host).toContain(path.join(sandbox, '.codex', 'config.toml'))
+    expect(host).toContain(path.join(sandbox, 'work', '.codex', 'config.toml'))
+    expect(host[host.length - 1]).toBe(path.join(path.parse(sandbox).root, '.codex', 'config.toml'))
+    if (process.platform === 'win32') expect(host[0]).toMatch(/\\OpenAI\\Codex\\config\.toml$/)
+    else expect(host[0]).toBe('/etc/codex/config.toml')
   })
 
   it('one listing for many runs; a changed config file, or the age limit, lists again', async () => {

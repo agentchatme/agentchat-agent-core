@@ -99,7 +99,14 @@ export function redactDiagnostic(value: string, max = STDERR_TAIL_CHARS): string
 /** Bounds every synchronous kill: a stuck `taskkill` must not hold the worker it protects. */
 const KILL_TIMEOUT_MS = 5_000
 
-function killProcessTree(child: ChildProcess, signal: NodeJS.Signals): void {
+/**
+ * Signal a child and everything it started: on POSIX its process group (the
+ * child must have been spawned `detached`, so it leads one), on Windows its
+ * tree (`taskkill /T /F` — there a command found through an npm `.cmd` shim
+ * runs under `cmd.exe`, and killing the shim alone leaves the real process
+ * running). Falls back to the child alone. Never throws.
+ */
+export function killProcessTree(child: ChildProcess, signal: NodeJS.Signals): void {
   if (child.pid === undefined) return
   try {
     if (process.platform === 'win32') {

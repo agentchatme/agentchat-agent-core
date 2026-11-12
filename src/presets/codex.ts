@@ -5,7 +5,7 @@ import { clientHeadersOf } from '../client-identity.js'
 import { hostedMcpUrl } from '../integration/mcp-probe.js'
 import { workdirExposesHome, type RunProfile } from '../integration/profile.js'
 import type { RunOutcome, RunPreflight, RunRequest, RunRunner } from '../integration/runner.js'
-import { redactDiagnostic, spawnRun } from '../integration/spawn-run.js'
+import { killProcessTree, redactDiagnostic, spawnRun } from '../integration/spawn-run.js'
 import { log } from '../util/log.js'
 import { spawnCommand, spawnCommandSync } from '../util/spawn.js'
 import { VERSION } from '../version.js'
@@ -274,6 +274,8 @@ export function codexAnswerFallbackWorkdir(codexHome: string): string {
 
 /** How long `codex mcp list` may take before an answer run is given up (not started). */
 export const CODEX_MCP_LIST_TIMEOUT_MS = 20_000
+/** After a listing is killed: how long to wait for it to have exited (it holds the workdir) before it is given up on. */
+export const CODEX_MCP_LIST_KILL_WAIT_MS = 10_000
 /** The most `codex mcp list --json` output read; more is a failure, not a truncation. */
 const CODEX_MCP_LIST_MAX_BYTES = 1024 * 1024
 
@@ -337,15 +339,28 @@ export const CODEX_MCP_LIST_MAX_AGE_MS = 60 * 60_000
 
 /**
  * The config files `codex mcp list` (and the run) read, in the loader's order
- * (openai/codex rust-v0.154.0 config/src/loader/mod.rs:79-95, layer_io.rs:22,
- * loader/macos.rs:20): system, managed, requirements, the user's config.toml,
- * the macOS managed preferences, and `config.toml` / `.codex/config.toml` from
- * the workdir up to the root.
+ * (openai/codex rust-v0.154.0 config/src/loader/mod.rs:79-95, 800-841,
+ * layer_io.rs:22, 78-92, loader/macos.rs:20):
+ *
+ *   * system: `/etc/codex/config.toml`, the legacy `/etc/codex/managed_config.toml`
+ *     and `/etc/codex/requirements.toml`; on Windows `<ProgramData>\OpenAI\Codex\`
+ *     `config.toml` and `requirements.toml` (the ProgramData known folder,
+ *     `C:\ProgramData` when it cannot be resolved; `CODEX_HOME\managed_config.toml`
+ *     is ignored there),
+ *   * macOS managed preferences (`com.openai.codex`),
+ *   * the user's `$CODEX_HOME/config.toml`,
+ *   * `config.toml` in the workdir and `.codex/config.toml` from the workdir up
+ *     to its root (a drive root on Windows).
+ *
+ * Paths are built for `platform` (its own separators and roots), whatever the
+ * host: the list is what that platform's Codex reads.
  */
-export function codexConfigLayerFiles(codexHome: string, workdir: string, platform: NodeJS.Platform = process.platform): string[] {
+export function codexConfigLayerFiles(codexHome: string, workdir: string, platform: NodeJS.Platform = process.platform, env: NodeJS.ProcessEnv = process.env): string[] {
+  const p = platform === 'win32' ? path.win32 : path.posix
+  const programData = env['ProgramData'] ?? env['PROGRAMDATA'] ?? 'C:\\ProgramData'
   const system =
     platform === 'win32'
-      ? [path.join(process.env['ProgramData'] ?? 'C:\\ProgramData', 'OpenAI', 'Codex', 'config.toml'), path.join(process.env['ProgramData'] ?? 'C:\\ProgramData', 'OpenAI', 'Codex', 'requirements.toml')]
+      ? [p.join(programData, 'OpenAI', 'Codex', 'config.toml'), p.join(programData, 'OpenAI', 'Codex', 'requirements.toml')]
       : ['/etc/codex/config.toml', '/etc/codex/managed_config.toml', '/etc/codex/requirements.toml']
   const user = (() => {
     try {
@@ -356,18 +371,18 @@ export function codexConfigLayerFiles(codexHome: string, workdir: string, platfo
   })()
   const managedPrefs =
     platform === 'darwin'
-      ? ['/Library/Managed Preferences/com.openai.codex.plist', ...(user !== null ? [path.join('/Library/Managed Preferences', user, 'com.openai.codex.plist')] : [])]
+      ? ['/Library/Managed Preferences/com.openai.codex.plist', ...(user !== null ? [p.join('/Library/Managed Preferences', user, 'com.openai.codex.plist')] : [])]
       : []
   const tree: string[] = []
-  let current = path.resolve(workdir)
-  tree.push(path.join(current, 'config.toml'))
+  let current = p.resolve(workdir)
+  tree.push(p.join(current, 'config.toml'))
   for (;;) {
-    tree.push(path.join(current, '.codex', 'config.toml'))
-    const parent = path.dirname(current)
+    tree.push(p.join(current, '.codex', 'config.toml'))
+    const parent = p.dirname(current)
     if (parent === current) break
     current = parent
   }
-  return [...system, ...managedPrefs, path.join(codexHome, 'config.toml'), ...tree]
+  return [...system, ...managedPrefs, p.join(codexHome, 'config.toml'), ...tree]
 }
 
 /** What the listing depends on: every layer file's size and mtime (or its absence), the flags, the workdir, the binary. */
@@ -458,40 +473,63 @@ export class CodexRunner implements RunRunner {
     const listed = await new Promise<{ ok: true; stdout: string } | { ok: false; detail: string }>((resolve) => {
       let child: ReturnType<typeof spawnCommand>
       try {
-        child = spawnCommand(this.command, ['mcp', 'list', '--json', ...flags], { cwd: this.workdir(), env: this.env(), stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
+        child = spawnCommand(this.command, ['mcp', 'list', '--json', ...flags], {
+          cwd: this.workdir(),
+          env: this.env(),
+          stdio: ['ignore', 'pipe', 'pipe'],
+          // Its own process group on POSIX, so a hung listing is killed with
+          // everything it started (the npm launcher and the native binary).
+          detached: process.platform !== 'win32',
+          windowsHide: true,
+        })
       } catch (err) {
         resolve({ ok: false, detail: err instanceof Error ? err.message : String(err) })
         return
       }
+      const proc = child
       let stdout = ''
       let stderr = ''
-      let tooLong = false
-      child.stderr?.on('data', (chunk: Buffer) => {
+      let stopped: string | null = null
+      let settled = false
+      let abandonTimer: NodeJS.Timeout | null = null
+      const settle = (result: { ok: true; stdout: string } | { ok: false; detail: string }): void => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        if (abandonTimer !== null) clearTimeout(abandonTimer)
+        resolve(result)
+      }
+      // A listing that has to be stopped: the whole tree (taskkill /T /F on
+      // Windows, where the shim and the real process differ), and the answer
+      // waits for it to have exited — it holds the workdir as its cwd. A tree
+      // that will not die is given up on after a bound, not waited on forever.
+      const stop = (why: string): void => {
+        if (stopped !== null) return
+        stopped = why
+        killProcessTree(proc, 'SIGKILL')
+        abandonTimer = setTimeout(() => settle({ ok: false, detail: `${why} (and it did not exit after being killed)` }), CODEX_MCP_LIST_KILL_WAIT_MS)
+      }
+      proc.stderr?.on('data', (chunk: Buffer) => {
         if (stderr.length < 4096) stderr += chunk.toString('utf-8')
       })
       const timeoutMs = this.options.mcpListTimeoutMs ?? CODEX_MCP_LIST_TIMEOUT_MS
-      const timer = setTimeout(() => {
-        child.kill('SIGKILL')
-        resolve({ ok: false, detail: `no answer within ${Math.round(timeoutMs / 1000)} s` })
-      }, timeoutMs)
-      child.stdout?.on('data', (chunk: Buffer) => {
+      const timer = setTimeout(() => stop(`no answer within ${Math.round(timeoutMs / 1000)} s`), timeoutMs)
+      proc.stdout?.on('data', (chunk: Buffer) => {
         stdout += chunk.toString('utf-8')
-        if (stdout.length > CODEX_MCP_LIST_MAX_BYTES && !tooLong) {
-          tooLong = true
-          child.kill('SIGKILL')
+        if (stdout.length > CODEX_MCP_LIST_MAX_BYTES) stop('its output is too long')
+      })
+      proc.on('error', (err) => {
+        if (stopped === null) settle({ ok: false, detail: err.message })
+      })
+      proc.on('close', (code) => {
+        if (stopped !== null) {
+          settle({ ok: false, detail: stopped })
+          return
         }
-      })
-      child.on('error', (err) => {
-        clearTimeout(timer)
-        resolve({ ok: false, detail: err.message })
-      })
-      child.on('close', (code) => {
-        clearTimeout(timer)
         // Codex's own complaint, first line, bounded and redacted (e.g. "Unknown feature flag: …").
         const said = redactDiagnostic(stderr.split(/\r?\n/).find((line) => line.trim().length > 0) ?? '', 200)
-        if (tooLong) resolve({ ok: false, detail: 'its output is too long' })
-        else if (code !== 0) resolve({ ok: false, detail: `it exited ${code}${said ? `: ${said}` : ''}` })
-        else resolve({ ok: true, stdout })
+        if (code !== 0) settle({ ok: false, detail: `it exited ${code}${said ? `: ${said}` : ''}` })
+        else settle({ ok: true, stdout })
       })
     })
     if (!listed.ok) return listed

@@ -179,6 +179,24 @@ describe('Claude Code answer: the AgentChat server only (--strict-mcp-config wit
   }, 20_000)
 })
 
+/** Whether a process is alive (signal 0 tests existence on POSIX and Windows). */
+function alive(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'EPERM'
+  }
+}
+
+/** Every pid a hung fake listing wrote is gone. */
+function expectGone(pidsFile: string): void {
+  const pids = JSON.parse(fs.readFileSync(pidsFile, 'utf-8')) as number[]
+  expect(pids).toHaveLength(2)
+  for (const pid of pids) expect(alive(pid), `pid ${pid} still alive`).toBe(false)
+  fs.rmSync(pidsFile, { force: true })
+}
+
 describe('Codex answer: every MCP server but AgentChat\'s switched off per run, or no run', () => {
   const listRecord = (): string => path.join(sandbox, 'mcp-list.jsonl')
   const options = (fake: FakeRuntime, extra: Record<string, string> = {}, more: Partial<CodexRunnerOptions> = {}): CodexRunnerOptions => ({
@@ -234,16 +252,22 @@ describe('Codex answer: every MCP server but AgentChat\'s switched off per run, 
   ] as const) {
     it(`a listing that ${mode === 'fail' ? 'fails' : mode === 'garbage' ? 'is not the list' : 'never answers'}: no run (fail closed, with the reason)`, async () => {
       const fake = installFakeCodex(sandbox)
-      const runner = new CodexRunner(options(fake, { FAKE_MCP_LIST_MODE: mode }, { mcpListTimeoutMs: 1_500 }))
+      const pids = path.join(sandbox, 'hung-pids.json')
+      const runner = new CodexRunner(options(fake, { FAKE_MCP_LIST_MODE: mode, FAKE_MCP_LIST_PIDS: pids }, { mcpListTimeoutMs: 1_500 }))
       // Said at preflight (status shows it as the last error), and every run is refused too.
       const pre = await runner.preflight()
       expect(pre.ok).toBe(false)
       expect(pre.detail).toMatch(why)
+      if (mode === 'hang') expectGone(pids)
       const outcome = await runner.start(request)
       expect(outcome.state).toBe('not_started')
       expect(outcome.detail).toMatch(why)
       expect(outcome.detail).toMatch(/an answer run starts only with every server but agentchat switched off/)
       expect(readFakeRuns(fake)).toEqual([])
+      // A hung listing is killed with everything it started (on Windows the
+      // shim's tree, on POSIX the process group) before the answer comes back:
+      // nothing is left holding the workdir.
+      if (mode === 'hang') expectGone(pids)
     }, 20_000)
   }
 
