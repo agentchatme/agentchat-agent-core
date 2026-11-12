@@ -65,7 +65,7 @@ describe('Claude Code flags (pinned: the integration and the listener share them
       '--permission-mode', 'default', '--permission-prompts', 'none',
       '--tools', 'Read,Glob,Grep',
       '--allowedTools', posix ? 'mcp__agentchat__*,Read(//w),Read(//w/**)' : 'mcp__agentchat__*',
-      '--settings', '{"permissions":{"blockReadsOutsideWorkingDirectories":true}}',
+      '--settings', '{"permissions":{"blockReadsOutsideWorkingDirectories":true},"env":{"CLAUDE_CODE_DISABLE_CLAUDE_MDS":"1","CLAUDE_CODE_DISABLE_AUTO_MEMORY":"1"},"disableAllHooks":true}',
       '--disallowedTools', 'WebFetch,WebSearch,Bash',
     ])
     // No workdir known: no file allow rule at all (the run still reads its cwd as its working directory).

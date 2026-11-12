@@ -136,10 +136,11 @@ export const CLAUDE_CODE_ENV_KEPT: readonly string[] = [
 /**
  * Claude Code session variables outside the `CLAUDE_CODE_` prefix
  * (code.claude.com/docs/en/env-vars, hooks.md): what it sets in the processes
- * it spawns — its pid, the effort level, a background job's folder, the hook
- * env file, the project folder, the W3C trace context — and `AI_AGENT`.
+ * it spawns — its pid, the effort level, a background job's folder, the
+ * project folder, the W3C trace context — and `AI_AGENT`. Not `CLAUDE_ENV_FILE`:
+ * that one the user sets (a file sourced before each shell command).
  */
-export const CLAUDE_SESSION_ENV: readonly string[] = ['CLAUDECODE', 'CLAUDE_PID', 'CLAUDE_EFFORT', 'CLAUDE_JOB_DIR', 'CLAUDE_ENV_FILE', 'CLAUDE_PROJECT_DIR', 'TRACEPARENT', 'TRACESTATE', 'AI_AGENT']
+export const CLAUDE_SESSION_ENV: readonly string[] = ['CLAUDECODE', 'CLAUDE_PID', 'CLAUDE_EFFORT', 'CLAUDE_JOB_DIR', 'CLAUDE_PROJECT_DIR', 'TRACEPARENT', 'TRACESTATE', 'AI_AGENT']
 
 /**
  * What a Codex session sets in the processes it spawns (openai/codex at
@@ -211,9 +212,14 @@ const CODEX_CA_ENV_KEYS: readonly string[] = [
   'NPM_CONFIG_CAFILE',
 ]
 
-/** The managed proxy's generated trust bundle: `$CODEX_HOME/proxy/ca-bundle…` (certs.rs:149-152, 430-438). */
+/**
+ * The managed proxy's generated trust bundle, in Codex's own form:
+ * `<CODEX_HOME>/proxy/ca-bundle-<64 hex>.pem` (certs.rs:149-152, 434-455, 476).
+ * Checked only while the parent's proxy marker is set, so a user's corporate
+ * `SSL_CERT_FILE` (or one that merely sits in a folder named `proxy`) stays.
+ */
 function isManagedCaBundle(value: string): boolean {
-  return /[\\/]proxy[\\/]ca-bundle[^\\/]*$/.test(value)
+  return /[\\/]proxy[\\/]ca-bundle-[0-9a-fA-F]{64}\.pem$/.test(value)
 }
 
 /** The managed proxy's `GIT_SSH_COMMAND` starts with this marker (proxy.rs `CODEX_PROXY_GIT_SSH_COMMAND_MARKER`). */
@@ -258,9 +264,10 @@ function brokeredDummies(env: NodeJS.ProcessEnv): Set<string> {
 /**
  * A copy of `env` without any Claude Code or Codex parent-session variable:
  * what every preset run, in every profile, starts from. By name: the session
- * markers above. By value: a parent Codex proxy's URLs (only while its marker
- * says it was active), its CA bundle, its SSH command, the dummy credentials
- * its broker substituted. The user's own proxy, CA bundle and settings stay.
+ * markers above. By value: a parent Codex proxy's URLs and its generated CA
+ * bundle (only while its marker says it was active), its SSH command, the
+ * dummy credentials its broker substituted. The user's own proxy, CA bundle
+ * and settings stay.
  */
 export function withoutParentSession(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const proxyActive = envValue(env, 'CODEX_NETWORK_PROXY_ACTIVE') !== undefined
@@ -270,7 +277,7 @@ export function withoutParentSession(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv 
     const upper = key.toUpperCase()
     if (isParentSessionEnv(key)) continue
     if (proxyActive && CODEX_MANAGED_PROXY_ENV.includes(upper)) continue
-    if (value !== undefined && CODEX_CA_ENV_KEYS.includes(upper) && isManagedCaBundle(value)) continue
+    if (proxyActive && value !== undefined && CODEX_CA_ENV_KEYS.includes(upper) && isManagedCaBundle(value)) continue
     if (value !== undefined && upper === 'GIT_SSH_COMMAND' && value.startsWith(CODEX_PROXY_GIT_SSH_MARKER)) continue
     if (dummies.has(upper)) continue
     copy[key] = value

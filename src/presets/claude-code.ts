@@ -109,9 +109,27 @@ export const ANSWER_DENIED_TOOLS = ['WebFetch', 'WebSearch', 'Bash'] as const
 /**
  * The `--settings` an `answer` run is given. A constant, never built from a
  * path: in print mode a settings value that fails validation is silently
- * ignored (`claude --help`, `-p`), so nothing variable may ride in it.
+ * ignored (`claude --help`, `-p`), so nothing variable may ride in it. Every
+ * key exists at the 2.1.274 floor.
+ *
+ *   permissions.blockReadsOutsideWorkingDirectories  (2.1.257+) no file tool
+ *       reads outside the working directories, whatever allow rule another
+ *       settings file holds.
+ *   env  the two `ANSWER_ENV` switches again. A settings file's `env` overrides
+ *       the process environment, and a workdir repository's own
+ *       `.claude/settings.json` is applied in print mode: there it could turn
+ *       CLAUDE.md and auto memory back on. `--settings` outranks user, project
+ *       and local settings (settings.md, "Settings precedence").
+ *   disableAllHooks  (1.0.68+) no hook, status line or file-suggestion command:
+ *       the user's own hooks and a workdir repository's would run a shell
+ *       command, and inject text, on every peer's message. Managed hooks still
+ *       run (only managed settings can turn those off).
  */
-export const ANSWER_SETTINGS = JSON.stringify({ permissions: { blockReadsOutsideWorkingDirectories: true } })
+export const ANSWER_SETTINGS = JSON.stringify({
+  permissions: { blockReadsOutsideWorkingDirectories: true },
+  env: { CLAUDE_CODE_DISABLE_CLAUDE_MDS: '1', CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1' },
+  disableAllHooks: true,
+})
 
 /**
  * Env a parent Claude Code session leaks that would make the child think it is
@@ -461,9 +479,9 @@ function gitRootOf(dir: string): string | null {
  * directory even under `blockReadsOutsideWorkingDirectories`
  * (settings-reference.md) — the user's settings, the managed file and its
  * `managed-settings.d/` drop-ins, and `.claude/settings.local.json` at the
- * workdir's repository root (counted when git does not track it; checked
- * whenever it is there). MDM and server-managed policies are not files and
- * are not covered.
+ * workdir's repository root and in the workdir itself (counted when git does
+ * not track it; checked whenever it is there). MDM and server-managed policies
+ * are not files and are not covered.
  */
 export function claudeSettingsFilesGrantingDirectories(configDirOverride: string | undefined, workdir: string): string[] {
   const managed = claudeManagedSettingsDir()
@@ -478,11 +496,16 @@ export function claudeSettingsFilesGrantingDirectories(configDirOverride: string
       return []
     }
   })()
+  // Local settings are read at the repository root in a git repository, and
+  // in the working directory itself otherwise (and on Windows): both are checked.
+  const cwdLocal = path.join(path.resolve(workdir), '.claude', 'settings.local.json')
+  const root = gitRootOf(workdir)
+  const rootLocal = root !== null ? path.join(root, '.claude', 'settings.local.json') : cwdLocal
   return [
     path.join(claudeHomeFor(configDirOverride), 'settings.json'),
     path.join(managed, 'managed-settings.json'),
     ...dropIns,
-    path.join(gitRootOf(workdir) ?? path.resolve(workdir), '.claude', 'settings.local.json'),
+    ...new Set([rootLocal, cwdLocal]),
   ]
 }
 

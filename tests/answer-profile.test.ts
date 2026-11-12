@@ -85,8 +85,15 @@ function assertClaudeAnswerIsConfined(argv: readonly string[], workdirs: readonl
   for (const tool of ['WebFetch', 'WebSearch', 'Bash']) expect(denied).toContain(tool)
 
   // Reads outside the working directories refused whatever the user's own allow rules say.
-  const settings = JSON.parse(valueOf(argv, '--settings') ?? '{}') as { permissions?: { blockReadsOutsideWorkingDirectories?: unknown; allow?: unknown; additionalDirectories?: unknown } }
+  const settings = JSON.parse(valueOf(argv, '--settings') ?? '{}') as {
+    permissions?: { blockReadsOutsideWorkingDirectories?: unknown; allow?: unknown; additionalDirectories?: unknown }
+    env?: Record<string, unknown>
+    disableAllHooks?: unknown
+  }
   expect(settings.permissions?.blockReadsOutsideWorkingDirectories).toBe(true)
+  // No CLAUDE.md or auto memory, whatever a lower settings file's `env` says; no hook runs.
+  expect(settings.env).toEqual({ CLAUDE_CODE_DISABLE_CLAUDE_MDS: '1', CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1' })
+  expect(settings.disableAllHooks).toBe(true)
   expect(settings.permissions?.allow).toBeUndefined()
   expect(settings.permissions?.additionalDirectories).toBeUndefined()
 }
@@ -123,7 +130,10 @@ describe('Claude Code answer: confined to the workdir (regression guard)', () =>
       swap('--permission-mode', 'bypassPermissions'),
     ]
     for (const argv of bad) expect(() => assertClaudeAnswerIsConfined(argv, ['/w'])).toThrow()
-    expect(ANSWER_SETTINGS).toBe('{"permissions":{"blockReadsOutsideWorkingDirectories":true}}')
+    expect(ANSWER_SETTINGS).toBe('{"permissions":{"blockReadsOutsideWorkingDirectories":true},"env":{"CLAUDE_CODE_DISABLE_CLAUDE_MDS":"1","CLAUDE_CODE_DISABLE_AUTO_MEMORY":"1"},"disableAllHooks":true}')
+    for (const settings of ['{"permissions":{"blockReadsOutsideWorkingDirectories":true}}', '{"permissions":{"blockReadsOutsideWorkingDirectories":true},"env":{"CLAUDE_CODE_DISABLE_CLAUDE_MDS":"1","CLAUDE_CODE_DISABLE_AUTO_MEMORY":"1"}}']) {
+      expect(() => assertClaudeAnswerIsConfined(swap('--settings', settings), ['/w'])).toThrow()
+    }
   })
 
   it('the preset runner (what the listener and the integration both start) passes the guard, with its own workdir', async () => {

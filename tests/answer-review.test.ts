@@ -188,6 +188,21 @@ describe('M2 — no answer run while a settings file grants Claude Code more wor
     expect(readFakeRuns(fake)).toHaveLength(2)
   }, 30_000)
 
+  it('without a repository, settings.local.json in the workdir itself counts; in a repository, both that one and the root\'s are checked', () => {
+    const cfg = path.join(sandbox, '.claude')
+    const plain = path.join(sandbox, 'plain-wd')
+    write(path.join(plain, '.claude', 'settings.local.json'), { permissions: { additionalDirectories: ['/x'] } })
+    expect(claudeExtraDirectoriesGrant(cfg, plain)).toEqual({ file: path.join(plain, '.claude', 'settings.local.json'), detail: 'lists permissions.additionalDirectories (1 folder)' })
+    const repo = path.join(sandbox, 'repo2')
+    fs.mkdirSync(path.join(repo, '.git'), { recursive: true })
+    const wd = path.join(repo, 'sub', 'wd')
+    write(path.join(wd, '.claude', 'settings.local.json'), { permissions: { additionalDirectories: ['/y'] } })
+    const files = claudeSettingsFilesGrantingDirectories(cfg, wd)
+    expect(files).toContain(path.join(repo, '.claude', 'settings.local.json'))
+    expect(files).toContain(path.join(wd, '.claude', 'settings.local.json'))
+    expect(claudeExtraDirectoriesGrant(cfg, wd)?.file).toBe(path.join(wd, '.claude', 'settings.local.json'))
+  })
+
   it('an untracked settings.local.json at the repository root counts; an empty list, other keys and a broken file without the key do not', () => {
     const repo = path.join(sandbox, 'repo')
     fs.mkdirSync(path.join(repo, '.git'), { recursive: true })
@@ -248,16 +263,26 @@ describe('L1 — the home-folder check goes by the kernel\'s identity of the fol
 })
 
 describe('L2 — the environment rule', () => {
-  it('drops the rest of Claude Code\'s session variables; keeps the user\'s request and memory switches', () => {
+  it('drops the rest of Claude Code\'s session variables; keeps the user\'s request and memory switches and CLAUDE_ENV_FILE', () => {
     const out = withoutParentSession({
       CLAUDE_JOB_DIR: '/j', CLAUDE_ENV_FILE: '/e', CLAUDE_PROJECT_DIR: '/p', TRACEPARENT: '00-abc-def-01', TRACESTATE: 'x=y',
       CLAUDE_CODE_DISABLE_CLAUDE_MDS: '1', CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1', CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: '1', CLAUDE_CODE_EXTRA_BODY: '{}', CLAUDE_CODE_MAX_OUTPUT_TOKENS: '4096',
     })
-    expect(Object.keys(out).sort()).toEqual(['CLAUDE_CODE_DISABLE_AUTO_MEMORY', 'CLAUDE_CODE_DISABLE_CLAUDE_MDS', 'CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS', 'CLAUDE_CODE_EXTRA_BODY', 'CLAUDE_CODE_MAX_OUTPUT_TOKENS'])
+    expect(Object.keys(out).sort()).toEqual(['CLAUDE_CODE_DISABLE_AUTO_MEMORY', 'CLAUDE_CODE_DISABLE_CLAUDE_MDS', 'CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS', 'CLAUDE_CODE_EXTRA_BODY', 'CLAUDE_CODE_MAX_OUTPUT_TOKENS', 'CLAUDE_ENV_FILE'])
+  })
+
+  it('a CA bundle goes only when it is a parent proxy\'s own (Codex\'s exact file form, while its marker is set); a corporate bundle always stays', () => {
+    const hash = 'a'.repeat(64)
+    const managed = `/Users/x/.codex/proxy/ca-bundle-${hash}.pem`
+    const corp = { SSL_CERT_FILE: '/etc/ssl/corp-ca.pem', NODE_EXTRA_CA_CERTS: '/opt/proxy/ca-bundle.pem', REQUESTS_CA_BUNDLE: `/srv/proxy/ca-bundle-${'z'.repeat(64)}.pem` }
+    // The marker set: Codex's form goes, everything else stays.
+    expect(withoutParentSession({ CODEX_NETWORK_PROXY_ACTIVE: '1', CURL_CA_BUNDLE: managed, ...corp })).toEqual(corp)
+    // No marker: even Codex's form is the user's.
+    expect(withoutParentSession({ CURL_CA_BUNDLE: managed, ...corp })).toEqual({ CURL_CA_BUNDLE: managed, ...corp })
   })
 
   it('a parent Codex proxy: its URLs (only while its marker says it was active), its CA bundle, its SSH command, its brokered dummies; the user\'s own stay', () => {
-    const managedBundle = '/Users/x/.codex/proxy/ca-bundle-0123abcd.pem'
+    const managedBundle = `/Users/x/.codex/proxy/ca-bundle-${'0123abcd'.repeat(8)}.pem`
     const parent = {
       CODEX_NETWORK_PROXY_ACTIVE: '1',
       CODEX_NETWORK_PROXY_ATTRIBUTION: 'tok',
