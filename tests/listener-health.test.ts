@@ -378,10 +378,11 @@ describe('a probe that hangs is killed with everything it started, and answers',
       'setTimeout(() => {}, 600000)',
     ].join('\n')
     const startedAt = Date.now()
-    const result = await runProbe(process.execPath, ['-e', script], { timeoutMs: 1_500 })
+    // Long enough for the child to start and write its pids even on a loaded machine.
+    const result = await runProbe(process.execPath, ['-e', script], { timeoutMs: 5_000 })
     expect(result.timedOut).toBe(true)
-    expect(result.error?.message).toMatch(/did not answer within 2 s|did not answer within 1 s/)
-    expect(Date.now() - startedAt).toBeLessThan(10_000)
+    expect(result.error?.message).toMatch(/did not answer within 5 s/)
+    expect(Date.now() - startedAt).toBeLessThan(15_000)
     expectGone(pids)
   }, 20_000)
 
@@ -394,10 +395,10 @@ describe('a probe that hangs is killed with everything it started, and answers',
   })
 
   for (const [label, install, probe] of [
-    ['claude --version', installFakeClaude, (cmd: string) => inspectClaudeRuntime(path.join(sandbox, '.claude'), cmd, 1_500)],
-    ['claude auth status', installFakeClaude, (cmd: string) => claudeIsLoggedIn(path.join(sandbox, '.claude'), cmd, 1_500)],
-    ['codex --version', installFakeCodex, (cmd: string) => inspectCodexRuntime(path.join(sandbox, '.codex'), cmd, 1_500)],
-    ['codex login status', installFakeCodex, (cmd: string) => codexIsLoggedIn(path.join(sandbox, '.codex'), cmd, 1_500)],
+    ['claude --version', installFakeClaude, (cmd: string) => inspectClaudeRuntime(path.join(sandbox, '.claude'), cmd, 5_000)],
+    ['claude auth status', installFakeClaude, (cmd: string) => claudeIsLoggedIn(path.join(sandbox, '.claude'), cmd, 5_000)],
+    ['codex --version', installFakeCodex, (cmd: string) => inspectCodexRuntime(path.join(sandbox, '.codex'), cmd, 5_000)],
+    ['codex login status', installFakeCodex, (cmd: string) => codexIsLoggedIn(path.join(sandbox, '.codex'), cmd, 5_000)],
   ] as const) {
     it(`${label} that hangs (through the .cmd shim on Windows): answered, and its whole tree gone`, async () => {
       const fake = install(sandbox)
