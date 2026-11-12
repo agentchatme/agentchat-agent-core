@@ -341,6 +341,7 @@ export class Integration {
       runtime: this.options.runner.name,
       handle: this.options.cfg.handle,
       profile: this.options.profile,
+      workdir: this.options.cfg.workdir,
       socket: this.stopping ? 'closed' : this.socket,
       wakes: status.coalescer.wakes,
       wakes_absorbed: status.coalescer.absorbed,
@@ -396,6 +397,7 @@ export class Integration {
     const onAbort = (): void => controller.abort()
     if (request.signal.aborted) controller.abort()
     else request.signal.addEventListener('abort', onAbort, { once: true })
+    const identityLine = this.texts.current()?.identity_line
     let outcome: RunOutcome
     try {
       outcome = await withDeadline(
@@ -404,6 +406,7 @@ export class Integration {
           wake,
           prompt: `${request.prompt}\n\n${this.options.manualPointer}`,
           runId,
+          ...(identityLine !== undefined && identityLine.trim().length > 0 ? { identityLine } : {}),
           budgetMs,
           signal: controller.signal,
         }),

@@ -78,7 +78,9 @@ describe('Claude Code preset: a deny path no rule can carry is never skipped sil
     const savedPath = process.env['PATH']
     process.env['PATH'] = `${fake.binDir}${path.delimiter}${savedPath ?? ''}`
     try {
-      const options = { configDir: undefined, workdir: path.join(sandbox, 'work'), profile: 'answer' as const, denyReadPaths: ['/Users/Some Body/.agentchat', '/fine/home'] }
+      // An answer run needs its AgentChat-only tool config, inside a denied path (answer-isolation.test.ts).
+      const answerMcp = { file: '/fine/home/presets/claude-code.mcp.json', apiBase: 'https://api.example.test', apiKey: () => KEY }
+      const options = { configDir: undefined, workdir: path.join(sandbox, 'work'), profile: 'answer' as const, denyReadPaths: ['/Users/Some Body/.agentchat', '/fine/home'], answerMcp }
       const refused = await new ClaudeRunner({ ...options, inexpressibleDeny: 'refuse' }).preflight()
       expect(refused.ok).toBe(false)
       expect(refused.detail).toMatch(/no read-deny rule can carry \/Users\/Some Body\/\.agentchat .*\(--home\)/)

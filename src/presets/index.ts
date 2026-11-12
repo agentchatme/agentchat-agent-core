@@ -10,6 +10,7 @@ import { codexPreset } from './codex.js'
 import type { Preset } from './types.js'
 
 export type { Preset, PresetContext, PresetInspection } from './types.js'
+export { withoutParentSession, isParentSessionEnv, CLAUDE_CODE_ENV_KEPT, CLAUDE_SESSION_ENV, CODEX_SESSION_ENV, CODEX_MANAGED_PROXY_ENV } from './types.js'
 export { semverAtLeast } from './semver.js'
 export {
   CLAUDE_CODE_PRESET,
@@ -17,16 +18,22 @@ export {
   CLAUDE_MCP_SERVER_NAME,
   AGENTCHAT_TOOL_ALLOW,
   ANSWER_TOOLS,
+  WEB_TOOLS,
   WORK_TOOLS,
+  ANSWER_DENIED_TOOLS,
+  ANSWER_SETTINGS,
   PARENT_ENV_KEYS,
   claudeConfigDirFrom,
   claudeHomeFor,
+  claudeProjectsDirFor,
   claudeUserStatePathFor,
   buildClaudeEnv,
   claudeIsLoggedIn,
   inspectClaudeRuntime,
   deniedAncestorOf,
   claudeProfileArgs,
+  workdirPaths,
+  workdirReadRules,
   readDenyRules,
   inexpressibleDenyPaths,
   claudeRunArgs,
@@ -34,6 +41,12 @@ export {
   claudeMcpConfigPath,
   ClaudeRunner,
   claudeCodePreset,
+  claudeAnswerFallbackWorkdir,
+  claudeManagedSettingsDir,
+  claudeSettingsFilesGrantingDirectories,
+  claudeExtraDirectoriesGrant,
+  ANSWER_ENV,
+  type ClaudeAnswerMcp,
   type ClaudeRunArgOptions,
   type ClaudeRunnerOptions,
 } from './claude-code.js'
@@ -43,6 +56,9 @@ export {
   CODEX_MCP_SERVER_NAME,
   LISTENER_KEY_ENV,
   CODEX_PROMPT_FROM_STDIN,
+  CODEX_ANSWER_PERMISSIONS,
+  CODEX_ANSWER_FILESYSTEM,
+  CODEX_ANSWER_DISABLED_FEATURES,
   codexHomeFrom,
   inspectCodexRuntime,
   codexIsLoggedIn,
@@ -53,6 +69,13 @@ export {
   agentchatTableKeys,
   CodexRunner,
   codexPreset,
+  codexAnswerFallbackWorkdir,
+  codexServerNameAddressable,
+  parseCodexMcpList,
+  codexMcpDisableArgs,
+  CODEX_MCP_LIST_TIMEOUT_MS,
+  CODEX_MCP_LIST_MAX_AGE_MS,
+  codexConfigLayerFiles,
   type CodexMcpOverride,
   type CodexRunnerOptions,
 } from './codex.js'

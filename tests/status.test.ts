@@ -127,6 +127,13 @@ describe('integration status file', () => {
     expect(lines).not.toMatch(/doorbell|knock/i)
   })
 
+  it('says plainly what work and full mean for the machine; answer carries no warning', () => {
+    expect(formatIntegrationStatus(sample()).join('\n')).not.toContain("peers' messages")
+    for (const profile of ['work', 'full']) {
+      expect(formatIntegrationStatus(sample({ profile })).join('\n')).toContain(`profile: ${profile} (fake) — runs started by peers' messages can read and change this machine`)
+    }
+  })
+
   it('says where the texts came from when they are cached, or missing', () => {
     expect(formatIntegrationStatus(sample({ texts: { source: 'cache', fetched_at: new Date(Date.now() - 86_400_000 * 2).toISOString(), version: '1', manual_version: '2.1.2' } })).join('\n')).toContain(
       'texts: from the identity-home cache (v1, manual 2.1.2, fetched 2 day(s) ago',

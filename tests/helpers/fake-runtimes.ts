@@ -10,6 +10,13 @@ import * as path from 'node:path'
 //
 //   FAKE_RUNTIME_RECORD=<file>     where runs append their record (JSON lines)
 //   FAKE_RUNTIME_LOGGED_OUT=1      the sign-in probe says no
+//   FAKE_MCP_LIST=<json>           what `mcp list --json` prints (default: agentchat only)
+//   FAKE_MCP_LIST_MODE=fail|hang|garbage   how `mcp list` misbehaves instead
+//   FAKE_MCP_LIST_PIDS=<file>      `hang`: where the hung listing writes its pid and its child's
+//   FAKE_MCP_LIST_RECORD=<file>    where `mcp list` appends its argv, cwd and env
+//
+// A run's record also says what its `--mcp-config` file held at that moment:
+// the server names and the file mode (never its contents — it carries a key).
 
 export interface FakeRuntime {
   readonly binDir: string
@@ -21,6 +28,25 @@ export interface FakeRun {
   stdin: string
   cwd: string
   env: Record<string, string>
+  /** What the run's `--mcp-config` file held when it started (names and mode only), `'unreadable'`, or null without one. */
+  mcpConfig: { servers: string[]; mode: number } | 'unreadable' | null
+  /** The text of the run's `--append-system-prompt-file` when it started, `'unreadable'`, or null without one. */
+  appendedSystemPrompt: string | null
+}
+
+export interface FakeMcpList {
+  argv: string[]
+  cwd: string
+  env: Record<string, string>
+}
+
+export function readFakeMcpLists(file: string): FakeMcpList[] {
+  if (!fs.existsSync(file)) return []
+  return fs
+    .readFileSync(file, 'utf-8')
+    .split('\n')
+    .filter((line) => line.trim().length > 0)
+    .map((line) => JSON.parse(line) as FakeMcpList)
 }
 
 function install(root: string, name: string, version: string, authArgs: [string, string], runArg: string): FakeRuntime {
@@ -38,11 +64,35 @@ function install(root: string, name: string, version: string, authArgs: [string,
       "  if (process.env.FAKE_RUNTIME_LOGGED_OUT === '1') { console.log('{\"loggedIn\":false}'); process.exit(1) }",
       "  console.log('{\"loggedIn\":true}'); process.exit(0)",
       '}',
+      "if (args[0] === 'mcp' && args[1] === 'list') {",
+      '  const env = {}',
+      "  for (const [k, v] of Object.entries(process.env)) if (/^(AGENTCHAT_|CLAUDE|CODEX_)/.test(k)) env[k] = v",
+      "  if (process.env.FAKE_MCP_LIST_RECORD) fs.appendFileSync(process.env.FAKE_MCP_LIST_RECORD, JSON.stringify({ argv: args, cwd: process.cwd(), env }) + '\\n')",
+      "  const mode = process.env.FAKE_MCP_LIST_MODE",
+      "  if (mode === 'fail') { console.error('config error'); process.exit(1) }",
+      // A hung listing with a child of its own holding the output pipe, as the npm
+      // launcher and the native binary do: both pids go to FAKE_MCP_LIST_PIDS.
+      "  if (mode === 'hang') {",
+      "    const kid = require('node:child_process').spawn(process.execPath, ['-e', 'setTimeout(() => {}, 600000)'], { stdio: ['ignore', 'inherit', 'inherit'] })",
+      "    if (process.env.FAKE_MCP_LIST_PIDS) fs.writeFileSync(process.env.FAKE_MCP_LIST_PIDS, JSON.stringify([process.pid, kid.pid]))",
+      '    setTimeout(() => {}, 600000)',
+      '    return',
+      '  }',
+      "  if (mode === 'garbage') { console.log('not json'); process.exit(0) }",
+      "  console.log(process.env.FAKE_MCP_LIST || JSON.stringify([{ name: 'agentchat', enabled: true }]))",
+      '  process.exit(0)',
+      '}',
       `if (args[0] === ${JSON.stringify(runArg)}) {`,
       "  const stdin = fs.readFileSync(0, 'utf8')",
       '  const env = {}',
       "  for (const [k, v] of Object.entries(process.env)) if (/^(AGENTCHAT_|CLAUDE|CODEX_)/.test(k)) env[k] = v",
-      '  const record = { argv: args, stdin, cwd: process.cwd(), env }',
+      "  const at = args.indexOf('--mcp-config')",
+      '  let mcpConfig = null',
+      "  if (at >= 0) { try { const file = args[at + 1]; mcpConfig = { servers: Object.keys(JSON.parse(fs.readFileSync(file, 'utf8')).mcpServers || {}), mode: fs.statSync(file).mode & 0o777 } } catch { mcpConfig = 'unreadable' } }",
+      "  const sp = args.indexOf('--append-system-prompt-file')",
+      "  let appendedSystemPrompt = null",
+      "  if (sp >= 0) { try { appendedSystemPrompt = fs.readFileSync(args[sp + 1], 'utf8') } catch { appendedSystemPrompt = 'unreadable' } }",
+      '  const record = { argv: args, stdin, cwd: process.cwd(), env, mcpConfig, appendedSystemPrompt }',
       "  if (process.env.FAKE_RUNTIME_RECORD) fs.appendFileSync(process.env.FAKE_RUNTIME_RECORD, JSON.stringify(record) + '\\n')",
       "  process.stdout.write('model output that must be discarded\\n')",
       '  process.exit(0)',
