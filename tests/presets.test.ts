@@ -4,6 +4,7 @@ import * as os from 'node:os'
 import * as path from 'node:path'
 import {
   PRESETS,
+  ANSWER_SETTINGS,
   claudeCodePreset,
   claudeMcpConfig,
   claudeMcpConfigPath,
@@ -13,6 +14,7 @@ import {
   deniedAncestorOf,
   presetNamed,
   readDenyRules,
+  workdirReadRules,
   LISTENER_KEY_ENV,
 } from '../src/presets/index.js'
 import { installFakeClaude, installFakeCodex, readFakeRuns, type FakeRuntime } from './helpers/fake-runtimes.js'
@@ -54,28 +56,39 @@ describe('the registry', () => {
   })
 })
 
+const posix = process.platform !== 'win32'
+
 describe('Claude Code flags (pinned: the integration and the listener share them)', () => {
-  it('answer: read-only built-ins + web + every hosted tool, prompts denied, Manual mode', () => {
-    expect(claudeRunArgs('answer')).toEqual([
+  it('answer: Read/Glob/Grep on the workdir only + every hosted tool; no web, no shell; reads outside the working directories blocked; prompts denied, Manual mode', () => {
+    expect(claudeRunArgs('answer', { workdir: '/w' })).toEqual([
       '-p', '--output-format', 'text', '--no-session-persistence',
       '--permission-mode', 'default', '--permission-prompts', 'none',
-      '--tools', 'Read,Glob,Grep,WebSearch,WebFetch',
-      '--allowedTools', 'mcp__agentchat__*,Read,Glob,Grep,WebSearch,WebFetch',
+      '--tools', 'Read,Glob,Grep',
+      '--allowedTools', posix ? 'mcp__agentchat__*,Read(//w),Read(//w/**)' : 'mcp__agentchat__*',
+      '--settings', '{"permissions":{"blockReadsOutsideWorkingDirectories":true}}',
+      '--disallowedTools', 'WebFetch,WebSearch,Bash',
     ])
+    // No workdir known: no file allow rule at all (the run still reads its cwd as its working directory).
+    expect(claudeRunArgs('answer')).toContain('mcp__agentchat__*')
+    expect(claudeRunArgs('answer')[claudeRunArgs('answer').indexOf('--allowedTools') + 1]).toBe('mcp__agentchat__*')
   })
 
-  it('work and full', () => {
-    expect(claudeRunArgs('work')).toContain('acceptEdits')
-    expect(claudeRunArgs('work').join(' ')).toContain('mcp__agentchat__*,Read,Glob,Grep,WebSearch,WebFetch,Bash,Edit,Write,MultiEdit,NotebookEdit')
-    expect(claudeRunArgs('full')).toEqual(['-p', '--output-format', 'text', '--no-session-persistence', '--dangerously-skip-permissions', '--permission-prompts', 'none', '--allowedTools', 'mcp__agentchat__*'])
+  it('work and full are unchanged (the operator\'s explicit opt-in)', () => {
+    expect(claudeRunArgs('work', { workdir: '/w' })).toEqual([
+      '-p', '--output-format', 'text', '--no-session-persistence',
+      '--permission-mode', 'acceptEdits', '--permission-prompts', 'none',
+      '--allowedTools', 'mcp__agentchat__*,Read,Glob,Grep,WebSearch,WebFetch,Bash,Edit,Write,MultiEdit,NotebookEdit',
+    ])
+    expect(claudeRunArgs('full', { workdir: '/w' })).toEqual(['-p', '--output-format', 'text', '--no-session-persistence', '--dangerously-skip-permissions', '--permission-prompts', 'none', '--allowedTools', 'mcp__agentchat__*'])
   })
 
   it('an --mcp-config file is closed by --strict-mcp-config, before the profile; deny rules come last', () => {
-    const args = claudeRunArgs('answer', { mcpConfigPath: '/h/presets/claude-code.mcp.json', denyReadPaths: ['/h'] })
+    const args = claudeRunArgs('answer', { mcpConfigPath: '/h/presets/claude-code.mcp.json', denyReadPaths: ['/h'], workdir: '/w' })
     const at = args.indexOf('--mcp-config')
     expect(args.slice(at, at + 3)).toEqual(['--mcp-config', '/h/presets/claude-code.mcp.json', '--strict-mcp-config'])
     expect(at).toBeLessThan(args.indexOf('--permission-mode'))
-    if (process.platform !== 'win32') expect(args.slice(-2)).toEqual(['--disallowedTools', 'Read(//h),Read(//h/**)'])
+    expect(args.slice(-2)).toEqual(['--disallowedTools', posix ? 'WebFetch,WebSearch,Bash,Read(//h),Read(//h/**)' : 'WebFetch,WebSearch,Bash'])
+    if (posix) expect(claudeRunArgs('work', { denyReadPaths: ['/h'] }).slice(-2)).toEqual(['--disallowedTools', 'Read(//h),Read(//h/**)'])
   })
 
   it('deny rules: POSIX absolute paths only; a path a comma list cannot carry is skipped', () => {

@@ -31,14 +31,32 @@ import { withoutInheritedKey, type Preset, type PresetContext, type PresetInspec
 //   --allowedTools <rules>      pre-approves. `mcp__agentchat__*` is the whole
 //                               hosted server; `Bash` pre-approves every shell
 //                               command (dropped as a broad rule only in auto mode).
+//                               A bare `Read`, `Glob` or `Grep` pre-approves that
+//                               tool on EVERY path; `Read(//<dir>/**)` only under
+//                               `<dir>`. Glob and Grep have no path rules of their
+//                               own: `Read(<path>)` rules are matched for them
+//                               (permissions.md "Glob(path) and Grep(path) rules
+//                               don't match"). An allow rule applies only when the
+//                               requested path AND the file it resolves to match
+//                               (permissions.md "Symlinks"), so a link out of the
+//                               workdir is never allowed by it.
 //   --disallowedTools <rules>   denies. Deny rules win over allow rules, and a
 //                               `Read(<path>)` rule covers every built-in tool
 //                               that reads files (Read, Grep, Glob — docs:
 //                               permissions.md "Read & Edit"). Used to keep a
 //                               run's file tools off the key store. `//`
-//                               prefixes an absolute path in rule syntax.
-//   --permission-mode default   Manual: reads need no approval, everything else
-//                               prompts (and is therefore denied here).
+//                               prefixes an absolute path in rule syntax. A bare
+//                               tool name removes the tool.
+//   --settings <json>           additional settings for this run only. `answer`
+//                               sets `permissions.blockReadsOutsideWorkingDirectories`
+//                               (v2.1.257+, settings-reference.md): the file tools
+//                               refuse every path outside the working directories
+//                               in every mode, and "no allow rule lets Claude's
+//                               file tools through" — so an allow rule in the
+//                               user's own settings cannot reopen the disk.
+//   --permission-mode default   Manual: reads inside the working directories need
+//                               no approval, everything else prompts (and is
+//                               therefore denied here).
 //   --permission-mode acceptEdits  file edits and common filesystem commands in
 //                               the working directory need no approval.
 //   --dangerously-skip-permissions  = bypassPermissions.
@@ -66,11 +84,34 @@ export const MIN_CLAUDE_CODE_VERSION = '2.1.274'
 export const CLAUDE_MCP_SERVER_NAME = 'agentchat'
 export const AGENTCHAT_TOOL_ALLOW = `mcp__${CLAUDE_MCP_SERVER_NAME}__*`
 
-/** Built-in tools an `answer` run keeps: read-only files plus the web. */
-export const ANSWER_TOOLS = ['Read', 'Glob', 'Grep', 'WebSearch', 'WebFetch'] as const
+/**
+ * Built-in tools an `answer` run has: the file-reading tools, and only on the
+ * run's own working folder (`workdirReadRules`, `ANSWER_SETTINGS`). An `answer`
+ * run is started by any peer's message — a stranger's cold DM included — so
+ * the only way out it has is the AgentChat tools: no web, no shell, no edits,
+ * and nothing outside its workdir to read.
+ */
+export const ANSWER_TOOLS = ['Read', 'Glob', 'Grep'] as const
+
+/** The web tools: `work` pre-approves them; `answer` never has them. */
+export const WEB_TOOLS = ['WebSearch', 'WebFetch'] as const
 
 /** Built-in tools a `work` run additionally pre-approves. */
 export const WORK_TOOLS = ['Bash', 'Edit', 'Write', 'MultiEdit', 'NotebookEdit'] as const
+
+/**
+ * Denied to every `answer` run by name, on top of `--tools` leaving them out:
+ * the ways out (web) and the shell. A bare tool name in a deny rule removes
+ * the tool, so even a widened `--tools` list could not bring them back.
+ */
+export const ANSWER_DENIED_TOOLS = ['WebFetch', 'WebSearch', 'Bash'] as const
+
+/**
+ * The `--settings` an `answer` run is given. A constant, never built from a
+ * path: in print mode a settings value that fails validation is silently
+ * ignored (`claude --help`, `-p`), so nothing variable may ride in it.
+ */
+export const ANSWER_SETTINGS = JSON.stringify({ permissions: { blockReadsOutsideWorkingDirectories: true } })
 
 /** Env a parent Claude Code session leaks that would make the child think it is nested. */
 export const PARENT_ENV_KEYS = [
@@ -192,7 +233,59 @@ export function deniedAncestorOf(dir: string, denied: readonly string[]): string
   return null
 }
 
-export function claudeProfileArgs(profile: RunProfile): string[] {
+/**
+ * Whether a path can be carried by a `Read(//<path>)` ALLOW rule in a
+ * comma/space-separated list: what `expressible` asks, and no gitignore
+ * pattern character either (`*`, `?`, `[`, `]`, `\`, `!`, `#`). Rules are
+ * matched as gitignore patterns and the ones written here are not escaped
+ * (permissions.md "Special characters"): `/w*` would also allow `/wallet`.
+ */
+function expressibleAllow(raw: string): boolean {
+  return expressible(raw) && !/[*?[\]\\!#]/.test(raw)
+}
+
+/**
+ * The paths a workdir is reached by: as given (absolute), and where it really
+ * is when that differs (`/tmp/w` is `/private/tmp/w` on macOS; a symlinked
+ * workdir). An allow rule matches only when the requested path and the file
+ * it resolves to both match, so both spellings are carried. A workdir that
+ * does not exist yet is carried as given.
+ */
+export function workdirPaths(workdir: string): string[] {
+  const given = path.resolve(workdir)
+  let real = given
+  try {
+    real = fs.realpathSync(given)
+  } catch {
+    /* not created yet (preflight creates it): only the given spelling */
+  }
+  return real === given ? [given] : [given, real]
+}
+
+/**
+ * `/w` → `Read(//w)` and `Read(//w/**)`, for each spelling of the workdir: the
+ * only paths an `answer` run's Read, Glob and Grep are pre-approved on. A
+ * spelling no allow rule can carry (whitespace, a comma, a gitignore pattern
+ * character; every path on Windows) gets no rule — that fails closed: the run
+ * still reads its workdir as its working directory, and nothing else.
+ */
+export function workdirReadRules(workdir: string | undefined): string[] {
+  if (workdir === undefined || process.platform === 'win32') return []
+  const rules: string[] = []
+  for (const raw of workdirPaths(workdir)) {
+    const clean = raw.replace(/\/+$/, '')
+    // The filesystem root is no work folder: no rule (its tree is the disk).
+    if (!expressibleAllow(raw) || clean.length === 0) continue
+    rules.push(`Read(/${clean})`, `Read(/${clean}/**)`)
+  }
+  return rules
+}
+
+/**
+ * The flags for one run profile. `workdir` is the run's working directory:
+ * `answer` scopes its file tools to it (absent, they get no allow rule at all).
+ */
+export function claudeProfileArgs(profile: RunProfile, workdir?: string): string[] {
   switch (profile) {
     case 'answer':
       return [
@@ -203,8 +296,12 @@ export function claudeProfileArgs(profile: RunProfile): string[] {
         '--tools',
         ANSWER_TOOLS.join(','),
         '--allowedTools',
-        [AGENTCHAT_TOOL_ALLOW, ...ANSWER_TOOLS].join(','),
+        [AGENTCHAT_TOOL_ALLOW, ...workdirReadRules(workdir)].join(','),
+        '--settings',
+        ANSWER_SETTINGS,
       ]
+    // `work` and `full` are the operator's explicit opt-in: a run started by
+    // any peer's message can then read and change this machine.
     case 'work':
       return [
         '--permission-mode',
@@ -212,7 +309,7 @@ export function claudeProfileArgs(profile: RunProfile): string[] {
         '--permission-prompts',
         'none',
         '--allowedTools',
-        [AGENTCHAT_TOOL_ALLOW, ...ANSWER_TOOLS, ...WORK_TOOLS].join(','),
+        [AGENTCHAT_TOOL_ALLOW, ...ANSWER_TOOLS, ...WEB_TOOLS, ...WORK_TOOLS].join(','),
       ]
     case 'full':
       return ['--dangerously-skip-permissions', '--permission-prompts', 'none', '--allowedTools', AGENTCHAT_TOOL_ALLOW]
@@ -222,6 +319,8 @@ export function claudeProfileArgs(profile: RunProfile): string[] {
 export interface ClaudeRunArgOptions {
   /** `AGENTCHAT_RUN_MAX_BUDGET_USD`: stop the run once estimated spend reaches this (print mode only). */
   readonly maxBudgetUsd?: string | undefined
+  /** The run's working directory: the one folder an `answer` run's file tools are allowed (`workdirReadRules`). */
+  readonly workdir?: string | undefined
   /**
    * Absolute paths the run's file tools may not read (a directory covers its
    * tree). Rendered as `Read(//<path>)` / `Read(//<dir>/**)` deny rules. A
@@ -272,7 +371,7 @@ export function readDenyRules(paths: readonly string[]): string[] {
  */
 export function claudeRunArgs(profile: RunProfile, options: ClaudeRunArgOptions = {}): string[] {
   const budget = options.maxBudgetUsd?.trim()
-  const deny = readDenyRules(options.denyReadPaths ?? [])
+  const deny = [...(profile === 'answer' ? ANSWER_DENIED_TOOLS : []), ...readDenyRules(options.denyReadPaths ?? [])]
   return [
     '-p',
     '--output-format',
@@ -283,7 +382,7 @@ export function claudeRunArgs(profile: RunProfile, options: ClaudeRunArgOptions 
     ...(budget !== undefined && /^\d+(\.\d+)?$/.test(budget) ? ['--max-budget-usd', budget] : []),
     // Variadic, so it is closed by the boolean flag right after it.
     ...(options.mcpConfigPath !== undefined ? ['--mcp-config', options.mcpConfigPath, '--strict-mcp-config'] : []),
-    ...claudeProfileArgs(profile),
+    ...claudeProfileArgs(profile, options.workdir),
     // Last: the option is variadic and the prompt arrives on stdin, so there
     // is no positional for it to swallow.
     ...(deny.length > 0 ? ['--disallowedTools', deny.join(',')] : []),
@@ -387,6 +486,7 @@ export class ClaudeRunner implements RunRunner {
   args(): string[] {
     return claudeRunArgs(this.options.profile, {
       maxBudgetUsd: (this.options.env ?? process.env)['AGENTCHAT_RUN_MAX_BUDGET_USD'],
+      workdir: this.options.workdir,
       denyReadPaths: this.options.denyReadPaths,
       mcpConfigPath: this.options.mcpConfigPath,
     })
