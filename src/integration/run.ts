@@ -105,6 +105,8 @@ export interface RunIntegrationOpts {
   unservableRecheckMs?: number
   /** Test seam: the agent and home leases' timing (`LeaseOptions`). */
   lease?: LeaseOptions
+  /** Test seam: how long a give-up recheck waits for the runtime's preflight (`PREFLIGHT_DEADLINE_MS`). */
+  preflightDeadlineMs?: number
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
@@ -367,7 +369,8 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
           // Runs were failing: the runtime is checked first (bounded, stopped with the daemon).
           const before: Unservable = waiting
           const checker = lastRunner
-          const pre = await withDeadline(checker.preflight({ signal: stopChecks.signal }), PREFLIGHT_DEADLINE_MS, () => ({ ok: false, detail: `preflight did not answer within ${Math.round(PREFLIGHT_DEADLINE_MS / 1000)} s` })).catch(
+          const deadlineMs = opts.preflightDeadlineMs ?? PREFLIGHT_DEADLINE_MS
+          const pre = await withDeadline(checker.preflight({ signal: stopChecks.signal }), deadlineMs, () => ({ ok: false, detail: `preflight did not answer within ${Math.round(deadlineMs / 1000)} s` })).catch(
             (err: unknown) => ({ ok: false, detail: `preflight threw: ${err instanceof Error ? err.message : String(err)}` }),
           )
           if (shuttingDown || opts.signal?.aborted) throw new StandbyError('stopping')

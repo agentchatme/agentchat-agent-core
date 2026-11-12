@@ -1,16 +1,21 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import { pathToFileURL } from 'node:url'
 import { acquireLease, holderLive, parseLease, pidAlive, resetLeaseObservations, type LeaseHolder } from '../src/util/lease.js'
-import { acquireAgentLock, agentLockDir, agentLockPath, AGENT_LOCK_DIR_ENV } from '../src/daemon/agent-lock.js'
+import { acquireAgentLock, agentLockDir, agentLockPath, AGENT_LOCK_DIR_ENV, standbyMarkerPath } from '../src/daemon/agent-lock.js'
 import { acquireLeaderLock } from '../src/daemon/leader-lock.js'
 import { lockedDaemonPid } from '../src/daemon/service.js'
 import { runIntegration } from '../src/integration/run.js'
 import { Integration } from '../src/integration/integration.js'
-import { formatIntegrationStatus, readIntegrationStatus } from '../src/integration/status.js'
+import { formatIntegrationStatus, readIntegrationStatus, writeIntegrationStatus, type IntegrationStatus } from '../src/integration/status.js'
+import { AgentChatClient } from 'agentchatme'
+import { createIdentityCommands } from '../src/identity/commands.js'
+import { writeCredentials } from '../src/identity/credentials.js'
+import type { HostProfile } from '../src/identity/host-profile.js'
+import { mockServedTexts } from './helpers/served-texts.js'
 import { runProbe } from '../src/util/probe.js'
 import { claudeIsLoggedIn, claudeSignIn, inspectClaudeRuntime, inspectCodexRuntime, codexIsLoggedIn, CodexRunner } from '../src/presets/index.js'
 import type { RunOutcome, RunPreflight, RunPreflightOptions, RunRequest, RunRunner } from '../src/integration/runner.js'
@@ -543,6 +548,16 @@ describe('one agent, one listener: the supervisor', () => {
     const a = daemon(home1, broken, { runtimeRecheckMs: 50 })
     try {
       await until(() => readIntegrationStatus(home1)?.socket === 'ready', 10_000)
+      // Markers of standbys that are not there: one whose process died, one that stopped renewing it. Nobody waits.
+      const lockFile = agentLockPath({ apiBase: double.apiBase, handle: 'probe' })
+      const marker = (home: string, pid: number): string => {
+        const file = standbyMarkerPath(lockFile, home)
+        fs.writeFileSync(file, `${pid}\n${JSON.stringify({ pid, host: os.hostname(), home, at: Date.now() })}\n`)
+        return file
+      }
+      marker('/crashed/standby', deadPid())
+      const old = marker('/silent/standby', process.pid)
+      fs.utimesSync(old, new Date(Date.now() - 120_000), new Date(Date.now() - 120_000))
       broken.outcome = { state: 'not_started', exitCode: 1, durationMs: 1, detail: 'Not logged in' }
       broken.check = { ok: false, detail: 'claude is not signed in (run `claude` once and sign in)' }
       double.send({ type: 'message.new', payload: { id: 'm1', conversation_id: 'conv_1', sender: 'peer', content: { text: 'x' } } })
@@ -556,6 +571,79 @@ describe('one agent, one listener: the supervisor', () => {
       expect(status?.unservable ?? null).toBeNull()
       expect(formatIntegrationStatus(status).join('\n')).toContain('the next run that succeeds clears this')
     } finally {
+      await a.stop()
+    }
+  }, 30_000)
+
+  it('after giving the agent up, its runtime recheck is bounded by a deadline and stopped with the daemon', async () => {
+    double = await startServerDouble({ tray: { waiting: 1 } })
+    const home1 = path.join(sandbox, 'gave-up-home')
+    const home2 = path.join(sandbox, 'waiting-home')
+    signIn(home1, KEY, double.apiBase)
+    signIn(home2, KEY, double.apiBase)
+    const broken = new ScriptedRunner({ state: 'ok', exitCode: 0, durationMs: 1 }, { ok: true })
+    const a = daemon(home1, broken, { runtimeRecheckMs: 50, preflightDeadlineMs: 300 })
+    await until(() => readIntegrationStatus(home1)?.socket === 'ready', 10_000)
+    const b = daemon(home2, okRunner())
+    try {
+      await until(() => (readIntegrationStatus(home2)?.standby ?? null) !== null, 10_000)
+      broken.outcome = { state: 'not_started', exitCode: 1, durationMs: 1, detail: 'Not logged in' }
+      broken.check = { ok: false, detail: 'claude is not signed in (run `claude` once and sign in)' }
+      double.send({ type: 'message.new', payload: { id: 'm1', conversation_id: 'conv_1', sender: 'peer', content: { text: 'x' } } })
+      await until(() => (readIntegrationStatus(home1)?.unservable ?? null) !== null, 15_000)
+      // A check that never answers: the deadline answers for it, and the home keeps waiting (it does not hang).
+      broken.hang = 'never'
+      await until(() => /did not answer within/.test(readIntegrationStatus(home1)?.unservable?.detail ?? ''), 10_000)
+      expect(readIntegrationStatus(home1)?.unservable?.reason).toBe('runs_failing')
+      // A check in flight when the daemon stops: it gets the stop signal, and the daemon exits at once.
+      broken.hang = 'until-stopped'
+      const asked = broken.preflights
+      await until(() => broken.preflights > asked, 10_000)
+      const t0 = Date.now()
+      expect(await a.stop()).toBe(0)
+      expect(Date.now() - t0).toBeLessThan(2_000)
+      expect(broken.signals.at(-1)?.aborted).toBe(true)
+    } finally {
+      await a.stop()
+      await b.stop()
+    }
+  }, 60_000)
+
+  it('a lone install whose key the server refuses gives the agent up all the same (it cannot serve it), and says so', async () => {
+    double = await startServerDouble({ tray: { waiting: 0 } })
+    const oldKey = 'ac_' + 'r'.repeat(40)
+    const home1 = path.join(sandbox, 'refused-home')
+    signIn(home1, oldKey, double.apiBase)
+    const a = daemon(home1, okRunner(), { unservableRecheckMs: 60_000 })
+    try {
+      await until(() => readIntegrationStatus(home1)?.socket === 'ready', 10_000)
+      double.refuseKey(oldKey)
+      double.kick(oldKey)
+      await until(() => readIntegrationStatus(home1)?.unservable?.reason === 'key_refused', 15_000)
+      expect(fs.existsSync(agentLockPath({ apiBase: double.apiBase, handle: 'probe' }))).toBe(false)
+    } finally {
+      await a.stop()
+    }
+  }, 30_000)
+
+  it.skipIf(!posix() || process.getuid?.() === 0)('a lock folder it cannot write to: renewals fail, are counted in status, and the daemon keeps serving', async () => {
+    double = await startServerDouble({ tray: { waiting: 1 } })
+    const home1 = path.join(sandbox, 'ro-lock-home')
+    signIn(home1, KEY, double.apiBase)
+    const a = daemon(home1, okRunner())
+    const lockDir = agentLockDir(process.env)
+    try {
+      await until(() => readIntegrationStatus(home1)?.socket === 'ready', 10_000)
+      fs.chmodSync(lockDir, 0o500)
+      await new Promise((r) => setTimeout(r, 500)) // several renewals (every 100 ms here)
+      double.send({ type: 'message.new', payload: { id: 'm1', conversation_id: 'conv_1', sender: 'peer', content: { text: 'x' } } })
+      await until(() => (readIntegrationStatus(home1)?.lease_errors?.count ?? 0) > 0, 10_000)
+      const status = readIntegrationStatus(home1)
+      expect(status?.socket).toBe('ready')
+      expect(status?.lease_errors?.last).toMatch(/EACCES|permission/i)
+      expect(formatIntegrationStatus(status).join('\n')).toMatch(/lock: \d+ renewal\(s\) failed/)
+    } finally {
+      fs.chmodSync(lockDir, 0o700)
       await a.stop()
     }
   }, 30_000)
@@ -638,12 +726,25 @@ class ScriptedRunner implements RunRunner {
   readonly name = 'claude'
   preflights = 0
   starts = 0
+  /** 'never': the check never answers, stop signal or not; 'until-stopped': it answers only when its signal fires. */
+  hang: 'no' | 'never' | 'until-stopped' = 'no'
+  signals: Array<AbortSignal | undefined> = []
   constructor(
     public outcome: RunOutcome,
     public check: RunPreflight,
   ) {}
-  async preflight(): Promise<RunPreflight> {
+  async preflight(options?: RunPreflightOptions): Promise<RunPreflight> {
     this.preflights += 1
+    this.signals.push(options?.signal)
+    if (this.hang === 'never') return new Promise<RunPreflight>(() => undefined)
+    if (this.hang === 'until-stopped') {
+      const signal = options?.signal
+      return new Promise<RunPreflight>((resolve) => {
+        if (signal === undefined) return
+        if (signal.aborted) resolve({ ok: false, detail: 'stopped' })
+        else signal.addEventListener('abort', () => resolve({ ok: false, detail: 'stopped' }), { once: true })
+      })
+    }
     return this.check
   }
   async start(_request: RunRequest): Promise<RunOutcome> {
@@ -802,6 +903,49 @@ describe('runs that keep failing for a runtime reason are said in status and doc
 })
 
 // ─── 3. probes ──────────────────────────────────────────────────────────────
+
+describe('doctor says what clears a failing home: a run that succeeds, or (after a give-up) the recheck', () => {
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+  const at = '2026-11-12T10:00:00.000Z'
+  const status = (extra: Partial<IntegrationStatus>): IntegrationStatus => ({
+    version: 2, updated_at: new Date().toISOString(), pid: 1, runtime: 'x', handle: 'probe', profile: 'answer', socket: 'ready',
+    wakes: 1, wakes_absorbed: 0, invites: 0, runs_started: 0, runs_ok: 0, runs_failed: 0, runs_timed_out: 0, runs_not_started: 0,
+    runs_skipped_empty: 0, last_run: null, retry_rung: 0, retry_due_at: null, last_error: null, texts: null, ...extra,
+  })
+  const failing = { reason: 'claude: claude is not signed in', since: at, runs_missed: 2, checked_at: at }
+  async function doctor(s: IntegrationStatus): Promise<string> {
+    const home = path.join(sandbox, 'doctor-home')
+    fs.mkdirSync(home, { recursive: true })
+    writeCredentials(home, { api_key: KEY, handle: 'probe' })
+    writeIntegrationStatus(home, s)
+    mockServedTexts('probe')
+    vi.spyOn(AgentChatClient.prototype, 'getMe').mockResolvedValue({ handle: 'probe', status: 'active' } as never)
+    const out: string[] = []
+    vi.spyOn(console, 'log').mockImplementation((v) => void out.push(String(v)))
+    const profile: HostProfile = { label: 'Example', id: 'example', client: { runtime: 'generic', version: '0' }, home: () => home, invocation: () => 'example', renderAnchor: (l) => l }
+    await createIdentityCommands(profile).runDoctor({})
+    return out.join('\n')
+  }
+
+  it('runs failing while serving: the next run that succeeds clears it', async () => {
+    const out = await doctor(status({ runs_failing: failing }))
+    expect(out).toMatch(/FAIL runs: runs failing: claude: claude is not signed in .*the next run that succeeds clears this/)
+  })
+
+  it('gave up for failing runs: no run happens, so the runtime recheck (every 60 s) is what clears it', async () => {
+    const out = await doctor(status({ socket: 'idle', runs_failing: failing, unservable: { reason: 'runs_failing', detail: 'runs failing: claude: claude is not signed in', since: at, retry_at: at } }))
+    expect(out).toMatch(/FAIL runs: this home gave the agent up: runs failing: claude: claude is not signed in .*checked again at .* \(every 60 s\)/)
+    expect(out).not.toContain('the next run that succeeds')
+  })
+
+  it('gave up for a refused key: tried again every 5 min; sign in again, or log out', async () => {
+    const out = await doctor(status({ socket: 'idle', unservable: { reason: 'key_refused', detail: "the server refuses this home's key", since: at, retry_at: at } }))
+    expect(out).toMatch(/FAIL runs: this home gave the agent up: the server refuses its key .*\(every 5 min\).*sign in again here/)
+    expect(out).not.toContain('the next run that succeeds')
+  })
+})
 
 describe('a probe that hangs is killed with everything it started, and answers', () => {
   // A killed process can sit unreaped for a moment on a loaded machine; one that was never killed lives on for ten minutes.
