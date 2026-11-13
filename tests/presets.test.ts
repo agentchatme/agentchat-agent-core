@@ -194,14 +194,14 @@ describe('a listener preset acts as the listener\'s agent', () => {
     expect(run?.env['AGENTCHAT_API_KEY']).toBeUndefined()
   }, 20_000)
 
-  it('inspect says installed and signed in, or why not', () => {
+  it('inspect says installed and signed in, or why not', async () => {
     const fake = installFakeClaude(sandbox)
     const env = withFake(fake)
     process.env['PATH'] = env['PATH']
-    expect(claudeCodePreset.inspect(env)).toMatchObject({ ok: true })
+    expect(await claudeCodePreset.inspect(env)).toMatchObject({ ok: true })
     process.env['FAKE_RUNTIME_LOGGED_OUT'] = '1'
     try {
-      expect(claudeCodePreset.inspect(env)).toMatchObject({ ok: false })
+      expect(await claudeCodePreset.inspect(env)).toMatchObject({ ok: false })
     } finally {
       delete process.env['FAKE_RUNTIME_LOGGED_OUT']
     }

@@ -13,6 +13,8 @@ import * as path from 'node:path'
 //   FAKE_MCP_LIST=<json>           what `mcp list --json` prints (default: agentchat only)
 //   FAKE_MCP_LIST_MODE=fail|hang|garbage   how `mcp list` misbehaves instead
 //   FAKE_MCP_LIST_PIDS=<file>      `hang`: where the hung listing writes its pid and its child's
+//   FAKE_RUNTIME_PROBE_HANG=version|auth   that probe hangs, with a child holding its output pipe
+//   FAKE_RUNTIME_PROBE_PIDS=<file> where the hung probe writes its pid and its child's
 //   FAKE_MCP_LIST_RECORD=<file>    where `mcp list` appends its argv, cwd and env
 //
 // A run's record also says what its `--mcp-config` file held at that moment:
@@ -59,8 +61,20 @@ function install(root: string, name: string, version: string, authArgs: [string,
       '#!/usr/bin/env node',
       "const fs = require('node:fs')",
       'const args = process.argv.slice(2)',
-      `if (args[0] === '--version') { console.log(${JSON.stringify(version)}); process.exit(0) }`,
+      // A probe that hangs (FAKE_RUNTIME_PROBE_HANG=version|auth), with a child of its own
+      // holding the output pipe, as an npm launcher and its native binary do; both pids
+      // go to FAKE_RUNTIME_PROBE_PIDS.
+      'const hangProbe = (which) => {',
+      "  if (process.env.FAKE_RUNTIME_PROBE_HANG !== which) return",
+      "  const kid = require('node:child_process').spawn(process.execPath, ['-e', 'setTimeout(() => {}, 600000)'], { stdio: ['ignore', 'inherit', 'inherit'] })",
+      "  if (process.env.FAKE_RUNTIME_PROBE_PIDS) fs.writeFileSync(process.env.FAKE_RUNTIME_PROBE_PIDS, JSON.stringify([process.pid, kid.pid]))",
+      '  setTimeout(() => {}, 600000)',
+      "  throw 'hang'",
+      '}',
+      'try {',
+      `if (args[0] === '--version') { hangProbe('version'); console.log(${JSON.stringify(version)}); process.exit(0) }`,
       `if (args[0] === ${JSON.stringify(authArgs[0])} && args[1] === ${JSON.stringify(authArgs[1])}) {`,
+      "  hangProbe('auth')",
       "  if (process.env.FAKE_RUNTIME_LOGGED_OUT === '1') { console.log('{\"loggedIn\":false}'); process.exit(1) }",
       "  console.log('{\"loggedIn\":true}'); process.exit(0)",
       '}',
@@ -99,6 +113,7 @@ function install(root: string, name: string, version: string, authArgs: [string,
       '}',
       `console.error('unsupported fake ${name} command: ' + args.join(' '))`,
       'process.exit(2)',
+      "} catch (e) { if (e !== 'hang') throw e }",
       '',
     ].join('\n'),
     { mode: 0o755 },

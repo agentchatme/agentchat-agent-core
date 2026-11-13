@@ -135,6 +135,45 @@ Pending group invites are on the tray (contract v1), so nothing about them is ke
 
 A run is classified `ok` (exit 0), `timed_out` (killed past its budget), `failed` (interrupted, or exited non-zero after writing to stdout), or `not_started` (exited non-zero with **nothing on stdout** — a signed-out CLI, a bad flag; its stderr complaint rides along, redacted, in the detail — or no served texts in hand yet). None of them is retried here.
 
+### One agent, one listener
+
+Two identity homes can hold the same agent's key: a CLI listener's home and an integration's, say. If both held a socket, every message would be answered twice. So the first daemon to start for an agent holds its **agent lock**, and any other daemon for that agent holds no socket and starts no run. `status` names the home that serves the agent (`standby`, rewritten every poll), `doctor` warns, and the standby takes over when that one stops.
+
+**A holder that cannot serve gives the agent up.** If the server refuses its key (socket `blocked`, say a key rotated by `recover` in another home), it gives the agent up at once. If its runs fail for a runtime reason (`runs_failing`), it gives the agent up only when a healthy listener for the agent is actually waiting: a standby keeps a fresh marker beside the lease, and only while its own runtime checks out (its preflight, rechecked every 5 min), so a signed-out standby never leaves the agent with no socket. A lone install keeps its socket: wakes keep arriving, are counted, and start runs, and the next run that succeeds clears it. A home that gave the agent up says so in status (`unservable`: `key_refused` or `runs_failing`, the detail, since, `retry_at`). It holds no socket and starts no run while another listener can serve the agent, and looks again every 60 s after failing runs (the runtime checked first, within a deadline: a check that passes clears it) or every 5 min after a refused key (signing in again clears it at once). Whenever no other listener holds the agent, it takes the agent back: a failing install is still better than none.
+
+- **Where the lock lives:** one file per agent, `agent-<32 hex>.lock`, named by a hash of the API origin and the agent's handle (never the key). The folder is per user and owner-only, derived from the home folder alone so that a service and a shell agree on it:
+  - macOS: `~/Library/Application Support/AgentChat/locks`
+  - Windows: `%USERPROFILE%\AppData\Local\AgentChat\locks`
+  - elsewhere: `~/.local/state/agentchat/locks`
+  - `AGENTCHAT_LOCK_DIR` in the process environment overrides it, for tests and sandboxes.
+- **A lease.** The agent lock and each home's `daemon.lock` are leases (`util/lease.ts`).
+  - **Format:** the first line is the holder's bare pid, so readers from before (the Windows service reinstall, a 0.4.x daemon) see the pid and refuse a live lock instead of stealing it. A line of JSON follows: token, host, home, `acquired_at`, `renewed_at`.
+  - **Created** with O_EXCL. The holder rewrites the lease every 10 s.
+- **When a holder is gone, by what a contender observes.** A contender never compares the holder's wall clock with its own. A lease is stale only when its content (token and `renewed_at`) has not changed for 45 s on the contender's own monotonic clock since it first saw that content (the Kubernetes leader-election rule).
+  - **A second look before a takeover.** Node's monotonic clock does not behave the same in sleep everywhere: it stops while a Linux machine is suspended, and keeps running through a macOS sleep. So on a Mac, a standby that wakes can find an unchanged lease that already looks 45 s old, before the holder (woken at the same moment) has fired its overdue renewal. A stale verdict by observation is therefore confirmed 15 s later (1.5 renewals); a holder that is there has renewed by then. Wall-clock steps and another host's skew play no part.
+  - **Dead pid:** a holder whose pid is dead on this host is gone at once.
+  - **Before this boot:** a lease on this host whose file and `renewed_at` both predate the current boot is gone at once (its pid belongs to someone else now). Windows Fast Startup keeps the uptime counting, so this cannot be the only rule there.
+  - **A daemon starting up watches before refusing.** It observes a held `daemon.lock` for the stale window plus a renewal (55 s), so a lease whose pid was reused (a reboot, or a logoff that killed the daemon) is taken over by that same process rather than refused into a service restart that would look at it afresh, for ever. A holder seen renewing is refused at once (within one renewal).
+  - **Old locks:** a lock from before leases (a bare pid) is judged by its pid, unless the file predates this boot (its pid may belong to someone else now).
+  - **No probes:** there are no start-time probes (`ps`, PowerShell).
+- **Takeover, renewal, release:** all happen under a short O_EXCL guard. On every renewal the holder re-reads the file and stands down at once if it is no longer its own: the integration stops right there, so no wake can start a run in the meantime. A renewal that fails (the lock folder removed, a full disk) is counted in status (`lease_errors`) and never crashes the daemon. A lease that cannot be renewed for 45 s is given up cleanly.
+- **The Windows/WSL reinstall** stops the pid in `daemon.lock` (`DAEMON_LOCK_FILE`) only while that holder is really there.
+- **Limit:** two different OS users holding one agent's key do not see each other.
+
+### When runs keep failing
+
+The socket can be fine while every run fails: the runtime was signed out, its binary removed, or an upgrade dropped a flag. After a run that did not get done, the daemon checks the runtime again with the runner's own preflight. It does this at most once every 5 minutes while runs keep failing, never on every wake. If the check fails, `status` says so plainly, under a headline that reads "socket ready — but runs are failing":
+
+```
+runs failing: claude: claude is not signed in (run `claude` once and sign in) — since <time>, N run(s) missed
+```
+
+`doctor` reports a FAIL check `runs`, and `integration.status.json` carries `runs_failing` (`reason`, `since`, `runs_missed`, `checked_at`). Wakes still start runs and are counted: each one is the quickest way back. The next run that succeeds clears it. The one exception is a healthy listener for the same agent waiting in another home: then this home hands the agent over (`unservable`, above), and its runtime recheck clears it.
+
+A runtime check in flight is stopped, its probes killed, when the daemon or the integration stops. A `claude auth status` that hangs is reported as not answering ("did not answer within 10 s"), not as signed out.
+
+The runtime probes (`inspectClaudeRuntime`, `claudeIsLoggedIn`, `inspectCodexRuntime`, `codexIsLoggedIn`, `Preset.inspect`) are async (`runProbe`). A probe that hangs is killed with everything it started: its process group on POSIX, `taskkill /T /F` on Windows, where the npm `.cmd` shim and the real process differ. Its exit is waited for, within a bound. A synchronous probe could only kill the shim, and then sat blocking the daemon.
+
 ### Run profiles
 
 `AGENTCHAT_RUN_PROFILE=answer|work|full` (default `answer`) says what a headless run may do; each integration maps the profile to its runtime's real flags and documents them. A run is started by **any** peer's unread message, a stranger's cold DM included, so the default gives it nothing to leak and no way to leak it:
@@ -197,7 +236,9 @@ pnpm test        # incl. tests/integration.test.ts (the SDK kit's receive loop a
                  # (the regression guard: an answer argv never gains the web, the shell or a read outside its workdir),
                  # tests/answer-isolation.test.ts (answer runs load only the AgentChat MCP server, no run carries a
                  # parent session's variables, the home folder is no answer run's workdir), tests/answer-review.test.ts
-                 # (no user context files, no extra working directories, per-run key files, the listing cache)
+                 # (no user context files, no extra working directories, per-run key files, the listing cache),
+                 # tests/listener-health.test.ts (runs failing said and cleared, the agent lock and its atomic
+                 # takeover, probes killed with their whole tree)
 ```
 
 The engine builds on the SDK's integration kit (`import { integration } from 'agentchatme'`, `agentchatme` 1.3.0 and later).

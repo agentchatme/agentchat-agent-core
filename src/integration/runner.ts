@@ -75,6 +75,14 @@ export interface RunOutcome {
   readonly detail?: string
 }
 
+export interface RunPreflightOptions {
+  /**
+   * Aborted when the integration stops while a check is in flight: a runner's
+   * probes should stop (and kill what they started) rather than outlive it.
+   */
+  readonly signal?: AbortSignal
+}
+
 export interface RunPreflight {
   ok: boolean
   detail?: string
@@ -88,7 +96,7 @@ export interface RunRunner {
    * before the socket is held: an integration whose runtime is not usable
    * holds no socket, and the supervisor asks again with a backoff.
    */
-  preflight(): Promise<RunPreflight>
+  preflight(options?: RunPreflightOptions): Promise<RunPreflight>
   /** Start one run and wait for it. Never throws — returns an outcome. */
   start(request: RunRequest): Promise<RunOutcome>
 }

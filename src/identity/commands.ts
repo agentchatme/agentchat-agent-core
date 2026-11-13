@@ -914,6 +914,35 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
     // (a runtime that fails, texts that never arrive, a cycle abandoned by
     // its watchdog) are a pattern to fix, even while the socket looks fine.
     const integration = readIntegrationStatus(home)
+    // Runs failing for a runtime reason, as the daemon's own recheck found
+    // (signed out, the binary gone, a flag an upgrade dropped).
+    const runsFailing = integration?.runs_failing ?? null
+    const gaveUp = integration?.unservable ?? null
+    if (gaveUp !== null) {
+      checks.push({
+        name: 'runs',
+        verdict: 'FAIL',
+        detail:
+          gaveUp.reason === 'key_refused'
+            ? `this home gave the agent up: the server refuses its key (${gaveUp.detail}); it looks again at ${gaveUp.retry_at} (every 5 min) and takes the agent back whenever no other listener holds it, but only a key the server accepts can serve — sign in again here (login/recover; that clears this at once), or log out if another home serves the agent`
+            : `this home gave the agent up: ${gaveUp.detail} (since ${gaveUp.since}); its runtime is checked again at ${gaveUp.retry_at} (every 60 s) and a check that passes clears this; it takes the agent back whenever no other listener holds it`,
+      })
+    } else if (runsFailing !== null) {
+      checks.push({
+        name: 'runs',
+        verdict: 'FAIL',
+        detail: `runs failing: ${runsFailing.reason} — since ${runsFailing.since}, ${runsFailing.runs_missed} run(s) missed (checked ${runsFailing.checked_at}); fix that, and the next run that succeeds clears this`,
+      })
+    }
+    // Another daemon serves this agent from another identity home.
+    const standby = integration?.standby ?? null
+    if (standby !== null) {
+      checks.push({
+        name: 'single-listener',
+        verdict: 'WARN',
+        detail: `another listener serves this agent: ${standby.home ?? 'another identity home'}${standby.pid !== null ? ` (pid ${standby.pid})` : ''}; this one stands by (no socket, no run) so no message is answered twice`,
+      })
+    }
     const cycles = integration?.recent_cycles ?? []
     if (cycles.length > 0) {
       const failing = failedCyclesInARow(integration)

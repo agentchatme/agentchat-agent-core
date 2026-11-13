@@ -15,6 +15,7 @@ export { semverAtLeast } from './semver.js'
 export {
   CLAUDE_CODE_PRESET,
   MIN_CLAUDE_CODE_VERSION,
+  PROBE_TIMEOUT_MS,
   CLAUDE_MCP_SERVER_NAME,
   AGENTCHAT_TOOL_ALLOW,
   ANSWER_TOOLS,
@@ -29,6 +30,8 @@ export {
   claudeUserStatePathFor,
   buildClaudeEnv,
   claudeIsLoggedIn,
+  claudeSignIn,
+  type ClaudeSignIn,
   inspectClaudeRuntime,
   deniedAncestorOf,
   claudeProfileArgs,
@@ -53,6 +56,7 @@ export {
 export {
   CODEX_PRESET,
   MIN_CODEX_VERSION,
+  CODEX_PROBE_TIMEOUT_MS,
   CODEX_MCP_SERVER_NAME,
   LISTENER_KEY_ENV,
   CODEX_PROMPT_FROM_STDIN,
@@ -64,6 +68,7 @@ export {
   codexIsLoggedIn,
   codexProfileArgs,
   codexMcpOverrideArgs,
+  codexPinnedUrlArgs,
   codexClientHeadersToml,
   codexRunArgs,
   agentchatTableKeys,

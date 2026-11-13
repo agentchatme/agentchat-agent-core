@@ -5,6 +5,8 @@ import * as path from 'node:path'
 import { log } from '../util/log.js'
 import { atomicWriteFile } from '../util/fsutil.js'
 import { spawnCommand, spawnCommandSync } from '../util/spawn.js'
+import { holderLive, parseLease } from '../util/lease.js'
+import { DAEMON_LOCK_FILE } from './leader-lock.js'
 
 // ─── Service lifecycle (systemd / launchd / Windows Startup) ─────────────────
 //
@@ -802,11 +804,20 @@ function killLauncher(label: string, mode: WinMode): { ok: boolean; out: string 
   return run(mode === 'win32' ? 'powershell' : 'powershell.exe', ['-NoProfile', '-Command', ps])
 }
 
-/** The pid in the daemon's leader lock, or null: the daemon the Startup launcher is keeping alive right now. */
-function lockedDaemonPid(home: string): number | null {
+/**
+ * The pid in the daemon's leader lock, or null: the daemon the Startup
+ * launcher is keeping alive right now. The lock's shared parser (its first
+ * line is the bare pid, in the lease format and in a lock from before it),
+ * and only while its holder is really there (`holderLive`): a lock left by a
+ * daemon that died — its pid perhaps reused by an unrelated process — names
+ * nothing to stop.
+ */
+export function lockedDaemonPid(home: string): number | null {
+  const file = path.join(home, DAEMON_LOCK_FILE)
   try {
-    const pid = Number.parseInt(fs.readFileSync(path.join(home, 'daemon.lock'), 'utf-8').trim(), 10)
-    return Number.isInteger(pid) && pid > 0 ? pid : null
+    const holder = parseLease(fs.readFileSync(file, 'utf-8'))
+    if (holder === null || !Number.isInteger(holder.pid) || holder.pid <= 0) return null
+    return holderLive(holder, { mtimeMs: fs.statSync(file).mtimeMs }) ? holder.pid : null
   } catch {
     return null
   }

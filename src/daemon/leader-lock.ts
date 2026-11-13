@@ -1,79 +1,34 @@
-import * as fs from 'node:fs'
 import * as path from 'node:path'
 import { log } from '../util/log.js'
+import { acquireLease, leaseStartupObserveMs, type Lease, type LeaseOptions } from '../util/lease.js'
 
-// ─── Single-instance lock (per identity) ────────────────────────────────────
+// ─── Single-instance lock (per identity home) ───────────────────────────────
 //
-// Two daemons for one agent = duplicate replies + WS thrash. A PID lockfile in
-// the agent's home enforces one. If a stale lock is found (holder PID dead),
-// we steal it. Portable (no native flock); good enough for one-box-per-agent.
+// Two daemons for one home = duplicate replies + socket thrash. `daemon.lock`
+// in the home enforces one: a lease (`util/lease.ts`) — created with O_EXCL,
+// renewed by its holder, taken over under a guard when its holder is gone.
+// Its first line is the holder's bare pid, as older readers expect (the
+// Windows service reinstall stops the daemon by it; a 0.4.x daemon reads it to
+// decide the lock is held). One agent served from two homes is the agent
+// lock's business (`daemon/agent-lock.ts`).
 
-export interface LockHandle {
-  release(): void
-}
+export type LockHandle = Lease
 
-export function acquireLeaderLock(home: string): LockHandle | null {
-  const lockPath = path.join(home, 'daemon.lock')
-  fs.mkdirSync(home, { recursive: true })
+/** The leader lock's file name in an identity home (consumers that stop or inspect a daemon read it). */
+export const DAEMON_LOCK_FILE = 'daemon.lock'
 
-  const tryWrite = (): boolean => {
-    try {
-      const fd = fs.openSync(lockPath, 'wx') // fails if exists
-      fs.writeSync(fd, String(process.pid))
-      fs.closeSync(fd)
-      return true
-    } catch {
-      return false
-    }
-  }
-
-  if (tryWrite()) return makeHandle(lockPath)
-
-  // Lock exists — is the holder alive?
-  let holderPid = 0
-  try {
-    holderPid = Number.parseInt(fs.readFileSync(lockPath, 'utf-8').trim(), 10)
-  } catch {
-    /* unreadable — treat as stale */
-  }
-  if (holderPid && isAlive(holderPid)) {
-    log.error(`another agentchatd already holds ${lockPath} (pid ${holderPid})`)
-    return null
-  }
-
-  // Stale — steal it.
-  log.warn(`stealing stale lock ${lockPath} (dead pid ${holderPid || '?'})`)
-  try {
-    fs.writeFileSync(lockPath, String(process.pid))
-    return makeHandle(lockPath)
-  } catch (err) {
-    log.error(`could not steal stale lock: ${String(err)}`)
-    return null
-  }
-}
-
-function isAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0) // signal 0 = existence check
-    return true
-  } catch {
-    return false
-  }
-}
-
-function makeHandle(lockPath: string): LockHandle {
-  let released = false
-  const release = (): void => {
-    if (released) return
-    released = true
-    try {
-      // Only remove if it's still ours.
-      if (fs.readFileSync(lockPath, 'utf-8').trim() === String(process.pid)) {
-        fs.unlinkSync(lockPath)
-      }
-    } catch {
-      /* already gone */
-    }
-  }
-  return { release }
+/**
+ * Take the home's leader lock, once, as a daemon starts. A held lease is
+ * watched for the stale window plus a renewal before refusing (unless
+ * `options.observeMs` says otherwise): a holder that is there renews within it
+ * (refused, within one renewal), and one whose pid was reused — a reboot, a
+ * logoff that killed the daemon — is taken over by this process instead of
+ * leaving a service to restart into the same first look for ever.
+ */
+export async function acquireLeaderLock(home: string, options: LeaseOptions = {}): Promise<LockHandle | null> {
+  const lockPath = path.join(home, DAEMON_LOCK_FILE)
+  const attempt = await acquireLease(lockPath, { home: path.resolve(home) }, { observeMs: leaseStartupObserveMs(options), ...options })
+  if (attempt.ok) return attempt.lease
+  log.error(`another agentchat daemon already holds ${lockPath}${attempt.holder !== null ? ` (pid ${attempt.holder.pid})` : ''}`)
+  return null
 }

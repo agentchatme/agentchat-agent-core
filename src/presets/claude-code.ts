@@ -4,11 +4,11 @@ import * as path from 'node:path'
 import { clientHeadersOf } from '../client-identity.js'
 import { hostedMcpUrl } from '../integration/mcp-probe.js'
 import { workdirExposesHome, type RunProfile } from '../integration/profile.js'
-import type { RunOutcome, RunPreflight, RunRequest, RunRunner } from '../integration/runner.js'
+import type { RunOutcome, RunPreflight, RunPreflightOptions, RunRequest, RunRunner } from '../integration/runner.js'
 import { spawnRun } from '../integration/spawn-run.js'
 import { atomicWriteFile } from '../util/fsutil.js'
 import { log } from '../util/log.js'
-import { spawnCommandSync } from '../util/spawn.js'
+import { runProbe } from '../util/probe.js'
 import { VERSION } from '../version.js'
 import { semverAtLeast } from './semver.js'
 import { withoutInheritedKey, withoutParentSession, type Preset, type PresetContext, type PresetInspection } from './types.js'
@@ -199,49 +199,58 @@ export function buildClaudeEnv(configDirOverride: string | undefined, source: No
   return env
 }
 
+/** How long a probe (`--version`, the sign-in check) may take; a hung one is killed with its whole tree. */
+export const PROBE_TIMEOUT_MS = 10_000
+
 /**
  * Is Claude Code signed in? `claude auth status` prints JSON with a boolean
  * `loggedIn` and exits 0 if logged in, 1 if not. When that JSON is there it is
  * the answer. The file/keychain probes are a fallback for builds without the
  * subcommand; the keychain probe is existence-only and never prompts — a
- * resident listener must never trigger a keychain prompt.
+ * resident listener must never trigger a keychain prompt. Async: a hung probe
+ * is killed with everything it started (`runProbe`), never left holding the
+ * daemon.
  */
-export function claudeIsLoggedIn(configDirOverride?: string, command = 'claude'): boolean {
-  const status = spawnCommandSync(command, ['auth', 'status'], {
-    encoding: 'utf-8',
-    timeout: 10_000,
-    windowsHide: true,
-    env: claudeProcessEnv(configDirOverride, process.env),
-  })
+/** What Claude Code's sign-in check found: signed in or not, or no answer (it hung, or was stopped): then `detail` says so. */
+export interface ClaudeSignIn {
+  readonly signedIn: boolean
+  /** Why it could not tell: `claude auth status did not answer within 10 s (killed)`. Null when it answered. */
+  readonly unanswered: string | null
+}
+
+export async function claudeSignIn(configDirOverride?: string, command = 'claude', timeoutMs = PROBE_TIMEOUT_MS, signal?: AbortSignal): Promise<ClaudeSignIn> {
+  const status = await runProbe(command, ['auth', 'status'], { timeoutMs, env: claudeProcessEnv(configDirOverride, process.env), ...(signal !== undefined ? { signal } : {}) })
+  // A check that hung says the runtime is broken, not that this is an old build: no fallback, and said as what it is.
+  if (status.timedOut) return { signedIn: false, unanswered: `claude auth status did not answer within ${Math.round(timeoutMs / 1000)} s (killed)` }
+  if (signal?.aborted) return { signedIn: false, unanswered: 'claude auth status was stopped' }
   if (!status.error) {
     try {
-      const parsed = JSON.parse(String(status.stdout ?? '').trim()) as { loggedIn?: unknown }
-      if (typeof parsed?.loggedIn === 'boolean') return parsed.loggedIn
+      const parsed = JSON.parse(status.stdout.trim()) as { loggedIn?: unknown }
+      if (typeof parsed?.loggedIn === 'boolean') return { signedIn: parsed.loggedIn, unanswered: null }
     } catch {
       /* no JSON: an older build; fall through to the file and keychain */
     }
-    if (status.status === 0) return true
+    if (status.status === 0) return { signedIn: true, unanswered: null }
   }
 
   const configDir = claudeHomeFor(configDirOverride)
-  if (fs.existsSync(path.join(configDir, '.credentials.json'))) return true
-  if (process.platform !== 'darwin') return false
-  const keychain = spawnCommandSync('security', ['find-generic-password', '-s', 'Claude Code-credentials'], {
-    encoding: 'utf-8',
-    timeout: 5_000,
-  })
-  return !keychain.error && keychain.status === 0
+  if (fs.existsSync(path.join(configDir, '.credentials.json'))) return { signedIn: true, unanswered: null }
+  if (process.platform !== 'darwin') return { signedIn: false, unanswered: null }
+  const keychain = await runProbe('security', ['find-generic-password', '-s', 'Claude Code-credentials'], { timeoutMs: Math.min(timeoutMs, 5_000), ...(signal !== undefined ? { signal } : {}) })
+  return { signedIn: !keychain.error && keychain.status === 0, unanswered: null }
 }
 
-export function inspectClaudeRuntime(configDirOverride?: string, command = 'claude'): PresetInspection {
-  const version = spawnCommandSync(command, ['--version'], {
-    encoding: 'utf-8',
-    timeout: 10_000,
-    windowsHide: true,
-    env: claudeProcessEnv(configDirOverride, process.env),
-  })
+/** `claudeSignIn`, as a yes/no (no answer is not signed in). */
+export async function claudeIsLoggedIn(configDirOverride?: string, command = 'claude', timeoutMs = PROBE_TIMEOUT_MS): Promise<boolean> {
+  return (await claudeSignIn(configDirOverride, command, timeoutMs)).signedIn
+}
+
+export async function inspectClaudeRuntime(configDirOverride?: string, command = 'claude', timeoutMs = PROBE_TIMEOUT_MS, signal?: AbortSignal): Promise<PresetInspection> {
+  const version = await runProbe(command, ['--version'], { timeoutMs, env: claudeProcessEnv(configDirOverride, process.env), ...(signal !== undefined ? { signal } : {}) })
+  if (version.timedOut) return { ok: false, detail: `claude --version did not answer within ${Math.round(timeoutMs / 1000)} s (killed)` }
+  if (signal?.aborted) return { ok: false, detail: 'claude --version was stopped' }
   if (version.error) return { ok: false, detail: `claude CLI not found on PATH (${version.error.message})` }
-  const rendered = String(version.stdout || version.stderr).trim()
+  const rendered = (version.stdout || version.stderr).trim()
   if (version.status !== 0) return { ok: false, detail: rendered || `claude --version exited ${version.status}` }
   return semverAtLeast(rendered, MIN_CLAUDE_CODE_VERSION)
     ? { ok: true, detail: rendered }
@@ -628,12 +637,12 @@ export class ClaudeRunner implements RunRunner {
     return deniedAncestorOf(this.workdir(), this.options.denyReadPaths)
   }
 
-  async preflight(): Promise<RunPreflight> {
-    const runtime = inspectClaudeRuntime(this.options.configDir, this.command)
+  async preflight(options: RunPreflightOptions = {}): Promise<RunPreflight> {
+    const runtime = await inspectClaudeRuntime(this.options.configDir, this.command, PROBE_TIMEOUT_MS, options.signal)
     if (!runtime.ok) return { ok: false, detail: runtime.detail }
-    if (!claudeIsLoggedIn(this.options.configDir, this.command)) {
-      return { ok: false, detail: 'claude is not signed in (run `claude` once and sign in)' }
-    }
+    const signIn = await claudeSignIn(this.options.configDir, this.command, PROBE_TIMEOUT_MS, options.signal)
+    if (signIn.unanswered !== null) return { ok: false, detail: signIn.unanswered }
+    if (!signIn.signedIn) return { ok: false, detail: 'claude is not signed in (run `claude` once and sign in)' }
     if (this.options.profile === 'answer' && this.options.mcpConfigPath === undefined) {
       const answerMcp = this.options.answerMcp
       // Fail closed: without an AgentChat-only tool config the run would load
@@ -824,11 +833,13 @@ export const claudeCodePreset: Preset = {
   // Every run's file tools are denied the identity home.
   serviceEnv: ['CLAUDE_CONFIG_DIR'],
   readsIdentityHome: false,
-  inspect(env = process.env, command = 'claude') {
+  async inspect(env = process.env, command = 'claude') {
     const configDir = claudeConfigDirFrom(env)
-    const runtime = inspectClaudeRuntime(configDir, command)
+    const runtime = await inspectClaudeRuntime(configDir, command)
     if (!runtime.ok) return runtime
-    return claudeIsLoggedIn(configDir, command)
+    const signIn = await claudeSignIn(configDir, command)
+    if (signIn.unanswered !== null) return { ok: false, detail: `${runtime.detail}, ${signIn.unanswered}` }
+    return signIn.signedIn
       ? { ok: true, detail: `${runtime.detail}, signed in` }
       : { ok: false, detail: `${runtime.detail}, not signed in (run \`claude\` once and sign in)` }
   },

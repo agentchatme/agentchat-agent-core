@@ -4,10 +4,11 @@ import * as path from 'node:path'
 import { clientHeadersOf } from '../client-identity.js'
 import { hostedMcpUrl } from '../integration/mcp-probe.js'
 import { workdirExposesHome, type RunProfile } from '../integration/profile.js'
-import type { RunOutcome, RunPreflight, RunRequest, RunRunner } from '../integration/runner.js'
+import type { RunOutcome, RunPreflight, RunPreflightOptions, RunRequest, RunRunner } from '../integration/runner.js'
 import { killProcessTree, redactDiagnostic, spawnRun } from '../integration/spawn-run.js'
 import { log } from '../util/log.js'
-import { spawnCommand, spawnCommandSync } from '../util/spawn.js'
+import { spawnCommand } from '../util/spawn.js'
+import { runProbe } from '../util/probe.js'
 import { VERSION } from '../version.js'
 import { semverAtLeast } from './semver.js'
 import { withoutInheritedKey, withoutParentSession, type Preset, type PresetContext, type PresetInspection } from './types.js'
@@ -107,15 +108,15 @@ export function codexHomeFrom(env: NodeJS.ProcessEnv = process.env): string {
   return path.join(os.homedir(), '.codex')
 }
 
-export function inspectCodexRuntime(codexHome: string, command = 'codex'): PresetInspection {
-  const result = spawnCommandSync(command, ['--version'], {
-    encoding: 'utf-8',
-    timeout: 10_000,
-    windowsHide: true,
-    env: { ...process.env, CODEX_HOME: codexHome },
-  })
+/** How long a probe (`--version`, `login status`) may take; a hung one is killed with its whole tree (`runProbe`). */
+export const CODEX_PROBE_TIMEOUT_MS = 10_000
+
+export async function inspectCodexRuntime(codexHome: string, command = 'codex', timeoutMs = CODEX_PROBE_TIMEOUT_MS, signal?: AbortSignal): Promise<PresetInspection> {
+  const result = await runProbe(command, ['--version'], { timeoutMs, env: { ...process.env, CODEX_HOME: codexHome }, ...(signal !== undefined ? { signal } : {}) })
+  if (result.timedOut) return { ok: false, detail: `codex --version did not answer within ${Math.round(timeoutMs / 1000)} s (killed)` }
+  if (signal?.aborted) return { ok: false, detail: 'codex --version was stopped' }
   if (result.error) return { ok: false, detail: `codex CLI not found on PATH (${result.error.message})` }
-  const rendered = String(result.stdout || result.stderr).trim()
+  const rendered = (result.stdout || result.stderr).trim()
   if (result.status !== 0) return { ok: false, detail: rendered || `codex --version exited ${result.status}` }
   return semverAtLeast(rendered, MIN_CODEX_VERSION)
     ? { ok: true, detail: rendered }
@@ -123,15 +124,10 @@ export function inspectCodexRuntime(codexHome: string, command = 'codex'): Prese
 }
 
 /** `codex login status` exits 0 when signed in. */
-export function codexIsLoggedIn(codexHome: string, command = 'codex'): PresetInspection {
-  const status = spawnCommandSync(command, ['login', 'status'], {
-    encoding: 'utf-8',
-    timeout: 10_000,
-    windowsHide: true,
-    env: { ...process.env, CODEX_HOME: codexHome },
-  })
+export async function codexIsLoggedIn(codexHome: string, command = 'codex', timeoutMs = CODEX_PROBE_TIMEOUT_MS, signal?: AbortSignal): Promise<PresetInspection> {
+  const status = await runProbe(command, ['login', 'status'], { timeoutMs, env: { ...process.env, CODEX_HOME: codexHome }, ...(signal !== undefined ? { signal } : {}) })
   if (status.error) return { ok: false, detail: status.error.message }
-  const detail = `${status.stdout ?? ''}${status.stderr ?? ''}`.trim().slice(0, 200)
+  const detail = `${status.stdout}${status.stderr}`.trim().slice(0, 200)
   return status.status === 0 ? { ok: true, detail: detail || 'signed in' } : { ok: false, detail: detail || 'codex is not signed in (run `codex login`)' }
 }
 
@@ -208,6 +204,11 @@ export function codexClientHeadersToml(clientVersion: string = VERSION): string 
   return `{ ${pairs.join(', ')} }`
 }
 
+/** `-c mcp_servers.agentchat.url="<url>"`: the hosted server's URL pinned for one run, whatever another config layer says. */
+export function codexPinnedUrlArgs(url: string): string[] {
+  return ['-c', `mcp_servers.${CODEX_MCP_SERVER_NAME}.url=${JSON.stringify(url)}`]
+}
+
 /** The `-c` overrides that make `[mcp_servers.agentchat]` this agent's, for one run. TOML values, no key in them. */
 export function codexMcpOverrideArgs(override: CodexMcpOverride): string[] {
   const table = `mcp_servers.${CODEX_MCP_SERVER_NAME}`
@@ -255,6 +256,15 @@ export interface CodexRunnerOptions {
   readonly keyEnv: string
   /** Point the hosted server at this agent for each run (`-c` overrides); absent, config.toml decides. */
   readonly mcp?: CodexMcpOverride
+  /**
+   * Without `mcp` (an integration's own runs): the hosted server's URL
+   * (`<api base>/mcp`), pinned on every run with `-c mcp_servers.agentchat.url=…`
+   * so no other config layer — a trusted project's `.codex/config.toml`
+   * among them — can point the agentchat server, and the key its bearer
+   * variable carries, anywhere else. A layer that gives it a `command`
+   * instead makes the merged table invalid: the run does not start.
+   */
+  readonly pinMcpUrl?: string
   /** Test seam: the binary to run. */
   readonly command?: string
   readonly env?: NodeJS.ProcessEnv
@@ -419,10 +429,10 @@ export class CodexRunner implements RunRunner {
     return this.options.workdir
   }
 
-  async preflight(): Promise<RunPreflight> {
-    const runtime = inspectCodexRuntime(this.options.codexHome, this.command)
+  async preflight(options: RunPreflightOptions = {}): Promise<RunPreflight> {
+    const runtime = await inspectCodexRuntime(this.options.codexHome, this.command, CODEX_PROBE_TIMEOUT_MS, options.signal)
     if (!runtime.ok) return { ok: false, detail: runtime.detail }
-    const auth = codexIsLoggedIn(this.options.codexHome, this.command)
+    const auth = await codexIsLoggedIn(this.options.codexHome, this.command, CODEX_PROBE_TIMEOUT_MS, options.signal)
     if (!auth.ok) return { ok: false, detail: `codex login status failed: ${auth.detail}` }
     if (this.workdir() !== this.options.workdir && !this.warnedHome) {
       this.warnedHome = true
@@ -441,7 +451,10 @@ export class CodexRunner implements RunRunner {
 
   /** The exact argv one run uses — exported for tests to pin per profile. An `answer` run adds `answerMcpDisables()` before the prompt. */
   args(): string[] {
-    return codexRunArgs(this.options.profile, { workdir: this.workdir(), ...(this.options.mcp !== undefined ? { mcp: this.options.mcp } : {}) })
+    const args = codexRunArgs(this.options.profile, { workdir: this.workdir(), ...(this.options.mcp !== undefined ? { mcp: this.options.mcp } : {}) })
+    if (this.options.mcp !== undefined || this.options.pinMcpUrl === undefined) return args
+    // The prompt stays the last positional.
+    return [...args.slice(0, -1), ...codexPinnedUrlArgs(this.options.pinMcpUrl), CODEX_PROMPT_FROM_STDIN]
   }
 
   /** The child environment: Codex's home and the key the hosted server needs, under the configured name. */
@@ -610,11 +623,11 @@ export const codexPreset: Preset = {
   // `work` and `full` read the whole filesystem (an `answer` run reads only its
   // workdir): true, because the field is one for every profile.
   readsIdentityHome: true,
-  inspect(env = process.env, command = 'codex') {
+  async inspect(env = process.env, command = 'codex') {
     const home = codexHomeFrom(env)
-    const runtime = inspectCodexRuntime(home, command)
+    const runtime = await inspectCodexRuntime(home, command)
     if (!runtime.ok) return runtime
-    const auth = codexIsLoggedIn(home, command)
+    const auth = await codexIsLoggedIn(home, command)
     return auth.ok ? { ok: true, detail: `${runtime.detail}, signed in` } : { ok: false, detail: `${runtime.detail}, not signed in: ${auth.detail}` }
   },
   runner(ctx: PresetContext): RunRunner {

@@ -257,7 +257,8 @@ describe('install (re)starts the daemon it just wrote', () => {
     setServiceCommandRunnerForTests(fake.runner)
     delete process.env['AGENTCHAT_SERVICE_DRY_RUN']
     fs.mkdirSync(home(), { recursive: true })
-    fs.writeFileSync(path.join(home(), 'daemon.lock'), '4242')
+    // The leader lock as a daemon writes it (a lease: the bare pid first, then its JSON).
+    fs.writeFileSync(path.join(home(), 'daemon.lock'), `4242\n${JSON.stringify({ pid: 4242, token: 't', host: 'h', renewed_at: Date.now() })}\n`)
     installService({ label: BASE, home: home(), entry: entry() })
     const launcherKill = fake.calls.findIndex((c) => c.startsWith('powershell ') && c.includes(`${BASE}.vbs`) && c.includes('Stop-Process'))
     const daemonKill = fake.calls.indexOf('taskkill /PID 4242 /T /F')
@@ -285,7 +286,7 @@ describe('install (re)starts the daemon it just wrote', () => {
     setServiceCommandRunnerForTests(fake.runner)
     delete process.env['AGENTCHAT_SERVICE_DRY_RUN']
     fs.mkdirSync(home(), { recursive: true })
-    fs.writeFileSync(path.join(home(), 'daemon.lock'), '777')
+    fs.writeFileSync(path.join(home(), 'daemon.lock'), `777\n${JSON.stringify({ pid: 777, token: 't', host: 'h', renewed_at: Date.now() })}\n`)
     installService({ label: BASE, home: home(), entry: entry() })
     const launcherKill = fake.calls.findIndex((c) => c.startsWith('powershell.exe ') && c.includes('Stop-Process'))
     const daemonKill = fake.calls.indexOf('kill -TERM 777')
