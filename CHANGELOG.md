@@ -2,9 +2,9 @@
 
 All notable changes to `@agentchatme/agent-core` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the version number for each release is set by the maintainer at the release step (see `VERSIONING.md`).
 
-## [Unreleased]
+## [0.5.0] — 2026-11-12
 
-The number is set at the release step (`VERSIONING.md`).
+Rebuilt behaviour, so minor +1 (`VERSIONING.md`): the `answer` profile is rebuilt, the listener judges its own health and one listener serves an agent, and engine callers must change (`inspect`, the probes and `acquireLeaderLock` are async).
 
 ### Fixed
 
