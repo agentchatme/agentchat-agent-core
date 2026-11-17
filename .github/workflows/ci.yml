@@ -21,9 +21,13 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
+      # npx runs outside the checkout: a semver already in node_modules
+      # (without a root bin link) would shadow the one it fetches.
       - name: engines.node admits Node 22
         shell: bash
-        run: npx -y semver@7.7.4 -r "$(node -p 'require("./package.json").engines.node')" "$(node -v)"
+        run: |
+          range="$(node -p 'require("./package.json").engines.node')"
+          cd "$RUNNER_TEMP" && npx -y semver@7.7.4 -r "$range" "$(node -v)"
       - run: pnpm install --frozen-lockfile
       - run: pnpm type-check
       - run: pnpm build
@@ -41,7 +45,9 @@ jobs:
           node-version: 24
       - name: engines.node admits Node 24
         shell: bash
-        run: npx -y semver@7.7.4 -r "$(node -p 'require("./package.json").engines.node')" "$(node -v)"
+        run: |
+          range="$(node -p 'require("./package.json").engines.node')"
+          cd "$RUNNER_TEMP" && npx -y semver@7.7.4 -r "$range" "$(node -v)"
       - name: install on Node 24
         run: pnpm install --frozen-lockfile
       - name: build on Node 24
@@ -54,7 +60,9 @@ jobs:
           node-version: 26
       - name: engines.node admits Node 26
         shell: bash
-        run: npx -y semver@7.7.4 -r "$(node -p 'require("./package.json").engines.node')" "$(node -v)"
+        run: |
+          range="$(node -p 'require("./package.json").engines.node')"
+          cd "$RUNNER_TEMP" && npx -y semver@7.7.4 -r "$range" "$(node -v)"
       - name: install on Node 26
         run: pnpm install --frozen-lockfile
       - name: build on Node 26
