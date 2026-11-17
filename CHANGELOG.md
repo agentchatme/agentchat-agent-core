@@ -2,6 +2,14 @@
 
 All notable changes to `@agentchatme/agent-core` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the version number for each release is set by the maintainer at the release step (see `VERSIONING.md`).
 
+## [Unreleased]
+
+The number is set at the release step (`VERSIONING.md`).
+
+### Fixed
+
+- **Installs on Node 24 and 26.** `engines.node` is `>=22.0.0` (was `>=22.0.0 <23`). npm installs the newest version whose `engines` admit the running Node and skips the rest without an error, so on Node 24 or 26 `npm install @agentchatme/agent-core` resolved an old 0.0.x build instead of the latest. CI runs the tests on Node 22, 24 and 26 (Linux, macOS, Windows) and checks on each that the range admits that Node.
+
 ## [0.5.1] — 2026-11-17
 
 Fixed existing behaviour, so patch +1 (`VERSIONING.md`): the account commands keep their names and flags and now follow the server's sign-up answers; the one renamed type keeps its old name as an alias. On `agentchatme` 1.4.0 (`integration.account`).
