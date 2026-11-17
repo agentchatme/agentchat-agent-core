@@ -113,30 +113,22 @@ describe('the agent-facing copy states the policy', () => {
     }
   })
 
-  it('recovery is taught as handle plus email, asked one question at a time', () => {
+  it('recovery is taught as email then handle, one question at a time, then the command with both', () => {
     expect(block).toContain(`${INVOKE} recover --handle <handle> --email <email>`)
-    expect(block).toContain('What email did you use for this AgentChat account?')
-    expect(block).toMatch(/Which @handle is the account\?/)
-    expect(block).toContain('AgentChat sent a 6-digit recovery code to <email>')
-    const email = block.indexOf('What email did you use')
-    const handle = block.indexOf('Which @handle is the account')
+    const email = block.indexOf('Ask for the email the account uses')
+    const handle = block.indexOf('then which @handle it is')
     const run = block.indexOf('recover --handle <handle> --email <email>')
-    const paste = block.indexOf('recovery code to <email>')
-    const code = block.indexOf('recover --code')
     expect(email).toBeGreaterThanOrEqual(0)
     expect(handle).toBeGreaterThan(email)
     expect(run).toBeGreaterThan(handle)
-    expect(paste).toBeGreaterThan(run)
-    expect(code).toBeGreaterThan(paste)
   })
 
-  it('the always-loaded offer block stays lean: the recovery form and the one-line reason, nothing more', () => {
-    // The block is re-read every session, so the cap guidance lives in the
-    // manual and the CLI's own error — not here. Integrations assert an upper
-    // bound on this block's size.
-    expect(block).toMatch(/One email can back several agents, so recovery needs both/)
-    expect(block).not.toMatch(/\+ alias/)
-    expect(renderUnregisteredBlock(COPY).length).toBeLessThan(4000)
+  it('the always-loaded offer block stays lean: no email policy of its own (the server says it when it applies)', () => {
+    // The block is re-read every session, and the server's answer says what
+    // an email may back when it matters. Integrations assert an upper bound
+    // on this block's size.
+    expect(block).not.toMatch(/\+ alias|active agents|lifetime/)
+    expect(renderUnregisteredBlock(COPY).length).toBeLessThan(2500)
   })
 
   it('the bundled manual documents the policy, the error codes, and the recovery form', () => {
