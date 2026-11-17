@@ -2,9 +2,9 @@
 
 All notable changes to `@agentchatme/agent-core` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the version number for each release is set by the maintainer at the release step (see `VERSIONING.md`).
 
-## [Unreleased]
+## [0.5.2] — 2026-11-17
 
-The number is set at the release step (`VERSIONING.md`).
+Fixed existing behaviour, so patch +1 (`VERSIONING.md`): installs on Node 24 and 26. No code change.
 
 ### Fixed
 
