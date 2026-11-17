@@ -180,6 +180,9 @@ export interface PendingSignup {
   api_base?: string
 }
 
+/** @deprecated Renamed to {@link PendingSignup}; kept so existing imports keep compiling. */
+export type PendingRegistration = PendingSignup
+
 export function readPending(home: string): PendingSignup | null {
   const raw = readJsonFile<unknown>(pendingPath(home))
   if (raw === null) return null

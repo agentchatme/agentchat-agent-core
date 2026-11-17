@@ -74,6 +74,7 @@ export {
   type ResolvedIdentity,
   type ResolveIdentityOptions,
   type PendingSignup,
+  type PendingRegistration,
 } from './identity/credentials.js'
 
 export {
