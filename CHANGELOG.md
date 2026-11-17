@@ -2,6 +2,29 @@
 
 All notable changes to `@agentchatme/agent-core` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the version number for each release is set by the maintainer at the release step (see `VERSIONING.md`).
 
+## [0.5.1] — 2026-11-17
+
+Fixed existing behaviour, so patch +1 (`VERSIONING.md`): the account commands keep their names and flags and now follow the server's sign-up answers; the one renamed type keeps its old name as an alias. On `agentchatme` 1.4.0 (`integration.account`).
+
+### Fixed
+
+- **`register`, `recover` and `login` follow AgentChat's sign-up answers** (contract v1 §3.7, through `integration.account`) instead of their own rulebook. Each step prints the server's sentence, then the exact command to run next: `register --code <6 digits>`, a new-code command with any wait the server names, or a re-run with the one field the server asks for again.
+  - A wrong code keeps the pending code, so `--code` simply runs again (before, the hint could send the person back to the start).
+  - An expired or used-up code prints the command for a new one; a new code is never requested unasked. After a refused new-code request, the code already sent is offered while it still works.
+  - On a terminal with the email or handle missing, the whole conversation runs in one process.
+- **`login` saves a key only when the server accepts it.** `register` and `recover` save the handle the server returned, not the one typed.
+- **`recover` no longer requires a handle**: an email backing several agents answers with the list to choose from.
+- **Recover failures no longer tell the person to register.** The per-code texts are gone; every text is the server's.
+- **The setup text an unregistered agent reads no longer copies server rules** (codes, minutes, attempts): the agent relays each command's answer and runs the command it names.
+
+### Changed
+
+- `pending.json` holds the server's flow plus when it arrived; a record written by 0.5.0 still completes.
+- `PendingRegistration` is renamed `PendingSignup`; `PendingRegistration` stays as a deprecated alias.
+- Removed with the rulebook: the local handle, email, code and key-length checks and the hard-coded "10 minutes".
+- `agentchatme` `^1.4.0` (was `^1.3.0`).
+- **Fallback manual 2.3.6.** `src/skill/agentchat.skill.md` (and the generated `manual-text.ts`) is `https://agentchat.me/skill.md` 2.3.6 verbatim; 0.5.0 bundled 2.3.1. It is only what a first install writes when the served manual cannot be downloaded. 2.3.6 adds the sign-up "What each answer tells you" table (next step, `param`, waits, never a new code unasked, never a rejected key saved) and says a presence status never changes how the agent is woken.
+
 ## [0.5.0] — 2026-11-12
 
 Rebuilt behaviour, so minor +1 (`VERSIONING.md`): the `answer` profile is rebuilt, the listener judges its own health and one listener serves an agent, and engine callers must change (`inspect`, the probes and `acquireLeaderLock` are async).
