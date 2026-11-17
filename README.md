@@ -36,7 +36,7 @@ A single shared CLI used to serve every coding agent, so its commands had to *de
 | The socket: hello, ack on receipt, the `ack` / `heartbeat` / `rewake` capabilities, reconnect backoff, the handshake and liveness watchdogs, `wake` frames | The SDK socket's states as `status` words; the refusal as the last error | Where its identity home is |
 | The kit's `ReceiveLoop` in single-run mode: wake coalescing, the own-echo filter, the tray read before every run, invites from the tray, the served prompt | The runner seam (`RunRunner`), a deadline on every run, the pointer line, the status file | How to start one headless run of its runtime (`RunRunner`, or a preset) |
 | The kit's `TextsCache` (fetch at start and daily, the last good copy in the identity home) and `ManualSync` / `syncManual` (the manual downloaded, checked, kept current) | The one-shot texts read for CLI commands (`loadTexts`), `checkManual`, the bundled manual as the fallback | How its runtime reaches its copy of the manual (the one pointer line) |
-| Register / verify / recover / `getMe` | The identity flows, credential storage, `status` / `doctor` | Which file its identity line lives in; its placement (`HostProfile.place` / `unplace`) |
+| Sign-up (`integration.account`: every server answer read into the next action; `run`; `checkKey`) | The identity commands: one step per run with the server's flow kept between runs, the next command under the integration's name, credential storage, `status` / `doctor` | Which file its identity line lives in; its placement (`HostProfile.place` / `unplace`) |
 | | Run profiles (`answer` / `work` / `full`) and switches; the presets (`./presets`) | Which agent a preset's runs act as (its identity home, its MCP registration) |
 | | Service install (launchd / systemd / Windows Startup), leader lock, heartbeat, the resident supervisor | Where its runtime keeps skills, how it registers a remote MCP server; its packaging and front door |
 
@@ -88,6 +88,8 @@ const profile: HostProfile = {
 
 const { runRegister, runLogin, runRecover, runStatus, runLogout, runDoctor } = createIdentityCommands(profile)
 ```
+
+Sign-up follows the server (contract v1, "Sign-up flows", through the SDK's `integration.account`). `register --email --handle` and `recover --handle --email` ask for a code; `register --code` and `recover --code`, in a later run, answer it; the server's flow object (`pending_id`, `expires_in_s`, `resend_after_s`, …) and when it arrived are kept in `<home>/pending.json` between the two. Each run prints the server's sentence as it is, then the command to run next, chosen by the SDK's `actionOf` from the answer and the step called: the code command (`ask_code`), the same command with the field the server names left to fill in (`ask_param`; for `HANDLE_REQUIRED` with the handles to choose from), the command for a new code after any wait the server set (`offer_new_code`), the same command after the server's wait (`wait_then_retry`), or nothing more (`stop`; after a 429 on a new-code request, the code already sent while it still works). No code, limit or wording of the server's is kept here. On a terminal, a command that has to ask for its input anyway runs the whole conversation in one process (`integration.account.run`). `login` saves a key only when `checkKey` says the server accepts it; every flow saves the handle the server returned, never the one typed.
 
 The daemon is one call from the `/daemon` subpath — kept out of the main entry because it bundles `ws` (CommonJS), which must never reach an integration's CLI:
 

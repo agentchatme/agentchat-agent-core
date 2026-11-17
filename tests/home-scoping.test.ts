@@ -54,8 +54,14 @@ describe('operations on home A leave home B byte-identical', () => {
     ['writeCredentials', (h) => writeCredentials(h, { api_key: 'ac_' + 'n'.repeat(40), handle: 'new-agent' })],
     ['clearCredentials', (h) => void clearCredentials(h)],
     ['writePending/readPending/clearPending', (h) => {
-      writePending(h, { kind: 'register', pending_id: 'pnd_1', email: 'a@example.com', handle: 'x-agent', created_at: new Date().toISOString() })
-      expect(readPending(h)?.pending_id).toBe('pnd_1')
+      writePending(h, {
+        kind: 'register',
+        flow: { version: 1, flow: 'register', next_step: 'verify', status: 'pending', pending_id: 'pnd_1' },
+        received_at: new Date().toISOString(),
+        email: 'a@example.com',
+        handle: 'x-agent',
+      })
+      expect(readPending(h)?.flow.pending_id).toBe('pnd_1')
       clearPending(h)
     }],
     ['recordOfferDeclined/clearOfferDeclined', (h) => {

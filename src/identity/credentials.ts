@@ -1,6 +1,7 @@
 import * as fs from 'node:fs'
 import * as path from 'node:path'
 import { z } from 'zod'
+import { integration, type SignupFlow } from 'agentchatme'
 import { atomicWriteFile, readJsonFile } from '../util/fsutil.js'
 import { log } from '../util/log.js'
 
@@ -132,31 +133,89 @@ export function clearCredentials(home: string): boolean {
   return removed
 }
 
-// ─── Pending registration (between `register` and `register --code`) ───────
+// ─── A sign-up waiting for its emailed code ─────────────────────────────────
+//
+// Between `register` (or `recover`) and the run with `--code`. The record is
+// the server's own flow object from its last answer (`pending_id`,
+// `expires_in_s`, `resend_after_s`, …, parsed by the SDK's `flowOf`) and when
+// that answer arrived, since its seconds count from then. Beside it: what the
+// start call sent, so the next run can print the command for a new code, and
+// the API base it went to, so the code goes to the same server.
 
 const PendingSchema = z.object({
-  // 'register' creates a new agent; 'recover' re-keys an existing one.
-  // Both share the two-invocation OTP shape, so they share this file — the
-  // kind guard stops `register --code` completing a recovery (and vice
-  // versa) with confusing results.
+  // 'register' creates a new agent; 'recover' re-keys an existing one. The
+  // kind guard stops `register --code` completing a recovery (and vice versa).
+  kind: z.enum(['register', 'recover']),
+  flow: z.record(z.unknown()),
+  received_at: z.string(),
+  email: z.string(),
+  handle: z.string().optional(),
+  display_name: z.string().optional(),
+  description: z.string().optional(),
+  api_base: z.string().url().optional(),
+})
+
+/** The record release 0.5.0 and earlier wrote: the pending id alone. */
+const LegacyPendingSchema = z.object({
   kind: z.enum(['register', 'recover']).default('register'),
   pending_id: z.string().min(1),
-  email: z.string().email(),
-  handle: z.string().min(3).optional(),
+  email: z.string(),
+  handle: z.string().min(1).optional(),
   api_base: z.string().url().optional(),
   created_at: z.string(),
 })
 
-export type PendingRegistration = z.infer<typeof PendingSchema>
+export interface PendingSignup {
+  kind: 'register' | 'recover'
+  /** The server's flow object, as its last answer gave it. */
+  flow: SignupFlow
+  /** When that answer arrived (ISO-8601): `expires_in_s` and `resend_after_s` count from here. */
+  received_at: string
+  /** What the start call sent. */
+  email: string
+  handle?: string
+  display_name?: string
+  description?: string
+  /** The API base the start call went to, when not the default. */
+  api_base?: string
+}
 
-export function readPending(home: string): PendingRegistration | null {
+export function readPending(home: string): PendingSignup | null {
   const raw = readJsonFile<unknown>(pendingPath(home))
   if (raw === null) return null
   const parsed = PendingSchema.safeParse(raw)
-  return parsed.success ? parsed.data : null
+  if (parsed.success) {
+    const { kind, received_at, email, handle, display_name, description, api_base } = parsed.data
+    const flow = integration.account.flowOf(parsed.data.flow)
+    if (flow === null) return null
+    return {
+      kind,
+      flow,
+      received_at,
+      email,
+      ...(handle !== undefined ? { handle } : {}),
+      ...(display_name !== undefined ? { display_name } : {}),
+      ...(description !== undefined ? { description } : {}),
+      ...(api_base !== undefined ? { api_base } : {}),
+    }
+  }
+  // A code requested before an upgrade (`npx -y` fetches the newest release
+  // between two runs) still completes: the old record becomes the flow it
+  // stood for.
+  const legacy = LegacyPendingSchema.safeParse(raw)
+  if (!legacy.success) return null
+  const { kind, pending_id, email, handle, api_base, created_at } = legacy.data
+  return {
+    kind,
+    flow: { version: 1, flow: kind, next_step: kind === 'register' ? 'verify' : 'recover_verify', status: 'pending', pending_id },
+    received_at: created_at,
+    email,
+    ...(handle !== undefined ? { handle } : {}),
+    ...(api_base !== undefined ? { api_base } : {}),
+  }
 }
 
-export function writePending(home: string, pending: PendingRegistration): void {
+export function writePending(home: string, pending: PendingSignup): void {
   atomicWriteFile(pendingPath(home), JSON.stringify(pending, null, 2) + '\n', 0o600)
 }
 

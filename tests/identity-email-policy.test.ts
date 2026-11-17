@@ -2,22 +2,21 @@ import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { AgentChatClient, AgentChatError } from 'agentchatme'
 import { createIdentityCommands } from '../src/identity/commands.js'
 import { renderAnchorBlock } from '../src/anchor/block.js'
 import { readPending } from '../src/identity/credentials.js'
 import type { HostProfile } from '../src/identity/host-profile.js'
-import { mockServedTexts } from './helpers/served-texts.js'
+import { askParam, signupServer, type Answer } from './helpers/signup-server.js'
 import { renderUnregisteredBlock } from '../src/anchor/offer.js'
 import { MANUAL } from '../src/skill/manual.js'
 
 // ─── One email, several agents ──────────────────────────────────────────────
 //
-// The number of agents an email may back is a server-side setting. The error
-// text must therefore quote the limit the server just reported and never a
-// constant of our own — a constant would be wrong the day the setting moves.
-// `EMAIL_TAKEN` is the same refusal from a server that has not been upgraded
-// yet (its limit was one) and must keep getting sensible advice.
+// The number of agents an email may back is a server-side setting, and so is
+// what to say about it: the server's sentence carries the number it applies
+// today, and the engine shows that sentence as it is and adds only the
+// command to re-run with another email. No limit, and no advice of its own,
+// lives here; an older server's codes (`EMAIL_TAKEN`) are read by the SDK.
 
 const homes: string[] = []
 const INVOKE = 'npx -y @agentchatme/example'
@@ -36,7 +35,6 @@ function fixture(): { home: string; commands: ReturnType<typeof createIdentityCo
     renderAnchor: renderAnchorBlock,
     isWired: () => false,
   }
-  mockServedTexts()
   return { home, commands: createIdentityCommands(profile) }
 }
 
@@ -50,14 +48,15 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.restoreAllMocks()
+  vi.unstubAllGlobals()
   if (originalStdinTty) Object.defineProperty(process.stdin, 'isTTY', originalStdinTty)
   if (originalStdoutTty) Object.defineProperty(process.stdout, 'isTTY', originalStdoutTty)
   for (const home of homes.splice(0)) fs.rmSync(home, { recursive: true, force: true })
 })
 
-async function registerAgainst(error: AgentChatError): Promise<{ code: number; err: string; home: string }> {
+async function registerAgainst(answer: Answer): Promise<{ code: number; err: string; home: string }> {
   const { home, commands } = fixture()
-  vi.spyOn(AgentChatClient, 'register').mockRejectedValue(error)
+  signupServer().on('POST /v1/register', answer)
   const lines: string[] = []
   vi.spyOn(console, 'error').mockImplementation((value) => lines.push(String(value)))
   vi.spyOn(console, 'log').mockImplementation(() => {})
@@ -65,72 +64,39 @@ async function registerAgainst(error: AgentChatError): Promise<{ code: number; e
   return { code, err: lines.join('\n'), home }
 }
 
+const RERUN_WITH_EMAIL = `Run \`${INVOKE} register --email <email> --handle new-agent\``
+
 describe('registration against a full email', () => {
-  it('EMAIL_LIMIT_REACHED quotes the limit the server reported', async () => {
+  it('EMAIL_LIMIT_REACHED: the server’s sentence with its number, then re-run with another email', async () => {
     const { code, err, home } = await registerAgainst(
-      new AgentChatError(
-        {
-          code: 'EMAIL_LIMIT_REACHED',
-          message: 'This email already backs 7 active agents. Delete one, or register with a different email.',
-          details: { limit: 7 },
-        },
-        409,
-      ),
+      askParam('register', 409, 'EMAIL_LIMIT_REACHED', 'This email address already has 7 active agents, the most allowed. Use a different email address.', 'email', {
+        limit: 7,
+      }),
     )
     expect(code).toBe(1)
-    expect(err).toContain('Registration failed.')
-    expect(err).toContain('7 active agents')
-    expect(err).toContain(`${INVOKE} login`)
-    expect(err).toContain(`${INVOKE} recover --handle <handle> --email <email>`)
-    expect(err).toMatch(/different email/)
-    expect(err).toMatch(/\+ alias/)
+    expect(err).toBe(`This email address already has 7 active agents, the most allowed. Use a different email address.\n${RERUN_WITH_EMAIL}`)
     expect(readPending(home)).toBeNull()
   })
 
-  it('EMAIL_LIMIT_REACHED without details falls back to the server’s own sentence', async () => {
+  it('EMAIL_EXHAUSTED: the same, with the lifetime number the server reported', async () => {
     const { err } = await registerAgainst(
-      new AgentChatError(
-        { code: 'EMAIL_LIMIT_REACHED', message: 'This email already backs its maximum number of agents.' },
-        409,
-      ),
+      askParam('register', 409, 'EMAIL_EXHAUSTED', 'This email address has been used for 12 accounts, the most allowed. Use a different email address.', 'email', {
+        limit: 12,
+      }),
     )
-    expect(err).toContain('This email already backs its maximum number of agents.')
-    expect(err).not.toMatch(/\b10\b/)
-    expect(err).toContain('recover --handle <handle> --email <email>')
+    expect(err).toBe(`This email address has been used for 12 accounts, the most allowed. Use a different email address.\n${RERUN_WITH_EMAIL}`)
   })
 
-  it('EMAIL_EXHAUSTED quotes the lifetime limit the server reported', async () => {
+  it('no number of its own: the output carries only what the server said', async () => {
     const { err } = await registerAgainst(
-      new AgentChatError(
-        {
-          code: 'EMAIL_EXHAUSTED',
-          message: 'This email has reached the maximum of 12 account registrations.',
-          details: { limit: 12 },
-        },
-        409,
-      ),
+      askParam('register', 409, 'EMAIL_LIMIT_REACHED', 'This email address already backs the most agents allowed.', 'email'),
     )
-    expect(err).toContain('lifetime maximum of 12 account registrations')
-    expect(err).toMatch(/different email/)
-    expect(err).not.toMatch(/\b30\b/)
+    expect(err).not.toMatch(/\d/)
   })
 
-  it('EMAIL_EXHAUSTED without details falls back to the server’s own sentence', async () => {
-    const { err } = await registerAgainst(
-      new AgentChatError({ code: 'EMAIL_EXHAUSTED', message: 'No more registrations for this email.' }, 409),
-    )
-    expect(err).toContain('No more registrations for this email.')
-    expect(err).not.toMatch(/\b3\b registrations/)
-  })
-
-  it('legacy EMAIL_TAKEN from an older server gets the same advice as EMAIL_LIMIT_REACHED', async () => {
-    const { err } = await registerAgainst(
-      new AgentChatError({ code: 'EMAIL_TAKEN', message: 'This email already has an active agent.' }, 409),
-    )
-    expect(err).toContain('This email already has an active agent.')
-    expect(err).toContain(`${INVOKE} login`)
-    expect(err).toContain(`${INVOKE} recover --handle <handle> --email <email>`)
-    expect(err).toMatch(/different email/)
+  it('an older server’s EMAIL_TAKEN (no flow object) reads the same way: re-run with another email', async () => {
+    const { err } = await registerAgainst({ status: 409, body: { code: 'EMAIL_TAKEN', message: 'This email already has an active agent.' } })
+    expect(err).toBe(`This email already has an active agent.\n${RERUN_WITH_EMAIL}`)
   })
 })
 
