@@ -15,22 +15,35 @@ describe('the unregistered offer block', () => {
     expect(block).toContain('this Example agent')
   })
 
-  it('walks the agent through email → handle → code, one question per turn', () => {
-    const email = block.indexOf('I need an email for verification')
-    const handle = block.indexOf('Now we need to choose an AgentChat username')
+  it('asks for the email, then the handle, then registers, one question per turn', () => {
+    const email = block.indexOf('ask for their email')
+    const handle = block.indexOf('then for the @handle they want')
     const register = block.indexOf(`${COPY.invoke} register --email <email> --handle <handle>`)
-    const code = block.indexOf('AgentChat sent a 6-digit code')
     expect(email).toBeGreaterThan(-1)
     expect(handle).toBeGreaterThan(email)
     expect(register).toBeGreaterThan(handle)
-    expect(code).toBeGreaterThan(register)
-    expect(block).toContain('Ask only one question per turn')
+    expect(block).toContain('ask the user one question per turn')
+  })
+
+  it('has the agent relay each command’s answer and run the command it names', () => {
+    expect(block).toContain('Each command prints AgentChat’s answer, then the command to run next')
+    expect(block).toContain('Relay the answer to the user as it is')
+    expect(block).toContain('such as the code AgentChat emailed them')
+    expect(block).toContain('if it says to wait, wait')
+    expect(block).toContain('exactly as the command printed them')
+  })
+
+  it('carries none of the server’s rules or wording: no handle rules, no code length, no scripted failure lines', () => {
+    expect(block).not.toMatch(/3[–-]30|lowercase letters|trailing hyphens/)
+    expect(block).not.toMatch(/6-digit|digits/)
+    expect(block).not.toMatch(/If (the code|login|their handle)[^.]*fails|didn’t work|is taken or invalid/i)
+    expect(block).not.toMatch(/register --code|recover --code/) // the commands print these themselves
   })
 
   it('covers login and recovery for an existing account, with the handle AND the email', () => {
     expect(block).toContain(`${COPY.invoke} login --api-key <ac_…>`)
     expect(block).toContain(`${COPY.invoke} recover --handle <handle> --email <email>`)
-    expect(block).toContain('One email can back several agents')
+    expect(block).toContain('recovery replaces the old API key')
   })
 
   it('tells the agent how to stop being asked', () => {

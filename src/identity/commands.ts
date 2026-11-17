@@ -1,5 +1,5 @@
 import * as readline from 'node:readline'
-import { AgentChatClient, type Texts } from 'agentchatme'
+import { AgentChatClient, integration as kit, type SignupFlow, type Texts } from 'agentchatme'
 import {
   DEFAULT_API_BASE,
   credentialsPath,
@@ -10,6 +10,7 @@ import {
   readPending,
   writePending,
   clearPending,
+  type PendingSignup,
 } from './credentials.js'
 import { clearOfferDeclined } from './state.js'
 import { writeAnchor, removeAnchorAt, readAnchorHandleAt, hasAnchorAt, anchorIsCurrentAt } from '../anchor/block.js'
@@ -24,14 +25,23 @@ import { REPEATED_FAILED_CYCLES, failedCyclesInARow, formatIntegrationStatus, re
 //
 // Dual-mode by design: a human runs these in a terminal and gets prompts; a
 // coding agent runs them with flags and gets deterministic, parseable output.
-// The OTP round-trip is split across two invocations with the pending state
-// persisted, so the agent can ask its user for the emailed code between them.
 //
-// These flows are a contract with the AgentChat server — the pending-state
-// machine, the error vocabulary, what a credential file holds — so they are
-// shared rather than reimplemented per host. They lived in each integration
-// once, and within a week the two copies were 94% identical and had already
-// drifted.
+// Sign-up (register, recover) follows the server's answer. Every answer
+// carries a flow object and a sentence written to be shown to a person
+// (contract v1, "Sign-up flows"); the SDK's `integration.account` reads it
+// into the next action. These commands show the sentence as it is and add
+// the one thing the server cannot know: the command to run next, under this
+// integration's name. No code, limit, rule or wording of the server's is
+// kept here. With flags, a sign-up is one step per run: the code is
+// requested in one run and entered in the next, with the server's flow kept
+// in `pending.json` between them, so the agent can ask its user for the
+// emailed code in between. On a terminal, a command that has to ask for its
+// input anyway asks to the end (`integration.account.run`), so the person
+// types the code where they are.
+//
+// These commands are shared rather than reimplemented per host. They lived
+// in each integration once, and within a week the two copies were 94%
+// identical and had already drifted.
 //
 // Every function acts on `profile.home()` — the caller's own agent. There is no
 // host argument to get wrong, and no branch that could reach another agent's
@@ -43,14 +53,6 @@ import { REPEATED_FAILED_CYCLES, failedCyclesInARow, formatIntegrationStatus, re
 // the server cannot be reached). No copy of it lives here. The same fetch
 // says which manual is current; `place` and `doctor --fix` bring the skill
 // file to it.
-
-// Canonical handle rule, mirrored from the server so obviously-bad input fails
-// locally with a helpful message instead of a round-trip.
-const HANDLE_PATTERN = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/
-
-function validHandle(handle: string): boolean {
-  return handle.length >= 3 && handle.length <= 30 && HANDLE_PATTERN.test(handle)
-}
 
 /** No served texts in hand: offline and nothing cached. */
 const NO_TEXTS: StatusContext = Object.freeze({ identityLine: null, identityLineTemplate: null, manual: null })
@@ -65,20 +67,28 @@ function contextOf(texts: Texts): StatusContext {
 }
 
 /**
- * Ask one question on the TTY.
+ * Ask one question on the TTY. Null when the input ends instead (Ctrl-D, or
+ * Ctrl-C at the prompt).
  *
  * Deliberately the classic `node:readline`, not `node:readline/promises`:
  * esbuild strips the `node:` prefix from builtin imports when it bundles this
  * package, and a bare `readline/promises` is not on its builtin list.
  */
-async function prompt(question: string): Promise<string> {
+async function prompt(question: string): Promise<string | null> {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout })
   try {
-    const answer = await new Promise<string>((resolve) => rl.question(question, resolve))
-    return answer.trim()
+    return await new Promise<string | null>((resolve) => {
+      rl.once('close', () => resolve(null))
+      rl.question(question, (answer) => resolve(answer.trim()))
+    })
   } finally {
     rl.close()
   }
+}
+
+/** Both streams are a terminal: a person is there to answer questions. */
+function interactive(): boolean {
+  return process.stdin.isTTY === true && process.stdout.isTTY === true
 }
 
 /**
@@ -91,22 +101,11 @@ async function readAllStdin(): Promise<string> {
   return Buffer.concat(chunks).toString('utf-8').trim()
 }
 
-interface ApiErrorLike {
-  code?: string
-  message?: string
-  details?: Record<string, unknown>
-}
-
-/** The server's `details.limit` on an email-policy rejection, when it sent one. */
-function limitOf(e: ApiErrorLike): number | null {
-  const limit = e.details?.['limit']
-  return typeof limit === 'number' && Number.isFinite(limit) ? limit : null
-}
-
-/** The server's `details.handles` on HANDLE_REQUIRED, when it sent them. */
-function handlesOf(e: ApiErrorLike): string[] {
-  const handles = e.details?.['handles']
-  return Array.isArray(handles) ? handles.filter((h): h is string => typeof h === 'string') : []
+/** An SDK error in one line: its code and the server's message. */
+function describeApiError(err: unknown): string {
+  const e = (err ?? {}) as { code?: unknown; message?: unknown }
+  const message = typeof e.message === 'string' ? e.message : String(err)
+  return typeof e.code === 'string' ? `${e.code}: ${message}` : message
 }
 
 /** The HTTP status an SDK error carries (`AgentChatError.status`), or null for a transport failure. */
@@ -119,48 +118,87 @@ function recoverUsage(invocation: string): string {
   return `${invocation} recover --handle <handle> --email <email>`
 }
 
-function describeApiError(err: unknown, invocation: string): string {
-  const e = (err ?? {}) as ApiErrorLike
-  const code = typeof e.code === 'string' ? e.code : undefined
-  const message = typeof e.message === 'string' ? e.message : String(err)
-  switch (code) {
-    case 'HANDLE_TAKEN':
-      return 'That handle is already taken — pick another and re-run.'
-    // An email backs a bounded number of live agents, and the bound is a
-    // server-side setting — so the number is always the one the server just
-    // reported, never a constant here. `EMAIL_TAKEN` is what a not-yet-upgraded
-    // server says in the same situation (its bound was one).
-    case 'EMAIL_LIMIT_REACHED':
-    case 'EMAIL_TAKEN': {
-      const limit = limitOf(e)
-      const lead =
-        limit !== null
-          ? `This email already backs ${limit} active agent${limit === 1 ? '' : 's'} — its maximum.`
-          : message
-      return `${lead} Delete one, sign in to one with \`${invocation} login\`, re-key one with \`${recoverUsage(invocation)}\`, or register with a different email (a + alias such as you+agent@example.com counts as a different email).`
-    }
-    case 'EMAIL_EXHAUSTED': {
-      const limit = limitOf(e)
-      const lead =
-        limit !== null
-          ? `This email has reached its lifetime maximum of ${limit} account registrations.`
-          : message
-      return `${lead} Register with a different email (a + alias such as you+agent@example.com counts as a different email).`
-    }
-    case 'HANDLE_REQUIRED': {
-      const handles = handlesOf(e)
-      const listed = handles.length > 0 ? ` Agents on this email: ${handles.map((h) => `@${h}`).join(', ')}.` : ''
-      return `This email backs more than one agent, so the server needs to know which one to re-key.${listed} Run recovery again with the handle: ${recoverUsage(invocation)}`
-    }
-    case 'INVALID_HANDLE':
-      return 'The server rejected the handle (invalid or reserved word).'
-    case 'INVALID_CODE':
-      return `Wrong or expired code. Re-check the 6 digits; after too many misses you must restart with \`${invocation} register\`.`
-    case 'EXPIRED':
-      return `This registration expired (codes last 10 minutes). Start over with \`${invocation} register\`.`
-    default:
-      return code ? `${code}: ${message}` : message
+// ─── Sign-up: what the commands keep between runs, and what they print ─────
+
+type AccountKind = kit.AccountKind
+type StepResult = kit.AccountStepResult
+
+/** What a start call sends: what was typed, trimmed (the server judges it). */
+interface SignupInput {
+  email: string
+  handle?: string
+  display_name?: string
+  description?: string
+}
+
+function emailInput(raw: string | undefined): string | undefined {
+  const email = raw?.trim().toLowerCase()
+  return email ? email : undefined
+}
+
+/** A handle as typed, with a leading `@` dropped. */
+function handleInput(raw: string | undefined): string | undefined {
+  const handle = raw?.trim().replace(/^@/, '').toLowerCase()
+  return handle ? handle : undefined
+}
+
+/** The step that answers a pending code of each kind (`next_step` while the code is pending). */
+const VERIFY_STEP: Readonly<Record<AccountKind, string>> = { register: 'verify', recover: 'recover_verify' }
+
+/** A flag value as a shell takes it: bare when plain, else in double quotes. */
+function shellValue(value: string): string {
+  return /^[A-Za-z0-9@%+=:,./_-]+$/.test(value) ? value : JSON.stringify(value)
+}
+
+function receivedAtMs(pending: PendingSignup): number | null {
+  const at = Date.parse(pending.received_at)
+  return Number.isFinite(at) ? at : null
+}
+
+/**
+ * Whether the code a pending record holds may still work: until
+ * `expires_in_s` from its answer, else until `expires_at`. Unknown counts as
+ * yes; the server says so when the code is gone.
+ */
+function codeMayWork(pending: PendingSignup, now = Date.now()): boolean {
+  const received = receivedAtMs(pending)
+  if (pending.flow.expires_in_s !== undefined && received !== null) return received + pending.flow.expires_in_s * 1000 > now
+  if (pending.flow.expires_at !== undefined) {
+    const at = Date.parse(pending.flow.expires_at)
+    if (Number.isFinite(at)) return at > now
   }
+  return true
+}
+
+/** Seconds left of the pending answer's `resend_after_s`: until a new code may be sent to that email (0: now). */
+function resendLeftS(pending: PendingSignup | null, now = Date.now()): number {
+  if (pending === null || pending.flow.resend_after_s === undefined) return 0
+  const received = receivedAtMs(pending)
+  if (received === null) return 0
+  return Math.max(0, Math.ceil((pending.flow.resend_after_s * 1000 - (now - received)) / 1000))
+}
+
+/** "Run `cmd`", after a wait when there is one. */
+function runLine(command: string, waitS = 0): string {
+  return waitS > 0 ? `Wait ${waitS} s, then run \`${command}\`` : `Run \`${command}\``
+}
+
+/**
+ * One question of `integration.account.run`, asked on the terminal. Its
+ * labels are the SDK's; the choices around them ("new", y/N) are ours.
+ */
+async function askOnTerminal(question: kit.AccountQuestion): Promise<kit.AccountAnswer> {
+  if (question.field === 'new_code') {
+    const answer = await prompt('Send a new code? [y/N] ')
+    return answer !== null && /^y(es)?$/i.test(answer) ? { answer: 'new_code' } : { answer: 'cancel' }
+  }
+  const choices =
+    question.handles !== undefined && question.handles.length > 0 ? ` (${question.handles.map((h) => `@${h}`).join(', ')})` : ''
+  const hint = question.field === 'code' ? ' (or "new" for a new code)' : ''
+  const answer = await prompt(`${question.label ?? question.field}${choices}${hint}: `)
+  if (answer === null) return { answer: 'cancel' }
+  if (question.field === 'code') return answer.toLowerCase() === 'new' ? { answer: 'new_code' } : { answer: 'value', value: answer }
+  return { answer: 'value', value: (question.field === 'handle' ? handleInput(answer) : emailInput(answer)) ?? '' }
 }
 
 const NEXT_HINT =
@@ -171,6 +209,7 @@ export interface RegisterOpts {
   handle?: string
   displayName?: string
   description?: string
+  /** The code from the verification email — the completion leg. */
   code?: string
   apiBase?: string
 }
@@ -179,12 +218,13 @@ export interface RecoverOpts {
   /** The email the agent registered with. */
   email?: string
   /**
-   * Which agent on that email to re-key. An email can back several agents,
-   * so this is required by the server; when omitted it defaults to this
-   * agent's stored handle, then to a prompt on a TTY.
+   * Which agent on that email to re-key. When omitted it defaults to this
+   * agent's stored handle, then to a prompt on a TTY; without one the
+   * server is asked by email alone, and names the handles to choose from
+   * when the email backs several agents.
    */
   handle?: string
-  /** The 6-digit code from the recovery email — the completion leg. */
+  /** The code from the recovery email — the completion leg. */
   code?: string
   apiBase?: string
 }
@@ -205,20 +245,19 @@ export interface IdentityCommands {
 /** Build the identity command set for one coding agent. */
 export function createIdentityCommands(profile: HostProfile): IdentityCommands {
   const invocation = (): string => profile.invocation()
-  const apiErr = (err: unknown): string => describeApiError(err, invocation())
   const LABEL = profile.label
   const clientIdentity = clientIdentityOf(profile.client)
 
   /**
-   * `quick`: one attempt, 5 s — for `status`, `doctor` and the texts fetch,
-   * which must answer in seconds on a black-holed network (the SDK's default
-   * ramp is 4 attempts of up to 15 s). `patient`: the SDK's defaults, for a
-   * sign-in the user is waiting on.
+   * One attempt, 5 s — for `status`, `doctor` and the texts fetch, which must
+   * answer in seconds on a black-holed network (the SDK's default ramp is 4
+   * attempts of up to 15 s).
    */
-  const apiClient = (apiKey: string, apiBase: string, budget: 'quick' | 'patient' = 'quick'): AgentChatClient =>
-    budget === 'quick'
-      ? new AgentChatClient({ apiKey, baseUrl: apiBase, clientIdentity, timeoutMs: 5_000, retry: { maxRetries: 0, baseDelayMs: 0, maxDelayMs: 0 } })
-      : new AgentChatClient({ apiKey, baseUrl: apiBase, clientIdentity, timeoutMs: 15_000 })
+  const apiClient = (apiKey: string, apiBase: string): AgentChatClient =>
+    new AgentChatClient({ apiKey, baseUrl: apiBase, clientIdentity, timeoutMs: 5_000, retry: { maxRetries: 0, baseDelayMs: 0, maxDelayMs: 0 } })
+
+  /** How the sign-up calls reach the server (never retried: a second call could send a second code). */
+  const accountOptions = (apiBase: string): kit.AccountCallOptions => ({ clientIdentity, apiBase, timeoutMs: 15_000 })
 
   /**
    * The served texts for this agent: fetched now (one attempt, 5 s), else the
@@ -282,143 +321,275 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
     }
   }
 
+  // ─── Sign-up ──────────────────────────────────────────────────────────────
+
+  /** The command that starts `kind` again, sending `input`; `blank` leaves that field for the person to fill in. */
+  function startCommand(kind: AccountKind, input: SignupInput, blank?: 'email' | 'handle'): string {
+    const email = blank === 'email' ? '<email>' : shellValue(input.email)
+    const handle = blank === 'handle' ? '<handle>' : input.handle !== undefined ? shellValue(input.handle) : null
+    if (kind === 'recover') return `${invocation()} recover${handle !== null ? ` --handle ${handle}` : ''} --email ${email}`
+    return [
+      `${invocation()} register --email ${email} --handle ${handle ?? '<handle>'}`,
+      ...(input.display_name !== undefined ? [`--display-name ${shellValue(input.display_name)}`] : []),
+      ...(input.description !== undefined ? [`--description ${shellValue(input.description)}`] : []),
+    ].join(' ')
+  }
+
+  /** The command that answers a pending code: with `code`, or a placeholder of the server's `code_length`. */
+  function codeCommand(kind: AccountKind, flow: SignupFlow, code?: string): string {
+    const value = code !== undefined ? shellValue(code) : flow.code_length !== undefined ? `<${flow.code_length} digits>` : '<code>'
+    return `${invocation()} ${kind} --code ${value}`
+  }
+
+  /**
+   * What to run next, from the action the SDK read from the server's answer
+   * (`actionOf` with the step called). The server's sentence says what
+   * happened; this is the one thing it cannot say: the command, under this
+   * integration's name. `held` is the pending code this agent holds for the
+   * same email, if any.
+   */
+  function nextSteps(
+    kind: AccountKind,
+    result: StepResult,
+    called: 'start' | 'verify',
+    input: SignupInput,
+    code: string | undefined,
+    held: PendingSignup | null,
+  ): string[] {
+    // A new code is sent only once the server's wait and the email's resend
+    // window are over: the window as this answer states it, else what is
+    // left of the one the held code's answer stated.
+    const beforeNewCode = Math.max(result.flow.retry_after_s ?? 0, result.flow.resend_after_s ?? resendLeftS(held))
+    // A start turned away (429) while the code already sent still works: go
+    // back to that code (contract v1, "Sign-up flows").
+    const heldCode =
+      called === 'start' && result.httpStatus === 429 && held !== null && held.handle === input.handle && codeMayWork(held)
+        ? [`Or enter the code already sent: \`${codeCommand(kind, held.flow)}\``]
+        : []
+    switch (result.action) {
+      case 'done':
+        return []
+      case 'ask_code':
+        return [runLine(codeCommand(kind, result.flow))]
+      case 'ask_param': {
+        const param = result.flow.param
+        const field = param === 'email' ? 'email' : param === 'handle' ? 'handle' : null
+        if (field === null) return []
+        const handles = field === 'handle' ? (result.handles ?? []) : []
+        const choices = handles.length > 0 ? `, with one of: ${handles.map((h) => `@${h}`).join(', ')}` : ''
+        return [`${runLine(startCommand(kind, input, field), beforeNewCode)}${choices}`]
+      }
+      case 'offer_new_code':
+        return [`For a new code: ${runLine(startCommand(kind, input), beforeNewCode)}`]
+      case 'wait_then_retry': {
+        const again = called === 'verify' ? codeCommand(kind, result.flow, code) : startCommand(kind, input)
+        return [runLine(again, result.flow.retry_after_s ?? 0), ...heldCode]
+      }
+      case 'stop':
+        return heldCode
+    }
+  }
+
+  /**
+   * The server's sentence (its code when it sent none), then the next
+   * command: on stdout when the step did what it was asked, else on stderr.
+   */
+  function report(result: StepResult, lines: string[], ok: boolean): number {
+    const said = result.message.length > 0 ? result.message : (result.code ?? `HTTP ${result.httpStatus}`)
+    const text = [said, ...lines].join('\n')
+    if (ok) console.log(text)
+    else console.error(text)
+    return ok ? 0 : 1
+  }
+
+  /**
+   * The key is the server's: save it with the handle the server returned
+   * (never the one typed), place the integration for it, say where it is.
+   * `message` is the server's sentence, or null when it has been shown.
+   */
+  async function finishSignup(kind: AccountKind, apiKey: string, handle: string, apiBase: string, message: string | null): Promise<number> {
+    const home = profile.home()
+    writeCredentials(home, {
+      api_key: apiKey,
+      handle,
+      ...(apiBase !== DEFAULT_API_BASE ? { api_base: apiBase } : {}),
+      created_at: new Date().toISOString(),
+    })
+    clearPending(home)
+    // They have an identity now, so a previous "not now" is spent. If they
+    // ever sign out, the setup offer should be free to appear again.
+    clearOfferDeclined(home)
+    const placed = await placeIdentity(handle, apiKey, apiBase)
+    const lines =
+      kind === 'register'
+        ? [
+            `API key for @${handle} stored at ${credentialsPath(home)} (never commit this file).`,
+            ...placed,
+            '',
+            `This handle belongs to your ${LABEL} agent. Another coding agent on this machine is a separate peer with its own handle — you can DM each other.`,
+            `Other agents can DM you at @${handle}. Check \`${invocation()} status\` any time.`,
+            NEXT_HINT,
+          ]
+        : [`New API key for @${handle} stored at ${credentialsPath(home)} (never commit this file).`, ...placed, NEXT_HINT]
+    console.log([...(message !== null && message.length > 0 ? [message] : []), ...lines].join('\n'))
+    return 0
+  }
+
+  /** Ask for a code: one start call. The flow is kept only when the server sent a code. */
+  async function startSignup(kind: AccountKind, input: SignupInput, apiBase: string): Promise<number> {
+    const home = profile.home()
+    const before = readPending(home)
+    const held = before !== null && before.kind === kind && before.email === input.email ? before : null
+    let result: StepResult
+    try {
+      result =
+        kind === 'register'
+          ? await kit.account.start(
+              'register',
+              {
+                email: input.email,
+                handle: input.handle ?? '',
+                ...(input.display_name !== undefined ? { display_name: input.display_name } : {}),
+                ...(input.description !== undefined ? { description: input.description } : {}),
+              },
+              accountOptions(apiBase),
+            )
+          : await kit.account.start(
+              'recover',
+              { email: input.email, ...(input.handle !== undefined ? { handle: input.handle } : {}) },
+              accountOptions(apiBase),
+            )
+    } catch (err) {
+      console.error(`Could not reach AgentChat: ${errorText(err)}\n${runLine(startCommand(kind, input))} again.`)
+      return 1
+    }
+    if (result.action === 'ask_code') {
+      writePending(home, {
+        kind,
+        flow: result.flow,
+        received_at: new Date().toISOString(),
+        ...input,
+        ...(apiBase !== DEFAULT_API_BASE ? { api_base: apiBase } : {}),
+      })
+    }
+    return report(result, nextSteps(kind, result, 'start', input, undefined, held), result.action === 'ask_code')
+  }
+
+  /** Answer the pending code: one verify call, then keep, refresh or drop the flow as the answer says. */
+  async function submitPendingCode(kind: AccountKind, rawCode: string, apiBase: string): Promise<number> {
+    const home = profile.home()
+    const code = rawCode.trim()
+    const pending = readPending(home)
+    const noun = kind === 'register' ? 'registration' : 'recovery'
+    if (pending === null) {
+      console.error(
+        `No ${noun} in progress. Start with: ${kind === 'register' ? `${invocation()} register --email <email> --handle <handle>` : recoverUsage(invocation())}`,
+      )
+      return 1
+    }
+    if (pending.kind !== kind) {
+      console.error(
+        pending.kind === 'recover'
+          ? `The pending code belongs to an account RECOVERY — complete it with: ${invocation()} recover --code ${shellValue(code)}`
+          : `The pending code belongs to a REGISTRATION — complete it with: ${invocation()} register --code ${shellValue(code)}`,
+      )
+      return 1
+    }
+    if (pending.flow.next_step !== VERIFY_STEP[kind] || pending.flow.pending_id === undefined) {
+      clearPending(home)
+      console.error(`The saved ${noun} is not waiting for a code. Start again with: ${startCommand(kind, pending)}`)
+      return 1
+    }
+    const base = pending.api_base ?? apiBase
+    let result: StepResult
+    try {
+      result = await kit.account.submitCode(pending.flow, code, accountOptions(base))
+    } catch (err) {
+      console.error(`Could not reach AgentChat: ${errorText(err)}\n${runLine(codeCommand(kind, pending.flow, code))} again.`)
+      return 1
+    }
+    switch (result.action) {
+      case 'done':
+        return finishSignup(kind, result.apiKey!, result.handle!, base, result.message)
+      case 'ask_code':
+        // A wrong code, or one in the wrong form: the same pending id, asked again.
+        writePending(home, { ...pending, flow: result.flow, received_at: new Date().toISOString() })
+        break
+      case 'offer_new_code':
+      case 'ask_param':
+        // The code is gone (expired, too many wrong tries, used up): only a new start can go on.
+        clearPending(home)
+        break
+      default:
+        // wait_then_retry: the code was not checked, and stays. stop: it stays
+        // too, until an answer says it is gone (a 5xx after the code may have
+        // created the account: never steer to a second start).
+        break
+    }
+    return report(result, nextSteps(kind, result, 'verify', pending, code, pending), false)
+  }
+
+  /**
+   * The whole sign-up on a terminal, for a person who left out what the
+   * command needs: `integration.account.run` asks for each field the server
+   * names, the code, and whether to send a new one; shows every server
+   * sentence; and sits out the server's short waits. Nothing is kept between
+   * runs: an interrupted conversation starts again.
+   */
+  async function converse(kind: AccountKind, input: Partial<SignupInput>, apiBase: string): Promise<number> {
+    let outcome: kit.AccountRunResult
+    try {
+      outcome = await kit.account.run({
+        kind,
+        input,
+        ...accountOptions(apiBase),
+        show: (message) => console.log(message),
+        ask: askOnTerminal,
+      })
+    } catch (err) {
+      console.error(`Could not reach AgentChat: ${errorText(err)}`)
+      return 1
+    }
+    if (outcome.outcome === 'done') return finishSignup(kind, outcome.apiKey, outcome.handle, apiBase, null)
+    if (outcome.outcome === 'cancelled') console.error('Cancelled.')
+    return 1
+  }
+
   async function runRegister(opts: RegisterOpts): Promise<number> {
     const home = profile.home()
     const apiBase = opts.apiBase ?? process.env['AGENTCHAT_API_BASE'] ?? DEFAULT_API_BASE
 
-    // Completion leg
-    if (opts.code !== undefined) {
-      const code = opts.code.trim()
-      if (!/^\d{6}$/.test(code)) {
-        console.error('The code is the 6-digit number from the verification email.')
-        return 1
-      }
-      const pending = readPending(home)
-      if (pending === null) {
-        console.error(
-          `No registration in progress. Start with: ${invocation()} register --email <email> --handle <handle>`,
-        )
-        return 1
-      }
-      if (pending.kind === 'recover') {
-        console.error(
-          `The pending code belongs to an account RECOVERY — complete it with: ${invocation()} recover --code ${code}`,
-        )
-        return 1
-      }
-      const pendingHandle = pending.handle
-      if (pendingHandle === undefined) {
-        clearPending(home)
-        console.error(`Pending registration was corrupt — start again with: ${invocation()} register`)
-        return 1
-      }
-      try {
-        const result = await AgentChatClient.verify(pending.pending_id, code, {
-          baseUrl: pending.api_base ?? apiBase,
-          clientIdentity,
-        })
-        writeCredentials(home, {
-          api_key: result.apiKey,
-          handle: pendingHandle,
-          ...(pending.api_base ? { api_base: pending.api_base } : {}),
-          created_at: new Date().toISOString(),
-        })
-        clearPending(home)
-        // They have an identity now, so a previous "not now" is spent. If they
-        // ever sign out, the setup offer should be free to appear again.
-        clearOfferDeclined(home)
-        console.log(
-          [
-            `Registered: @${pendingHandle} for ${LABEL}.`,
-            `API key stored at ${credentialsPath(home)} (never commit this file).`,
-            ...(await placeIdentity(pendingHandle, result.apiKey, pending.api_base ?? apiBase)),
-            '',
-            `This handle belongs to your ${LABEL} agent. Another coding agent on this machine is a separate peer with its own handle — you can DM each other.`,
-            `Other agents can DM you at @${pendingHandle}. Check \`${invocation()} status\` any time.`,
-            NEXT_HINT,
-          ].join('\n'),
-        )
-        return 0
-      } catch (err) {
-        console.error(`Verification failed. ${apiErr(err)}`)
-        return 1
-      }
-    }
+    if (opts.code !== undefined) return submitPendingCode('register', opts.code, apiBase)
 
-    // Initiation leg. The gate is about THIS agent only — another coding agent
-    // having an identity is irrelevant and must never block this one.
+    // The gate is about THIS agent only — another coding agent having an
+    // identity is irrelevant and must never block this one.
     if (resolveIdentity(home) !== null) {
       console.error(
         `${LABEL} already has an AgentChat identity (see \`${invocation()} status\`). Run \`${invocation()} logout\` first to replace it.`,
       )
       return 1
     }
-    const inFlight = readPending(home)
-    if (inFlight?.kind === 'recover') {
+    if (readPending(home)?.kind === 'recover') {
       console.error(
         `An account recovery is in progress — finish it with \`${invocation()} recover --code <code>\`, or discard it with \`${invocation()} logout\` before registering.`,
       )
       return 1
     }
 
-    let email = opts.email?.trim().toLowerCase()
-    let handle = opts.handle?.trim().toLowerCase()
-    const interactive = process.stdin.isTTY === true && process.stdout.isTTY === true
-
-    if (!email) {
-      if (!interactive) {
-        console.error(`Missing --email. Usage: ${invocation()} register --email <email> --handle <handle>`)
-        return 1
+    const email = emailInput(opts.email)
+    const handle = handleInput(opts.handle)
+    const extras = {
+      ...(opts.displayName ? { display_name: opts.displayName } : {}),
+      ...(opts.description ? { description: opts.description } : {}),
+    }
+    if (email === undefined || handle === undefined) {
+      if (interactive()) {
+        return converse('register', { ...(email !== undefined ? { email } : {}), ...(handle !== undefined ? { handle } : {}), ...extras }, apiBase)
       }
-      email = (await prompt('Email for verification codes: ')).toLowerCase()
-    }
-    if (!handle) {
-      if (!interactive) {
-        console.error(`Missing --handle. Usage: ${invocation()} register --email <email> --handle <handle>`)
-        return 1
-      }
-      handle = (await prompt('Desired handle (3–30 chars, e.g. sanim-dev): ')).toLowerCase()
-    }
-
-    if (!email.includes('@')) {
-      console.error(`"${email}" does not look like an email address.`)
+      console.error(`Missing --${email === undefined ? 'email' : 'handle'}. Usage: ${invocation()} register --email <email> --handle <handle>`)
       return 1
     }
-    if (!validHandle(handle)) {
-      console.error(
-        `Handle "@${handle}" is invalid. Rules: 3–30 characters, lowercase letters/digits/hyphens, must start with a letter, no trailing or doubled hyphens.`,
-      )
-      return 1
-    }
-
-    try {
-      const result = await AgentChatClient.register({
-        email,
-        handle,
-        ...(opts.displayName ? { display_name: opts.displayName } : {}),
-        ...(opts.description ? { description: opts.description } : {}),
-        baseUrl: apiBase,
-        clientIdentity,
-      })
-      writePending(home, {
-        kind: 'register',
-        pending_id: result.pending_id,
-        email,
-        handle,
-        ...(apiBase !== DEFAULT_API_BASE ? { api_base: apiBase } : {}),
-        created_at: new Date().toISOString(),
-      })
-      console.log(
-        [
-          `Verification code sent to ${email} (valid ~10 minutes).`,
-          `Complete with: ${invocation()} register --code <6-digit-code>`,
-        ].join('\n'),
-      )
-      return 0
-    } catch (err) {
-      console.error(`Registration failed. ${apiErr(err)}`)
-      return 1
-    }
+    return startSignup('register', { email, handle, ...extras }, apiBase)
   }
 
   async function runLogin(opts: { apiKey?: string; apiBase?: string }): Promise<number> {
@@ -442,158 +613,72 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
         )
         return 1
       } else {
-        apiKey = await prompt('AgentChat API key (ac_…): ')
+        apiKey = (await prompt('AgentChat API key (ac_…): ')) ?? ''
       }
     }
-    if (apiKey.length < 20) {
-      console.error('That does not look like an AgentChat API key (too short).')
+    if (!apiKey) {
+      console.error('No API key given; nothing was saved.')
       return 1
     }
 
+    // The server judges the key; a key it does not accept is never saved.
+    let check: kit.CheckKeyResult
     try {
-      const client = apiClient(apiKey, apiBase, 'patient')
-      const me = await client.getMe()
-      writeCredentials(home, {
-        api_key: apiKey,
-        handle: me.handle,
-        ...(apiBase !== DEFAULT_API_BASE ? { api_base: apiBase } : {}),
-        created_at: new Date().toISOString(),
-      })
-      clearOfferDeclined(home)
-      console.log(
-        [
-          `Signed in as @${me.handle} for ${LABEL}.`,
-          `API key stored at ${credentialsPath(home)} (never commit this file).`,
-          ...(await placeIdentity(me.handle, apiKey, apiBase)),
-          NEXT_HINT,
-        ].join('\n'),
-      )
-      return 0
+      check = await kit.account.checkKey(apiKey, accountOptions(apiBase))
     } catch (err) {
-      console.error(`Login failed. ${apiErr(err)}`)
+      console.error(`Login failed: ${errorText(err)}\nThe key was not saved.`)
       return 1
     }
+    if (!check.ok) {
+      console.error(`Login failed. ${check.code}: ${check.message}\nThe key was not saved.`)
+      return 1
+    }
+    writeCredentials(home, {
+      api_key: apiKey,
+      handle: check.handle,
+      ...(apiBase !== DEFAULT_API_BASE ? { api_base: apiBase } : {}),
+      created_at: new Date().toISOString(),
+    })
+    clearOfferDeclined(home)
+    console.log(
+      [
+        `Signed in as @${check.handle} for ${LABEL}.`,
+        `API key stored at ${credentialsPath(home)} (never commit this file).`,
+        ...(await placeIdentity(check.handle, apiKey, apiBase)),
+        NEXT_HINT,
+      ].join('\n'),
+    )
+    return 0
   }
 
-  // Recovery re-keys ONE agent, named by handle + email. One email can back
-  // several agents, so the email alone no longer identifies an account; the
-  // server treats an email-only request as "the only agent on this email, if
-  // there is exactly one" and otherwise fails at verify time with
-  // HANDLE_REQUIRED — after the code has been spent. Always sending the handle
-  // keeps this a single round-trip.
+  // Recovery re-keys ONE agent. One email can back several agents, so the
+  // handle rides along whenever it is known (this agent's stored one by
+  // default); asked by email alone, the server answers an email that backs
+  // several agents after the code, with the handles to choose from.
   async function runRecover(opts: RecoverOpts): Promise<number> {
     const home = profile.home()
     const apiBase = opts.apiBase ?? process.env['AGENTCHAT_API_BASE'] ?? DEFAULT_API_BASE
-    const usage = recoverUsage(invocation())
 
-    if (opts.code !== undefined) {
-      const code = opts.code.trim()
-      if (!/^\d{6}$/.test(code)) {
-        console.error('The code is the 6-digit number from the recovery email.')
-        return 1
-      }
-      const pending = readPending(home)
-      if (pending === null || pending.kind !== 'recover') {
-        console.error(`No recovery in progress. Start with: ${usage}`)
-        return 1
-      }
-      try {
-        const result = await AgentChatClient.recoverVerify(pending.pending_id, code, {
-          baseUrl: pending.api_base ?? apiBase,
-          clientIdentity,
-        })
-        writeCredentials(home, {
-          api_key: result.apiKey,
-          handle: result.handle,
-          ...(pending.api_base ? { api_base: pending.api_base } : {}),
-          created_at: new Date().toISOString(),
-        })
-        clearPending(home)
-        clearOfferDeclined(home)
-        console.log(
-          [
-            `Recovered: @${result.handle} for ${LABEL}.`,
-            `New API key stored at ${credentialsPath(home)} (the old key is now revoked; never commit this file).`,
-            ...(await placeIdentity(result.handle, result.apiKey, pending.api_base ?? apiBase)),
-            NEXT_HINT,
-          ].join('\n'),
-        )
-        return 0
-      } catch (err) {
-        // The code was accepted but the server could not pick an agent. That
-        // code is spent and the server has dropped the pending record, so the
-        // local one is dead too.
-        if ((err as ApiErrorLike | null)?.code === 'HANDLE_REQUIRED') clearPending(home)
-        console.error(`Recovery failed. ${apiErr(err)}`)
-        return 1
-      }
-    }
+    if (opts.code !== undefined) return submitPendingCode('recover', opts.code, apiBase)
 
-    const interactive = process.stdin.isTTY === true && process.stdout.isTTY === true
-
-    let handle = opts.handle?.trim().replace(/^@/, '').toLowerCase()
-    if (!handle) {
+    let handle = handleInput(opts.handle)
+    if (handle === undefined) {
       const stored = readCredentials(home)?.handle
       if (stored !== undefined) {
         handle = stored
         console.log(`Recovering @${stored} — this agent's stored handle (pass --handle to recover a different agent).`)
-      } else if (interactive) {
-        handle = (await prompt('Handle of the agent to recover (e.g. sanim-dev): ')).replace(/^@/, '').toLowerCase()
-      } else {
-        console.error(
-          `Missing --handle. An email can back more than one agent, so recovery needs the handle too. Usage: ${usage}`,
-        )
+      }
+    }
+    const email = emailInput(opts.email)
+    if (email === undefined) {
+      if (!interactive()) {
+        console.error(`Missing --email. Usage: ${recoverUsage(invocation())}`)
         return 1
       }
+      if (handle === undefined) handle = handleInput((await prompt('Handle of the agent to recover: ')) ?? undefined)
+      return converse('recover', handle !== undefined ? { handle } : {}, apiBase)
     }
-    if (!validHandle(handle)) {
-      console.error(
-        `Handle "@${handle}" is invalid. Rules: 3–30 characters, lowercase letters/digits/hyphens, must start with a letter, no trailing or doubled hyphens.`,
-      )
-      return 1
-    }
-
-    let email = opts.email?.trim().toLowerCase()
-    if (!email) {
-      if (!interactive) {
-        console.error(`Missing --email. Usage: ${usage}`)
-        return 1
-      }
-      email = (await prompt(`Email @${handle} was registered with: `)).toLowerCase()
-    }
-    if (!email.includes('@')) {
-      console.error(`"${email}" does not look like an email address.`)
-      return 1
-    }
-
-    try {
-      // The handle rides along: one email can back several agents, and an
-      // email-only request is only unambiguous while it backs exactly one.
-      const result = await AgentChatClient.recover(email, { handle, baseUrl: apiBase, clientIdentity })
-      if (!result.pending_id) {
-        console.log(result.message || 'If an agent is registered with that email, a recovery code was sent to it.')
-        return 0
-      }
-      writePending(home, {
-        kind: 'recover',
-        pending_id: result.pending_id,
-        email,
-        handle,
-        ...(apiBase !== DEFAULT_API_BASE ? { api_base: apiBase } : {}),
-        created_at: new Date().toISOString(),
-      })
-      console.log(
-        [
-          `If @${handle} is registered with ${email}, a recovery code was sent there (valid ~10 minutes).`,
-          `Complete with: ${invocation()} recover --code <6-digit-code>`,
-          'Note: completing recovery rotates the API key — anything using the old key stops working.',
-        ].join('\n'),
-      )
-      return 0
-    } catch (err) {
-      console.error(`Recovery failed. ${apiErr(err)}`)
-      return 1
-    }
+    return startSignup('recover', { email, ...(handle !== undefined ? { handle } : {}) }, apiBase)
   }
 
   /**
@@ -630,14 +715,15 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
             integration,
           }),
         )
-      } else if (pending?.kind === 'recover') {
-        const who = pending.handle !== undefined ? ` for @${pending.handle}` : ''
-        console.log(
-          `No identity yet, but an account recovery${who} is waiting on its emailed code — finish with: ${invocation()} recover --code <code>`,
-        )
       } else if (pending !== null) {
+        const what =
+          pending.kind === 'recover'
+            ? `an account recovery${pending.handle !== undefined ? ` for @${pending.handle}` : ''}`
+            : `a registration for @${pending.handle ?? '?'}`
         console.log(
-          `No identity yet, but a registration for @${pending.handle ?? '?'} is waiting on its emailed code — finish with: ${invocation()} register --code <code>`,
+          codeMayWork(pending)
+            ? `No identity yet, but ${what} is waiting on its emailed code — finish with: ${codeCommand(pending.kind, pending.flow)}`
+            : `No identity yet; the code for ${what} has expired — for a new one, run: ${startCommand(pending.kind, pending)}`,
         )
       } else {
         console.log(`No AgentChat identity for this ${LABEL} agent. Set one up with: ${invocation()} register`)
@@ -655,7 +741,7 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
       // rejected (close 1008 …)`) are exactly what explains the failure.
       const status = httpStatusOf(err)
       const refused = status === 401 || status === 403
-      const detail = apiErr(err)
+      const detail = describeApiError(err)
       if (opts.json) {
         const offline = anchorView(anchorFile, null, null)
         console.log(

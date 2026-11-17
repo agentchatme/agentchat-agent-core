@@ -56,7 +56,7 @@ export {
   type TextsSource,
 } from './integration/texts.js'
 
-// Identity — credential + pending storage, always scoped to a given home.
+// Identity — credential + pending sign-up storage, always scoped to a given home.
 export {
   DEFAULT_API_BASE,
   credentialsPath,
@@ -73,6 +73,7 @@ export {
   type Credentials,
   type ResolvedIdentity,
   type ResolveIdentityOptions,
+  type PendingSignup,
   type PendingRegistration,
 } from './identity/credentials.js'
 

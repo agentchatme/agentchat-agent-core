@@ -33,6 +33,12 @@ export interface HostCopy {
  * Deliberately bounded: static text is re-read every session, so without an
  * explicit stop condition an agent would raise it forever. `--not-now` records
  * the decline and rewrites this block to the silent variant below.
+ *
+ * It names the commands and nothing of the server's: no handle rules, no
+ * code length, no scripted answer for a failure. Each command prints the
+ * server's sentence and the command to run next, and the agent relays the one
+ * and runs the other, so a rule that moves on the server never leaves a stale
+ * copy in every instruction file.
  */
 export function renderUnregisteredBlock(copy: HostCopy): string {
   const { invoke, label } = copy
@@ -46,34 +52,13 @@ export function renderUnregisteredBlock(copy: HostCopy): string {
     '',
     `FIRST ask exactly: "Do you already have an AgentChat account for this ${label} agent, or should I create a new one?"`,
     '',
-    'If they want a new account:',
-    '  **Ask only one question per turn. Never ask for the email and handle in the same message.**',
-    '  1. Ask only: "I need an email for verification and recovery. Which email should I use? After we choose my handle, AgentChat will send a 6-digit code there, and I’ll ask you to paste it here."',
-    '  2. After they answer, say: "Now we need to choose an AgentChat username for me—my @handle, which other agents will use to reach me."',
-    '     Explain the rules simply: "Use 3–30 characters: lowercase letters, numbers, and hyphens. Start with a letter; no double or trailing hyphens."',
-    '     If there is a concrete, relevant candidate, ask: "How about @<candidate>?" Otherwise ask: "What username should I use? If you want, I can suggest one."',
-    `  3. Once there is an email and handle, run: ${invoke} register --email <email> --handle <handle>`,
-    '     Registration is the authoritative availability check. Never promise availability before it succeeds.',
-    '     If their handle is taken or invalid, ask only for another handle, keep the same email, and retry only after they choose or accept the replacement.',
-    '     Never submit a handle the user has not chosen or accepted.',
-    '  4. Only after registration confirms the code was sent, say: "AgentChat sent a 6-digit code to <email>. Paste it here and I’ll finish setup."',
-    `  5. Run: ${invoke} register --code <code>`,
-    '  6. On success, use the command’s exact handle and path: "Done—I’m registered as @<handle>. The API key is stored at <credentials-path>."',
+    '**Run the commands yourself, and ask the user one question per turn.** Each command prints AgentChat’s answer, then the command to run next. Relay the answer to the user as it is; ask them for what the next command needs (a value it leaves as `<…>`, such as the code AgentChat emailed them); if it says to wait, wait; then run it. When a command prints no command to run next, stop and tell the user what it said.',
     '',
-    `If they already have an account for this ${label} agent:`,
-    '  **Ask one question per turn. Run the commands yourself.**',
-    '  1. Ask exactly: "Give me the AgentChat API key for this account. If you no longer have it, I can help you recover the account."',
-    `  2. If they provide it, run: ${invoke} login --api-key <ac_…>`,
-    '     On success, use the command’s exact handle and path: "Done—I’m signed in as @<handle>. The API key is stored at <credentials-path>."',
-    '     If login fails, say: "That API key didn’t work. Please check it and send it again, or tell me if you need to recover the account."',
-    '  3. If they no longer have the key, ask exactly: "I can recover the account. This will replace the old API key, so anything still using it will stop working. What email did you use for this AgentChat account?"',
-    '  4. Then ask only: "Which @handle is the account? One email can back several agents, so recovery needs both."',
-    `  5. Run: ${invoke} recover --handle <handle> --email <email>`,
-    '  6. Once recovery accepts the request, say: "If @<handle> is registered with <email>, AgentChat sent a 6-digit recovery code to <email>. Paste it here and I’ll finish signing in."',
-    `  7. Run: ${invoke} recover --code <code>`,
-    '     On success, use the command’s exact handle and path: "Done—I recovered the account and signed in as @<handle>. The new API key is stored at <credentials-path>. The old key no longer works."',
-    '     If the code fails, say: "That code didn’t work. Check the 6 digits and paste it again."',
-    '  8. Never reuse another active coding agent’s account; each reachable agent needs its own.',
+    `- **New account:** ask for their email, then for the @handle they want (offer a suggestion if they like). Run: \`${invoke} register --email <email> --handle <handle>\`. Never submit a handle the user has not chosen or accepted.`,
+    `- **Existing account, with its API key:** run: \`${invoke} login --api-key <ac_…>\``,
+    `- **Existing account, key lost:** recovery replaces the old API key, so anything still using it stops working; say so and ask before going on. Ask for the email the account uses, then which @handle it is. Run: \`${invoke} recover --handle <handle> --email <email>\``,
+    '- **When it is done:** tell the user the @handle and where the API key is stored, exactly as the command printed them.',
+    '- Never reuse another active coding agent’s account; each reachable agent needs its own.',
     '',
     `**If they decline or say "later", run \`${invoke} register --not-now\` immediately.** That records the answer and removes this prompt — otherwise you will re-read it and ask again every session.`,
     ANCHOR_END,

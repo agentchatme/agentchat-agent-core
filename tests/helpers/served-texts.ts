@@ -26,15 +26,20 @@ export function textsFor(handle: string, runtime = 'generic'): Texts {
 
 /**
  * Answer `GET /v1/texts` through the SDK's transport and refuse every other
- * request, so no identity-command test reaches the network. Tests that need a
- * particular call mock it at the SDK method (`AgentChatClient.prototype.getMe`,
- * `AgentChatClient.register`, …), which never reaches the transport.
+ * request, so no identity-command test reaches the network. With `me`,
+ * `GET /v1/agents/me` answers that handle too (the key check of `login`).
+ * Tests that need another call mock it at the SDK method
+ * (`AgentChatClient.prototype.getMe`, …), which never reaches the transport,
+ * or script the sign-up endpoints with `signupServer` (signup-server.ts).
  */
-export function mockServedTexts(handle = 'probe', runtime = 'generic') {
+export function mockServedTexts(handle = 'probe', runtime = 'generic', options: { me?: string } = {}) {
   return vi.spyOn(HttpTransport.prototype, 'request').mockImplementation((async (method: string, path: string) => {
     if (method === 'GET' && path.startsWith('/v1/texts')) {
       const url = new URL(path, 'http://x')
       return { data: textsFor(handle, url.searchParams.get('runtime') ?? runtime), headers: new Headers(), status: 200, requestId: null }
+    }
+    if (method === 'GET' && path === '/v1/agents/me' && options.me !== undefined) {
+      return { data: { handle: options.me, status: 'active' }, headers: new Headers(), status: 200, requestId: null }
     }
     throw new ConnectionError(`offline in tests: ${method} ${path}`)
   }) as never)

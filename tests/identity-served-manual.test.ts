@@ -20,7 +20,7 @@ import { MANUAL_VERSION, mockServedTexts, textsFor, writeTextsCacheFile } from '
 const homes: string[] = []
 const ANNOUNCED: ServedManual = { url: 'https://agentchat.me/skill.md', version: MANUAL_VERSION }
 
-function fixture(extra: Partial<HostProfile>): { home: string; commands: ReturnType<typeof createIdentityCommands>; request: ReturnType<typeof mockServedTexts> } {
+function fixture(extra: Partial<HostProfile>, me?: string): { home: string; commands: ReturnType<typeof createIdentityCommands>; request: ReturnType<typeof mockServedTexts> } {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'agentchat-served-manual-cmd-'))
   homes.push(home)
   const profile: HostProfile = {
@@ -33,7 +33,7 @@ function fixture(extra: Partial<HostProfile>): { home: string; commands: ReturnT
     renderAnchor: renderAnchorBlock,
     ...extra,
   }
-  const request = mockServedTexts('probe')
+  const request = mockServedTexts('probe', 'generic', me !== undefined ? { me } : {})
   return { home, commands: createIdentityCommands(profile), request }
 }
 
@@ -60,8 +60,7 @@ describe('the announced manual reaches the host', () => {
         seen.push([handle, line, manual])
         return ['  manual: placed (async)']
       },
-    })
-    vi.spyOn(AgentChatClient.prototype, 'getMe').mockResolvedValue({ handle: 'probe' } as never)
+    }, 'probe')
     const out = capture()
     expect(await commands.runLogin({ apiKey: `ac_${'l'.repeat(32)}` })).toBe(0)
     expect(seen).toEqual([['probe', 'I am @probe on AgentChat (api.agentchat.me). Served identity line for generic.', ANNOUNCED]])
