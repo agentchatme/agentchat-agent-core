@@ -329,12 +329,13 @@ describe('Codex own: the user\'s config.toml decides; AgentChat adds only its MC
     expect(JSON.stringify(run!.env)).not.toContain(KEY)
     expect(JSON.stringify(run!.argv)).not.toContain(KEY)
     const helper = codexListenerHeadersHelperPath(home)
-    expect(run!.argv.join(' ')).toContain(helper)
     if (posix) expect(fs.statSync(helper).mode & 0o777).toBe(0o600)
-    // The helper command exactly as the run's argv carries it, run as Codex runs it (`sh -c`, an
-    // environment of its own): it yields this home's key and nothing of the environment's.
+    // The helper command exactly as the run's argv carries it (a TOML string: on Windows its
+    // backslashes are escaped there), run as Codex runs it (`sh -c`, an environment of its own):
+    // it names this home's helper and yields this home's key and nothing of the environment's.
     const pin = run!.argv.find((a) => a.startsWith('mcp_servers.agentchat.http_headers_helper='))!
     const command = JSON.parse(pin.slice('mcp_servers.agentchat.http_headers_helper='.length)) as string
+    expect(command).toContain(helper)
     if (posix) {
       const out = spawnSync('sh', ['-c', command], { encoding: 'utf-8', env: { AGENTCHAT_API_KEY: 'ac_live_' + 'e'.repeat(40) } })
       expect(out.status, out.stderr).toBe(0)
