@@ -77,8 +77,20 @@ describe('resolveDaemonConfig reads the home it is GIVEN', () => {
     expect(a.wsBase).toBe('ws://localhost:3000')
   })
 
-  it('resolves an environment key handle authoritatively instead of borrowing the file handle', async () => {
+  it('an exported key that is not the home’s never becomes the daemon’s agent', async () => {
     fs.writeFileSync(path.join(homeA, 'credentials'), creds('file-agent'))
+    const exported = 'ac_live_' + 'z'.repeat(40)
+    process.env['AGENTCHAT_API_KEY'] = exported
+    const fetch = vi.fn(async () => new Response(JSON.stringify({ handle: 'environment-agent' }), { status: 200, headers: { 'content-type': 'application/json' } }))
+    vi.stubGlobal('fetch', fetch)
+
+    const config = await resolveDaemonConfig({ home: homeA, workdir: path.join(homeA, 'w'), client: CLIENT })
+    expect(config.handle).toBe('file-agent')
+    expect(config.apiKey).not.toBe(exported)
+    expect(fetch).not.toHaveBeenCalled()
+  })
+
+  it('a home with no credentials takes the exported key, and asks the server for its handle', async () => {
     process.env['AGENTCHAT_API_KEY'] = 'ac_live_' + 'z'.repeat(40)
     vi.stubGlobal('fetch', vi.fn(async () =>
       new Response(JSON.stringify({ handle: 'environment-agent' }), {
@@ -87,7 +99,7 @@ describe('resolveDaemonConfig reads the home it is GIVEN', () => {
       }),
     ))
 
-    const config = await resolveDaemonConfig({ home: homeA, workdir: path.join(homeA, 'w'), client: CLIENT })
+    const config = await resolveDaemonConfig({ home: homeB, workdir: path.join(homeB, 'w'), client: CLIENT })
     expect(config.handle).toBe('environment-agent')
   })
 

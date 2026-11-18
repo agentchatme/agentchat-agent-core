@@ -41,7 +41,8 @@ describe('the unregistered offer block', () => {
   })
 
   it('covers login and recovery for an existing account, with the handle AND the email', () => {
-    expect(block).toContain(`${COPY.invoke} login --api-key <ac_…>`)
+    expect(block).toContain(`ask the user to run \`${COPY.invoke} login\` in their own terminal`)
+    expect(block).not.toContain('--api-key')
     expect(block).toContain(`${COPY.invoke} recover --handle <handle> --email <email>`)
     expect(block).toContain('recovery replaces the old API key')
   })

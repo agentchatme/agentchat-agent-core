@@ -44,7 +44,7 @@ export interface ResolveDaemonOpts {
   workdir: string
   /** How to identify to the server when the handle has to be asked for. */
   client: IntegrationClient
-  /** Whether `AGENTCHAT_API_KEY` may override the home's credentials (default true; see `resolveIdentity`). */
+  /** Whether `AGENTCHAT_API_KEY` may stand in for a home that holds no key (default true; it never replaces one: see `resolveIdentity`). */
   envKey?: boolean
 }
 
@@ -63,9 +63,8 @@ export async function resolveDaemonConfig(opts: ResolveDaemonOpts): Promise<Daem
     throw new Error(`no AgentChat identity in ${home} — register this agent first`)
   }
 
-  // An environment key is the authenticated identity even when this home also
-  // contains an older credentials file. That file's handle is not evidence
-  // about the env key, so resolve it from the server.
+  // An environment key stands in only for a home with no credentials file,
+  // so it has no handle on disk: ask the server.
   let handle = id.source === 'file' ? id.handle : null
   if (handle === null) {
     const client = new AgentChatClient({

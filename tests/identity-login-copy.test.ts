@@ -150,15 +150,15 @@ describe('login reads the key without putting it on argv', () => {
     expect(output.join('\n')).toContain('Using the key from AGENTCHAT_API_KEY.')
   })
 
-  it('with no key from anywhere and no TTY, it explains the three ways in', async () => {
+  it('with no key from anywhere and no TTY, it names the prompt and stdin, never a key on a command line', async () => {
     const { commands } = fixture()
     Object.defineProperty(process, 'stdin', { value: Readable.from([]), configurable: true })
     const errors: string[] = []
     vi.spyOn(console, 'error').mockImplementation((value) => errors.push(String(value)))
 
     expect(await commands.runLogin({})).toBe(1)
-    expect(errors.join('\n')).toContain('login --api-key -')
-    expect(errors.join('\n')).toContain('AGENTCHAT_API_KEY')
+    expect(errors.join('\n')).toContain('login --api-key - < key.txt')
+    expect(errors.join('\n')).not.toMatch(/--api-key ac_|AGENTCHAT_API_KEY=/)
   })
 })
 
