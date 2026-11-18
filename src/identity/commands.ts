@@ -3,6 +3,7 @@ import { AgentChatClient, integration as kit, type SignupFlow, type Texts } from
 import {
   DEFAULT_API_BASE,
   credentialsPath,
+  envKeyConflict,
   readCredentials,
   resolveIdentity,
   writeCredentials,
@@ -247,6 +248,20 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
   const invocation = (): string => profile.invocation()
   const LABEL = profile.label
   const clientIdentity = clientIdentityOf(profile.client)
+
+  /**
+   * The refusal when an exported `AGENTCHAT_API_KEY` is not the key this
+   * home holds, with what to do; null when there is no such split. Nothing
+   * that acts as this agent adopts the exported key: it would quietly make
+   * every command, and every placement `doctor --fix` writes, another agent
+   * (found in testing). The listener of `@agentchatme/cli` refuses the
+   * same split.
+   */
+  function envKeyRefusal(): string | null {
+    const conflict = envKeyConflict(profile.home())
+    if (conflict === null) return null
+    return `${conflict}. Unset AGENTCHAT_API_KEY, or, to sign this home in with that key on purpose: printenv AGENTCHAT_API_KEY | ${invocation()} login --api-key -`
+  }
 
   /**
    * One attempt, 5 s — for `status`, `doctor` and the texts fetch, which must
@@ -597,19 +612,28 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
     const apiBase = opts.apiBase ?? process.env['AGENTCHAT_API_BASE'] ?? DEFAULT_API_BASE
     let apiKey = opts.apiKey?.trim()
 
-    // Where the key comes from, most explicit first. `--api-key <key>` keeps
-    // working, but argv is visible in `ps` and kept in shell history, so a
-    // key can also be piped in (`--api-key -`) or passed in the environment.
+    // Where the key comes from, most explicit first. A key is never asked for
+    // as an argument: argv is visible in `ps` to every user of the machine and
+    // kept in shell history. It is piped in (`--api-key -`), typed at the
+    // prompt, or taken from AGENTCHAT_API_KEY when this home holds no other
+    // key. `--api-key <key>` keeps working for scripts that pass one, and the
+    // output says where the key was seen.
+    const onArgv = apiKey !== undefined && apiKey.length > 0 && apiKey !== '-'
     if (apiKey === '-') {
       apiKey = await readAllStdin()
     } else if (!apiKey) {
       const fromEnv = process.env['AGENTCHAT_API_KEY']?.trim()
+      const refusal = fromEnv ? envKeyRefusal() : null
+      if (refusal !== null) {
+        console.error(`${refusal}\nlogin does not adopt an exported key in place of the one this home holds; nothing was saved.`)
+        return 1
+      }
       if (fromEnv) {
         apiKey = fromEnv
         console.log('Using the key from AGENTCHAT_API_KEY.')
       } else if (process.stdin.isTTY !== true) {
         console.error(
-          `Missing API key. Pipe it in: printf %s "$KEY" | ${invocation()} login --api-key -   (or set AGENTCHAT_API_KEY, or pass --api-key ac_live_…, which \`ps\` and shell history can see)`,
+          `Missing API key. Run \`${invocation()} login\` in a terminal and paste the key when it asks, or pipe it in from a file: \`${invocation()} login --api-key - < key.txt\`. Never put the key itself on a command line: \`ps\` and shell history can see it there.`,
         )
         return 1
       } else {
@@ -646,6 +670,11 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
         `API key stored at ${credentialsPath(home)} (never commit this file).`,
         ...(await placeIdentity(check.handle, apiKey, apiBase)),
         NEXT_HINT,
+        ...(onArgv
+          ? [
+              `Note: the key was on this command line, where \`ps\` and shell history can see it. Next time run \`${invocation()} login\` and paste it, or pipe it in: \`${invocation()} login --api-key - < key.txt\`.`,
+            ]
+          : []),
       ].join('\n'),
     )
     return 0
@@ -700,6 +729,14 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
   async function runStatus(opts: { json?: boolean }): Promise<number> {
     const home = profile.home()
     const anchorFile = profile.anchorFile?.() ?? null
+    // A split identity is said before anything else, and nothing is asked of
+    // the server with either key: status names one agent or none.
+    const refusal = envKeyRefusal()
+    if (refusal !== null) {
+      if (opts.json) console.log(JSON.stringify({ configured: true, host: profile.id, error: { kind: 'env_key_conflict', detail: refusal }, home }))
+      else console.error(refusal)
+      return 1
+    }
     const identity = resolveIdentity(home)
     const pending = readPending(home)
     const integration = readIntegrationStatus(home)
@@ -948,6 +985,9 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
 
     checks.push({ name: 'node', verdict: 'PASS', detail: process.version })
     checks.push({ name: 'home', verdict: 'PASS', detail: home })
+    // Every check below, and every repair `--fix` makes, uses the home's key.
+    const refusal = envKeyRefusal()
+    if (refusal !== null) checks.push({ name: 'env-key', verdict: 'FAIL', detail: refusal })
 
     const creds = readCredentials(home)
     if (creds === null) {

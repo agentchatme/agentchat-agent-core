@@ -29,11 +29,11 @@ afterEach(() => {
 })
 
 describe('home-only identity (for a resident listener)', () => {
-  it('resolveIdentity and resolveDaemonConfig ignore AGENTCHAT_API_KEY when asked', async () => {
+  it('resolveIdentity and resolveDaemonConfig never let AGENTCHAT_API_KEY replace the home’s key', async () => {
     const home = tempHome()
     writeCredentials(home, { api_key: KEY, handle: 'probe' })
     process.env['AGENTCHAT_API_KEY'] = OTHER
-    expect(resolveIdentity(home)?.apiKey).toBe(OTHER)
+    expect(resolveIdentity(home)).toMatchObject({ apiKey: KEY, handle: 'probe', source: 'file' })
     expect(resolveIdentity(home, { envKey: false })).toMatchObject({ apiKey: KEY, handle: 'probe', source: 'file' })
     const cfg = await resolveDaemonConfig({ home, workdir: home, client: { runtime: 'generic', version: '0' }, envKey: false })
     expect(cfg).toMatchObject({ apiKey: KEY, handle: 'probe' })

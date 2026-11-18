@@ -5,7 +5,7 @@ import { acquireLeaderLock } from '../daemon/leader-lock.js'
 import { acquireAgentLock, agentLockPath, agentLockRefusal, clearStandby, markStandby, standbyWaiting } from '../daemon/agent-lock.js'
 import type { Lease, LeaseOptions } from '../util/lease.js'
 import type { DaemonConfig } from '../daemon/config.js'
-import { resolveIdentity, credentialsPath } from '../identity/credentials.js'
+import { resolveIdentity, credentialsPath, envKeyConflict } from '../identity/credentials.js'
 import { resolveDaemonConfig } from '../daemon/config.js'
 import { idle } from '../daemon/health.js'
 import type { IntegrationClient } from '../client-identity.js'
@@ -90,9 +90,10 @@ export interface RunIntegrationOpts {
   /** Test seam: what a signal-initiated shutdown calls last. Defaults to `process.exit`. */
   exit?: (code: number) => void
   /**
-   * Serve only the agent the home's `credentials` hold: `AGENTCHAT_API_KEY`
-   * in the environment is ignored (default false: it overrides, as for every
-   * integration). The `agentchat` listener sets it.
+   * Serve only the agent the home's `credentials` hold, never one of
+   * `AGENTCHAT_API_KEY` (default false: an exported key stands in for a home
+   * that holds none; it never replaces a key the home holds). The `agentchat`
+   * listener sets it.
    */
   credentialsFromHomeOnly?: boolean
   /** See `IntegrationOptions.dismissIgnoredInvites` (default true). */
@@ -224,6 +225,9 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
 
   const envKey = opts.credentialsFromHomeOnly !== true
   const identityOf = () => resolveIdentity(home, { envKey })
+  // Said once: the daemon serves the agent its home names, never the exported key's.
+  const split = envKeyConflict(home, process.env)
+  if (split !== null) log.warn(`${split}; this daemon serves the agent of ${credentialsPath(home)} — unset AGENTCHAT_API_KEY where it runs`)
   const disabledBy = integrationDisabledBy(env)
   const disabled = disabledBy !== null
   let live: Integration | null = null

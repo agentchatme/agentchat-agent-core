@@ -65,6 +65,7 @@ export {
   readCredentials,
   resolveIdentity,
   envApiKey,
+  envKeyConflict,
   writeCredentials,
   clearCredentials,
   readPending,

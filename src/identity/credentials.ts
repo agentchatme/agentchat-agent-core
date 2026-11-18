@@ -3,7 +3,6 @@ import * as path from 'node:path'
 import { z } from 'zod'
 import { integration, type SignupFlow } from 'agentchatme'
 import { atomicWriteFile, readJsonFile } from '../util/fsutil.js'
-import { log } from '../util/log.js'
 
 // ─── Credential storage (host-agnostic) ─────────────────────────────────────
 //
@@ -18,9 +17,12 @@ import { log } from '../util/log.js'
 // such decision: the caller is a single-host integration that knows its own
 // home at compile time and passes it in.
 //
-// Precedence within a home mirrors the Hermes plugin: an explicit
-// AGENTCHAT_API_KEY env var wins over the file (for CI and externally-managed
-// secrets); the file is what the setup wizard writes.
+// Within a home, the home's `credentials` name the agent. An exported
+// AGENTCHAT_API_KEY is used only when the home holds no key (CI, an
+// externally managed secret): one that differs from the home's key is never
+// adopted, because a shell variable left over from another agent would
+// otherwise make every command, and every placement, quietly that other
+// agent. Commands say so in words (`envKeyConflict`).
 
 export const DEFAULT_API_BASE = 'https://api.agentchat.me'
 
@@ -60,16 +62,17 @@ export function readCredentials(home: string): Credentials | null {
 }
 
 /**
- * The identity an integration should act as, for one specific home.
- * `AGENTCHAT_API_KEY` overrides the file; `AGENTCHAT_API_BASE` overrides the
- * base URL. Neither is host-specific, so both are read from the environment.
+ * The identity an integration should act as, for one specific home: the
+ * home's `credentials`, else `AGENTCHAT_API_KEY` when the home holds no key.
+ * `AGENTCHAT_API_BASE` overrides the base URL. Neither is host-specific, so
+ * both are read from the environment.
  */
 export interface ResolveIdentityOptions {
   /**
-   * Whether `AGENTCHAT_API_KEY` may override the home's credentials (default
-   * true). A resident listener passes false: the agent it serves is the one
-   * its home holds, whatever happens to be exported in the shell that
-   * started it.
+   * Whether `AGENTCHAT_API_KEY` may stand in for a home that holds no key
+   * (default true). It never overrides a key the home holds. A resident
+   * listener passes false: the agent it serves is the one its home holds,
+   * whatever happens to be exported in the shell that started it.
    */
   readonly envKey?: boolean
 }
@@ -85,24 +88,9 @@ export function resolveIdentity(home: string, options: ResolveIdentityOptions = 
   const envBase = process.env['AGENTCHAT_API_BASE']
   const file = readCredentials(home)
 
-  if (envKey && envKey.trim().length >= 20) {
-    return {
-      apiKey: envKey.trim(),
-      apiBase: envBase?.trim() || file?.api_base || DEFAULT_API_BASE,
-      handle: file?.handle ?? null,
-      source: 'env',
-    }
-  }
-
-  // A SET-but-malformed env key silently losing to the file would be an
-  // unnoticed identity swap on a messaging platform — say it on stderr.
-  if (envKey && envKey.trim().length > 0 && file) {
-    log.warn(
-      'AGENTCHAT_API_KEY is set but malformed (under 20 chars); using the credentials-file identity instead',
-    )
-  }
-
   if (file) {
+    // An exported key that is not this home's is not adopted; a command that
+    // acts as the agent refuses on it first (`envKeyConflict`).
     return {
       apiKey: file.api_key,
       apiBase: envBase?.trim() || file.api_base || DEFAULT_API_BASE,
@@ -111,7 +99,30 @@ export function resolveIdentity(home: string, options: ResolveIdentityOptions = 
     }
   }
 
+  if (envKey && envKey.trim().length >= 20) {
+    return {
+      apiKey: envKey.trim(),
+      apiBase: envBase?.trim() || DEFAULT_API_BASE,
+      handle: null,
+      source: 'env',
+    }
+  }
+
   return null
+}
+
+/**
+ * One sentence when an exported `AGENTCHAT_API_KEY` is not the key `home`
+ * holds, else null (none exported, the same key, or a home with no key, where
+ * the exported one stands in). Never contains either key. The caller adds
+ * what to do in its own words.
+ */
+export function envKeyConflict(home: string, env: NodeJS.ProcessEnv = process.env): string | null {
+  const exported = env['AGENTCHAT_API_KEY']?.trim()
+  if (exported === undefined || exported.length === 0) return null
+  const stored = readCredentials(home)
+  if (stored === null || stored.api_key === exported) return null
+  return `AGENTCHAT_API_KEY is exported and is not the key ${credentialsPath(home)} holds (it is another agent's key, or an old one); commands for this agent act only with that file's key`
 }
 
 export function writeCredentials(home: string, creds: Credentials): void {

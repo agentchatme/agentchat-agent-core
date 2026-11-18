@@ -2,6 +2,13 @@
 
 All notable changes to `@agentchatme/agent-core` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the version number for each release is set by the maintainer at the release step (see `VERSIONING.md`).
 
+## [Unreleased]
+
+### Fixed
+
+- **An exported `AGENTCHAT_API_KEY` never makes this agent another one.** `resolveIdentity(home)` returns the home's `credentials` whenever they exist; the exported key stands in only for a home that holds no key (CI, an externally managed secret). When the two differ, `status` refuses in words and asks the server nothing, `doctor` fails a new `env-key` check while every other check and every `--fix` repair uses the home's key, `login` without `--api-key` does not adopt the exported key, and the daemon logs the split and serves the home's agent. New export: `envKeyConflict(home, env)`.
+- **No printed step puts a key on a command line.** `login`'s missing-key text names the prompt and `login --api-key - < key.txt`, no longer `--api-key <key>` or `AGENTCHAT_API_KEY=…`; a login whose key came as an argument says it was seen there. The setup offer in the instruction file has the user run `login` in their own terminal instead of the agent typing `login --api-key <ac_…>`.
+
 ## [0.5.2] — 2026-11-17
 
 Fixed existing behaviour, so patch +1 (`VERSIONING.md`): installs on Node 24 and 26. No code change.
