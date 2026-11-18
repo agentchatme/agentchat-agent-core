@@ -354,6 +354,44 @@ export function parseCodexMcpList(stdout: string): { ok: true; names: string[] }
 }
 
 /**
+ * What the `agentchat` entry of `codex mcp list --json` would authenticate
+ * with besides a headers helper: `bearer_token_env_var`, or an `Authorization`
+ * in `env_http_headers` (names only, never values). Codex sends either in
+ * place of the helper's `Authorization` ("Helper Authorization is used only
+ * when the request has no explicit bearer/OAuth credential",
+ * rmcp-client/src/http_headers.rs). A static `http_headers` is not counted:
+ * a listener's run replaces that whole table. An entry the list does not
+ * have authenticates with nothing else.
+ */
+export function codexAgentchatExplicitAuth(stdout: string): { ok: true; keys: string[] } | { ok: false; detail: string } {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(stdout)
+  } catch {
+    return { ok: false, detail: 'its output is not JSON' }
+  }
+  if (!Array.isArray(parsed)) return { ok: false, detail: 'its output is not a list' }
+  const entry = parsed.find((e) => (e as { name?: unknown } | null)?.name === CODEX_MCP_SERVER_NAME) as { transport?: unknown } | undefined
+  const transport = entry?.transport !== null && typeof entry?.transport === 'object' ? (entry.transport as Record<string, unknown>) : {}
+  const keys: string[] = []
+  const bearer = transport['bearer_token_env_var']
+  if (typeof bearer === 'string' && bearer.length > 0) keys.push('bearer_token_env_var')
+  const envHeaders = transport['env_http_headers']
+  if (envHeaders !== null && typeof envHeaders === 'object' && Object.keys(envHeaders).some((name) => name.toLowerCase() === 'authorization')) keys.push('env_http_headers.Authorization')
+  return { ok: true, keys }
+}
+
+/** The key variables a `.env` file sets (`AGENTCHAT_API_KEY`, `LISTENER_KEY_ENV`): names only. Codex loads `$CODEX_HOME/.env` into its own environment, and a run's commands inherit it. */
+export function codexDotEnvKeyNames(content: string): string[] {
+  const names = new Set<string>()
+  for (const line of content.split(/\r?\n/)) {
+    const match = /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*['"]?\S/.exec(line)
+    if (match?.[1] === 'AGENTCHAT_API_KEY' || match?.[1] === LISTENER_KEY_ENV) names.add(match[1])
+  }
+  return [...names]
+}
+
+/**
  * `-c mcp_servers.<name>.enabled=false` for every listed server but AgentChat's,
  * or why that cannot be done. Only names Codex listed: an override for a server
  * no config layer defines is a config error ("invalid transport").
@@ -446,6 +484,8 @@ export class CodexRunner implements RunRunner {
   private warnedHome = false
   /** The last good listing and what it depended on: a stranger's DM does not cost a listing (and its contacts to the user's MCP hosts) on every run. */
   private listing: { key: string; at: number; result: { ok: true; args: string[] } } | null = null
+  /** The last listing that showed a listener's own run authenticates with its helper alone (`ownAuthProblem`). */
+  private ownListing: { key: string; at: number } | null = null
 
   constructor(private readonly options: CodexRunnerOptions) {
     this.command = options.command ?? 'codex'
@@ -479,6 +519,9 @@ export class CodexRunner implements RunRunner {
       const disables = await this.answerMcpDisables()
       if (!disables.ok) return { ok: false, detail: codexAnswerListingRefusal(disables.detail) }
     }
+    // Said up front as well: a listener's own run that would carry or use another key.
+    const ownProblem = await this.ownAuthProblem()
+    if (ownProblem !== null) return { ok: false, detail: ownProblem }
     return { ok: true }
   }
 
@@ -520,14 +563,67 @@ export class CodexRunner implements RunRunner {
    * an error, a timeout, output that is not the list — means no run.
    */
   async answerMcpDisables(): Promise<{ ok: true; args: string[] } | { ok: false; detail: string }> {
-    const run = this.args()
-    // The run's config flags only: `-c <v>` and `--disable <feature>` pairs.
-    const flags = run.flatMap((arg, i) => (run[i - 1] === '-c' || run[i - 1] === '--disable' ? [run[i - 1] as string, arg] : []))
+    const { flags, key } = this.listingFlags()
     // Reused while nothing it was read from changed (and for at most an hour);
     // a failure is never cached, so the next run asks again.
-    const key = codexListingKey(codexConfigLayerFiles(this.options.codexHome, this.workdir()), [this.command, this.workdir(), ...flags])
     if (this.listing !== null && this.listing.key === key && Date.now() - this.listing.at < CODEX_MCP_LIST_MAX_AGE_MS) return this.listing.result
-    const listed = await new Promise<{ ok: true; stdout: string } | { ok: false; detail: string }>((resolve) => {
+    const listed = await this.listMcpServers(flags)
+    if (!listed.ok) return listed
+    const parsed = parseCodexMcpList(listed.stdout)
+    if (!parsed.ok) return parsed
+    const result = codexMcpDisableArgs(parsed.names)
+    if (result.ok) this.listing = { key, at: Date.now(), result }
+    return result
+  }
+
+  /**
+   * For a listener's `own` run (its key from a headers helper, none in its
+   * environment): why it must not start, or null. Two things would make it
+   * carry or use a key that is not the helper's — another agent's, as a
+   * Codex integration from 0.5.2 or earlier left them: `$CODEX_HOME/.env`
+   * setting a key variable (Codex loads it into the run's environment), and an
+   * `agentchat` entry that names `bearer_token_env_var` or an `Authorization`
+   * in `env_http_headers` in any config layer (Codex sends that in place of the
+   * helper's: the run would act as that other agent). The entry is asked of
+   * Codex itself (`codex mcp list --json` with the run's own flags, cached as
+   * an answer run's listing is); a listing that fails means no run.
+   */
+  async ownAuthProblem(): Promise<string | null> {
+    if (this.options.profile !== 'own' || this.options.mcp?.headersHelper === undefined) return null
+    const dotenv = path.join(this.options.codexHome, '.env')
+    let names: string[] = []
+    try {
+      names = codexDotEnvKeyNames(fs.readFileSync(dotenv, 'utf-8'))
+    } catch {
+      names = []
+    }
+    if (names.length > 0) {
+      return `${dotenv} sets ${names.join(' and ')}: Codex loads that file into every run's environment, so this listener's own runs would carry that key. An AgentChat Codex integration from 0.5.2 or earlier left it there (\`npx -y @agentchatme/codex doctor --fix\` takes it out); remove the line, or run this listener with --profile answer`
+    }
+    const { flags, key } = this.listingFlags()
+    if (this.ownListing !== null && this.ownListing.key === key && Date.now() - this.ownListing.at < CODEX_MCP_LIST_MAX_AGE_MS) return null
+    const listed = await this.listMcpServers(flags)
+    const auth = listed.ok ? codexAgentchatExplicitAuth(listed.stdout) : listed
+    if (!auth.ok) {
+      return `could not list Codex's MCP servers (\`codex mcp list --json\` with the own run's flags: ${auth.detail}); a listener's own run starts only once Codex confirms its ${CODEX_MCP_SERVER_NAME} server sends this listener's key`
+    }
+    if (auth.keys.length > 0) {
+      return `the [mcp_servers.${CODEX_MCP_SERVER_NAME}] Codex loads for these runs sets ${auth.keys.join(' and ')}: Codex sends that credential in place of this listener's headers helper, so its own runs would act as another agent. An AgentChat Codex integration from 0.5.2 or earlier wrote bearer_token_env_var (\`npx -y @agentchatme/codex doctor --fix\` replaces it); remove it, or run this listener with --profile answer`
+    }
+    this.ownListing = { key, at: Date.now() }
+    return null
+  }
+
+  /** The run's config flags (`-c <v>` and `--disable <feature>` pairs) and what a listing of them depends on. */
+  private listingFlags(): { flags: string[]; key: string } {
+    const run = this.args()
+    const flags = run.flatMap((arg, i) => (run[i - 1] === '-c' || run[i - 1] === '--disable' ? [run[i - 1] as string, arg] : []))
+    return { flags, key: codexListingKey(codexConfigLayerFiles(this.options.codexHome, this.workdir()), [this.command, this.workdir(), ...flags]) }
+  }
+
+  /** `codex mcp list --json <flags>` from the run's workdir, with the run's environment: its output, or why there is none. Killed with its whole tree past its time. */
+  private async listMcpServers(flags: string[]): Promise<{ ok: true; stdout: string } | { ok: false; detail: string }> {
+    return new Promise<{ ok: true; stdout: string } | { ok: false; detail: string }>((resolve) => {
       let child: ReturnType<typeof spawnCommand>
       try {
         child = spawnCommand(this.command, ['mcp', 'list', '--json', ...flags], {
@@ -589,12 +685,6 @@ export class CodexRunner implements RunRunner {
         else settle({ ok: true, stdout })
       })
     })
-    if (!listed.ok) return listed
-    const parsed = parseCodexMcpList(listed.stdout)
-    if (!parsed.ok) return parsed
-    const result = codexMcpDisableArgs(parsed.names)
-    if (result.ok) this.listing = { key, at: Date.now(), result }
-    return result
   }
 
   async start(request: RunRequest): Promise<RunOutcome> {
@@ -607,6 +697,9 @@ export class CodexRunner implements RunRunner {
       if (!disables.ok) return { state: 'not_started', exitCode: null, durationMs: Date.now() - startedAt, detail: codexAnswerListingRefusal(disables.detail) }
       args = [...args.slice(0, -1), ...disables.args, CODEX_PROMPT_FROM_STDIN]
     }
+    // Fail closed: a listener's own run starts only when it would act as the listener's agent, with no key in its environment.
+    const ownProblem = await this.ownAuthProblem()
+    if (ownProblem !== null) return { state: 'not_started', exitCode: null, durationMs: Date.now() - startedAt, detail: ownProblem }
     log.debug(`codex ${args.join(' ')} (prompt on stdin, ${request.kind} run ${request.runId})`)
     return spawnRun({
       command: this.command,
@@ -709,7 +802,7 @@ export const codexPreset: Preset = {
     return [
       `-c mcp_servers.${CODEX_MCP_SERVER_NAME}.url="${hostedMcpUrl(apiBase)}"`,
       profile === 'own'
-        ? `-c mcp_servers.${CODEX_MCP_SERVER_NAME}.http_headers_helper=<node> ${codexListenerHeadersHelperPath(home)} (own: reads this home's credentials on each connection; no key in the run's environment or on argv)`
+        ? `-c mcp_servers.${CODEX_MCP_SERVER_NAME}.http_headers_helper=<node> ${codexListenerHeadersHelperPath(home)} (own: reads this home's credentials on each connection; no key in the run's environment or on argv; no run while $CODEX_HOME/.env sets a key or the merged ${CODEX_MCP_SERVER_NAME} entry names bearer_token_env_var)`
         : `-c mcp_servers.${CODEX_MCP_SERVER_NAME}.bearer_token_env_var="${LISTENER_KEY_ENV}" (the key set in the run's environment, never on argv)`,
       `-c mcp_servers.${CODEX_MCP_SERVER_NAME}.default_tools_approval_mode="approve"`,
       `-c mcp_servers.${CODEX_MCP_SERVER_NAME}.http_headers={ "X-AgentChat-Client" = "codex", "X-AgentChat-Client-Version" = <the listener's version> } (names the runtime to the hosted tools)`,

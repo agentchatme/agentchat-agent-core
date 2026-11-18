@@ -70,7 +70,7 @@ export function describeRunProfile(profile: string, runtimeLabel?: string | null
     case 'own':
       return `${ownProfileLine(runtimeLabel)}; ${OWN_RUN_WARNING}`
     case 'work':
-      return `reply runs also get the web, edits and shell; ${PEER_RUN_WARNING}`
+      return `reply runs also get the shell and edits in their work folder; ${PEER_RUN_WARNING}`
     case 'full':
       return `reply runs use ${runtimeLabel !== undefined && runtimeLabel !== null && runtimeLabel.trim().length > 0 ? `${runtimeLabel.trim()}'s` : "the runtime's"} bypass mode; ${PEER_RUN_WARNING}`
     default:

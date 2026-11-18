@@ -25,7 +25,9 @@ import {
   claudeMcpConfigPath,
   claudeProjectsDirFor,
   claudeRunArgs,
+  codexAgentchatExplicitAuth,
   codexAnswerFallbackWorkdir,
+  codexDotEnvKeyNames,
   codexListenerHeadersHelperPath,
   codexPreset,
   codexRunArgs,
@@ -315,7 +317,8 @@ describe('Codex own: the user\'s config.toml decides; AgentChat adds only its MC
   it('the listener: a headers helper in its home reads its credentials; the run\'s environment carries no key', async () => {
     const fake = installFakeCodex(sandbox)
     fs.writeFileSync(path.join(home, 'credentials'), JSON.stringify({ api_key: KEY, handle: 'listener', api_base: 'https://api.example' }), { mode: 0o600 })
-    const env = withFake(fake, { AGENTCHAT_API_KEY: 'ac_live_' + 'o'.repeat(40) })
+    const lists = path.join(sandbox, 'own-lists.jsonl')
+    const env = withFake(fake, { AGENTCHAT_API_KEY: 'ac_live_' + 'o'.repeat(40), FAKE_MCP_LIST_RECORD: lists })
     const runner = codexPreset.runner({ home, workdir: path.join(sandbox, 'work'), profile: 'own', apiKey: KEY, apiBase: 'https://api.example', env })
     expect(await runner.preflight()).toEqual({ ok: true })
     expect((await runner.start(request)).state).toBe('ok')
@@ -328,9 +331,18 @@ describe('Codex own: the user\'s config.toml decides; AgentChat adds only its MC
     const helper = codexListenerHeadersHelperPath(home)
     expect(run!.argv.join(' ')).toContain(helper)
     if (posix) expect(fs.statSync(helper).mode & 0o777).toBe(0o600)
-    // The helper, run as Codex runs it, yields this home's key and nothing of the environment's.
-    const out = spawnSync(process.execPath, [helper], { encoding: 'utf-8', env: { PATH: process.env['PATH'] ?? '', AGENTCHAT_API_KEY: 'ac_live_' + 'e'.repeat(40) } })
-    expect(JSON.parse(out.stdout)).toEqual({ Authorization: `Bearer ${KEY}` })
+    // The helper command exactly as the run's argv carries it, run as Codex runs it (`sh -c`, an
+    // environment of its own): it yields this home's key and nothing of the environment's.
+    const pin = run!.argv.find((a) => a.startsWith('mcp_servers.agentchat.http_headers_helper='))!
+    const command = JSON.parse(pin.slice('mcp_servers.agentchat.http_headers_helper='.length)) as string
+    if (posix) {
+      const out = spawnSync('sh', ['-c', command], { encoding: 'utf-8', env: { AGENTCHAT_API_KEY: 'ac_live_' + 'e'.repeat(40) } })
+      expect(out.status, out.stderr).toBe(0)
+      expect(JSON.parse(out.stdout)).toEqual({ Authorization: `Bearer ${KEY}` })
+    }
+    // Before the run, Codex was asked how its agentchat entry authenticates (the run's own flags).
+    expect(readFakeMcpLists(lists)).toHaveLength(1)
+    expect(readFakeMcpLists(lists)[0]!.argv).toContain(pin)
     // answer, work and full keep the bearer variable, unchanged.
     for (const profile of ['answer', 'work', 'full'] as const) {
       const other = codexPreset.runner({ home, workdir: path.join(sandbox, 'work'), profile, apiKey: KEY, apiBase: 'https://api.example', env }) as CodexRunner
@@ -338,6 +350,38 @@ describe('Codex own: the user\'s config.toml decides; AgentChat adds only its MC
       expect(other.env()[LISTENER_KEY_ENV]).toBe(KEY)
     }
   }, 20_000)
+
+  it('the listener: no own run while Codex would send another credential, or carry a key from $CODEX_HOME/.env (a Codex integration from 0.5.2 or earlier left both)', async () => {
+    const fake = installFakeCodex(sandbox)
+    fs.writeFileSync(path.join(home, 'credentials'), JSON.stringify({ api_key: KEY, handle: 'listener', api_base: 'https://api.example' }), { mode: 0o600 })
+    const legacy = JSON.stringify([{ name: 'agentchat', enabled: true, transport: { type: 'streamable_http', url: 'https://api.example/mcp', bearer_token_env_var: 'AGENTCHAT_API_KEY', http_headers_helper: 'x' } }])
+    const build = (extra: NodeJS.ProcessEnv) => codexPreset.runner({ home, workdir: path.join(sandbox, 'work'), profile: 'own', apiKey: KEY, apiBase: 'https://api.example', env: withFake(fake, extra) })
+    const bearer = build({ FAKE_MCP_LIST: legacy })
+    expect(await bearer.preflight()).toMatchObject({ ok: false, detail: expect.stringContaining('sets bearer_token_env_var: Codex sends that credential in place of this listener\'s headers helper') })
+    expect(await bearer.start(request)).toMatchObject({ state: 'not_started', detail: expect.stringContaining('doctor --fix') })
+    const authHeader = JSON.stringify([{ name: 'agentchat', enabled: true, transport: { env_http_headers: { authorization: 'SOME_VAR' } } }])
+    expect(await build({ FAKE_MCP_LIST: authHeader }).preflight()).toMatchObject({ ok: false, detail: expect.stringContaining('env_http_headers.Authorization') })
+    expect(await build({ FAKE_MCP_LIST_MODE: 'fail' }).preflight()).toMatchObject({ ok: false, detail: expect.stringContaining("could not list Codex's MCP servers") })
+    // An env header that is not the Authorization one changes nothing.
+    expect(await build({ FAKE_MCP_LIST: JSON.stringify([{ name: 'agentchat', enabled: true, transport: { env_http_headers: { 'X-Trace': 'T' } } }]) }).preflight()).toEqual({ ok: true })
+    // A key in $CODEX_HOME/.env: Codex would load it into the run's environment.
+    fs.mkdirSync(path.join(sandbox, '.codex'), { recursive: true })
+    fs.writeFileSync(path.join(sandbox, '.codex', '.env'), 'OTHER=1\nexport AGENTCHAT_API_KEY=ac_live_left_behind\n')
+    expect(await build({}).preflight()).toMatchObject({ ok: false, detail: expect.stringContaining('.env sets AGENTCHAT_API_KEY') })
+    expect(readFakeRuns(fake)).toEqual([])
+    // answer, work and full are not affected: they set their own bearer variable.
+    expect(await codexPreset.runner({ home, workdir: path.join(sandbox, 'work'), profile: 'work', apiKey: KEY, apiBase: 'https://api.example', env: withFake(fake, { FAKE_MCP_LIST: legacy }) }).preflight()).toEqual({ ok: true })
+    // An integration's own runs (no helper override of their own) are not refused for it either.
+    expect(await new CodexRunner({ codexHome: path.join(sandbox, '.codex'), workdir: path.join(sandbox, 'work'), profile: 'own', apiKey: () => null, keyEnv: 'AGENTCHAT_API_KEY', env: withFake(fake, { FAKE_MCP_LIST: legacy }) }).preflight()).toEqual({ ok: true })
+  }, 30_000)
+
+  it('the parsers keep names only', () => {
+    expect(codexAgentchatExplicitAuth('[{"name":"agentchat","transport":{"bearer_token_env_var":"K","env_http_headers":{"Authorization":"V"}}},{"name":"x","transport":{"bearer_token_env_var":"Y"}}]')).toEqual({ ok: true, keys: ['bearer_token_env_var', 'env_http_headers.Authorization'] })
+    expect(codexAgentchatExplicitAuth('[{"name":"agentchat","enabled":true}]')).toEqual({ ok: true, keys: [] })
+    expect(codexAgentchatExplicitAuth('[]')).toEqual({ ok: true, keys: [] })
+    expect(codexAgentchatExplicitAuth('nope')).toMatchObject({ ok: false })
+    expect(codexDotEnvKeyNames('A=1\r\n  export AGENTCHAT_API_KEY="x"\n# AGENTCHAT_LISTENER_API_KEY=y\nAGENTCHAT_LISTENER_API_KEY=z\nAGENTCHAT_API_KEY=\n')).toEqual(['AGENTCHAT_API_KEY', 'AGENTCHAT_LISTENER_API_KEY'])
+  })
 
   it('describeMcp says what an own run of each preset is given', () => {
     const claude = claudeCodePreset.describeMcp({ home, apiBase: 'https://api.example', profile: 'own' }).join('\n')
@@ -347,7 +391,8 @@ describe('Codex own: the user\'s config.toml decides; AgentChat adds only its MC
     const codex = codexPreset.describeMcp({ home, apiBase: 'https://api.example', profile: 'own', env: { CODEX_HOME: path.join(sandbox, '.codex') } }).join('\n')
     expect(codex).toContain('http_headers_helper')
     expect(codex).toContain(codexListenerHeadersHelperPath(home))
-    expect(codex).not.toContain('bearer_token_env_var')
+    expect(codex).not.toContain('-c mcp_servers.agentchat.bearer_token_env_var=')
+    expect(codex).toContain('no run while $CODEX_HOME/.env sets a key or the merged agentchat entry names bearer_token_env_var')
     // Without a profile: as before (the strict file; the bearer variable).
     expect(claudeCodePreset.describeMcp({ home, apiBase: 'https://api.example' }).join('\n')).toContain('--strict-mcp-config')
     expect(codexPreset.describeMcp({ home, apiBase: 'https://api.example', env: { CODEX_HOME: path.join(sandbox, '.codex') } }).join('\n')).toContain('bearer_token_env_var')

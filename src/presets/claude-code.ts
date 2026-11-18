@@ -873,7 +873,7 @@ export const claudeCodePreset: Preset = {
     return [
       `--mcp-config ${claudeMcpConfigPath(home)} (owner-only): ${CLAUDE_MCP_SERVER_NAME} → ${hostedMcpUrl(apiBase)}, Authorization: Bearer <this home's key>, X-AgentChat-Client: claude-code`,
       profile === 'own'
-        ? `own: your other MCP servers load too (the file is not made the only one); this file's ${CLAUDE_MCP_SERVER_NAME} is used in place of any ${CLAUDE_MCP_SERVER_NAME} your own configuration registers`
+        ? `own: your other MCP servers load too (the file is not made the only one); this file's ${CLAUDE_MCP_SERVER_NAME} is used in place of a user-scope ${CLAUDE_MCP_SERVER_NAME} (verified); a project- or local-scope one is not covered`
         : '--strict-mcp-config: no other MCP server (user, project or plugin) is loaded in these runs',
     ]
   },

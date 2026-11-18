@@ -80,6 +80,8 @@ export {
   codexAnswerFallbackWorkdir,
   codexServerNameAddressable,
   parseCodexMcpList,
+  codexAgentchatExplicitAuth,
+  codexDotEnvKeyNames,
   codexMcpDisableArgs,
   CODEX_MCP_LIST_TIMEOUT_MS,
   CODEX_MCP_LIST_MAX_AGE_MS,
