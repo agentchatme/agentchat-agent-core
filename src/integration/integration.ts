@@ -361,6 +361,7 @@ export class Integration {
       updated_at: new Date().toISOString(),
       pid: process.pid,
       runtime: this.options.runner.name,
+      runtime_label: this.options.runner.label ?? null,
       handle: this.options.cfg.handle,
       profile: this.options.profile,
       workdir: this.options.cfg.workdir,

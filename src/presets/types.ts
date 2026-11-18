@@ -68,9 +68,11 @@ export interface Preset {
   /**
    * The hosted-tool configuration a listener's run of this preset sees, as
    * lines for `doctor` (keys never printed): what the run is given, and what
-   * of the user's own configuration still applies.
+   * of the user's own configuration still applies. `profile` is the
+   * listener's (`own` changes what is given); absent, the lines are those of
+   * the other profiles.
    */
-  describeMcp(ctx: { readonly home: string; readonly apiBase: string; readonly env?: NodeJS.ProcessEnv }): string[]
+  describeMcp(ctx: { readonly home: string; readonly apiBase: string; readonly env?: NodeJS.ProcessEnv; readonly profile?: RunProfile }): string[]
   /** Variables a service must capture for this runtime (where it keeps its config, when relocated). */
   readonly serviceEnv: readonly string[]
   /** Whether the run can read files under the identity home (decides how the manual is pointed to). */

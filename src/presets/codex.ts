@@ -6,6 +6,7 @@ import { hostedMcpUrl } from '../integration/mcp-probe.js'
 import { workdirExposesHome, type RunProfile } from '../integration/profile.js'
 import type { RunOutcome, RunPreflight, RunPreflightOptions, RunRequest, RunRunner } from '../integration/runner.js'
 import { killProcessTree, redactDiagnostic, spawnRun } from '../integration/spawn-run.js'
+import { atomicWriteFile } from '../util/fsutil.js'
 import { log } from '../util/log.js'
 import { spawnCommand } from '../util/spawn.js'
 import { runProbe } from '../util/probe.js'
@@ -42,6 +43,22 @@ import { withoutInheritedKey, withoutParentSession, type Preset, type PresetCont
 // key itself), with `default_tools_approval_mode = "approve"` so they never
 // prompt (with `approval_policy = "never"`, an MCP tool call that needs
 // approval is denied: codex-rs/core/src/mcp_tool_call.rs).
+//
+// `own` — the agent itself — passes no `--sandbox`, no `approval_policy`, no
+// `--disable` and no permission profile: the user's config.toml (and its
+// profiles, project layers and requirements) decides the sandbox, the web,
+// the tools and the instructions, as in their own `codex exec` runs. Nothing
+// waits on an approval all the same: `codex exec` sets `approval_policy =
+// "never"` itself unless the user's config hands approvals to Codex's
+// auto-review (a model, not a person), and it rejects every approval,
+// permission or user-input request a run makes instead of waiting
+// (exec/src/lib.rs at rust-v0.154.0: the headless `AskForApproval::Never`
+// override, `build_exec_config`, `handle_server_request`; verified on the real
+// 0.154.0 with `approval_policy = "on-request"` in the user's config: an
+// escalation was rejected at once). The only `-c` keys are AgentChat's own
+// server's (`mcp_servers.agentchat.*`). Codex's sandboxes restrict writes and
+// the network, never reads, so an `own` run's shell can read any file the
+// user can — the identity home's `credentials` included (README, known limits).
 //
 // `answer` — started by any peer's message — must read nothing outside its
 // workdir and have no way out but the AgentChat tools. Codex can restrict a
@@ -157,6 +174,9 @@ export const CODEX_ANSWER_DISABLED_FEATURES = [
 
 export function codexProfileArgs(profile: RunProfile): string[] {
   switch (profile) {
+    // The agent itself: nothing but the run's shape (see the header).
+    case 'own':
+      return []
     case 'answer':
       return [
         '-c',
@@ -187,6 +207,13 @@ export function codexProfileArgs(profile: RunProfile): string[] {
 export interface CodexMcpOverride {
   readonly url: string
   readonly keyEnv: string
+  /**
+   * A headers helper command (`http_headers_helper`) in place of the bearer
+   * variable: the run's environment then carries no key. A listener's `own`
+   * runs use one (`codexListenerHeadersHelperPath`): with the user's own
+   * shell, an environment variable is one `env` away.
+   */
+  readonly headersHelper?: string
   /** The version named in `X-AgentChat-Client-Version` (the front door that placed the run). Defaults to this engine's. */
   readonly clientVersion?: string
 }
@@ -216,7 +243,7 @@ export function codexMcpOverrideArgs(override: CodexMcpOverride): string[] {
     '-c',
     `${table}.url=${JSON.stringify(override.url)}`,
     '-c',
-    `${table}.bearer_token_env_var=${JSON.stringify(override.keyEnv)}`,
+    override.headersHelper !== undefined ? `${table}.http_headers_helper=${JSON.stringify(override.headersHelper)}` : `${table}.bearer_token_env_var=${JSON.stringify(override.keyEnv)}`,
     '-c',
     `${table}.default_tools_approval_mode="approve"`,
     '-c',
@@ -270,13 +297,17 @@ export interface CodexRunnerOptions {
   readonly env?: NodeJS.ProcessEnv
   /** Test seam: how long `codex mcp list` may take (`CODEX_MCP_LIST_TIMEOUT_MS`). */
   readonly mcpListTimeoutMs?: number
+  /** Why no run may start (preflight and every run say it); absent: runs start. */
+  readonly refuse?: string
 }
 
 /**
- * The folder an `answer` run works in when its configured workdir is the
- * user's home folder or contains it (`workdirExposesHome`): an empty folder of
- * its own under CODEX_HOME. The run keeps working — it only cannot reach the
- * user's files through its workspace root.
+ * The folder an `own` or `answer` run works in when its configured workdir is
+ * the user's home folder or contains it (`workdirExposesHome`): an empty folder
+ * of its own under CODEX_HOME. The run keeps working — it only cannot reach the
+ * user's files through its workspace root. An `own` run needs this as much: a
+ * user's `workspace-write` sandbox would let a peer-started run write anywhere
+ * under the workspace root, which would be the whole home.
  */
 export function codexAnswerFallbackWorkdir(codexHome: string): string {
   return path.join(codexHome, 'agentchat-answer-workdir')
@@ -410,6 +441,7 @@ function codexListingKey(files: readonly string[], parts: readonly string[]): st
 
 export class CodexRunner implements RunRunner {
   readonly name = 'codex'
+  readonly label = 'Codex'
   private readonly command: string
   private warnedHome = false
   /** The last good listing and what it depended on: a stranger's DM does not cost a listing (and its contacts to the user's MCP hosts) on every run. */
@@ -421,22 +453,23 @@ export class CodexRunner implements RunRunner {
 
   /**
    * Where this runner's runs work (`-C`): the configured workdir, except that an
-   * `answer` run never has the home folder or above it as its workspace root —
-   * it gets `codexAnswerFallbackWorkdir`.
+   * `own` or `answer` run never has the home folder or above it as its
+   * workspace root — it gets `codexAnswerFallbackWorkdir`.
    */
   workdir(): string {
-    if (this.options.profile === 'answer' && workdirExposesHome(this.options.workdir)) return codexAnswerFallbackWorkdir(this.options.codexHome)
+    if ((this.options.profile === 'answer' || this.options.profile === 'own') && workdirExposesHome(this.options.workdir)) return codexAnswerFallbackWorkdir(this.options.codexHome)
     return this.options.workdir
   }
 
   async preflight(options: RunPreflightOptions = {}): Promise<RunPreflight> {
+    if (this.options.refuse !== undefined) return { ok: false, detail: this.options.refuse }
     const runtime = await inspectCodexRuntime(this.options.codexHome, this.command, CODEX_PROBE_TIMEOUT_MS, options.signal)
     if (!runtime.ok) return { ok: false, detail: runtime.detail }
     const auth = await codexIsLoggedIn(this.options.codexHome, this.command, CODEX_PROBE_TIMEOUT_MS, options.signal)
     if (!auth.ok) return { ok: false, detail: `codex login status failed: ${auth.detail}` }
     if (this.workdir() !== this.options.workdir && !this.warnedHome) {
       this.warnedHome = true
-      log.warn(`the run workdir ${this.options.workdir} is your home folder or contains it: answer runs work in ${this.workdir()} instead, so a peer-started run reaches none of your files there. Point the workdir at a folder of its own to choose another.`)
+      log.warn(`the run workdir ${this.options.workdir} is your home folder or contains it: ${this.options.profile} runs work in ${this.workdir()} instead, so a peer-started run reaches none of your files there. Point the workdir at a folder of its own to choose another.`)
     }
     fs.mkdirSync(this.workdir(), { recursive: true })
     if (this.options.profile === 'answer') {
@@ -457,10 +490,21 @@ export class CodexRunner implements RunRunner {
     return [...args.slice(0, -1), ...codexPinnedUrlArgs(this.options.pinMcpUrl), CODEX_PROMPT_FROM_STDIN]
   }
 
-  /** The child environment: Codex's home and the key the hosted server needs, under the configured name. */
+  /**
+   * The child environment: Codex's home and the key the hosted server needs,
+   * under the configured name. An `own` run gets no key at all — not the
+   * configured one, not an `AGENTCHAT_API_KEY` the daemon inherited: it has
+   * the user's own shell, and Codex hands a run's commands its environment.
+   * Its hosted server authenticates through a headers helper instead.
+   */
   env(): NodeJS.ProcessEnv {
     // Nothing of a parent Claude Code or Codex session, in every profile.
     const env: NodeJS.ProcessEnv = { ...withoutParentSession(this.options.env ?? process.env), CODEX_HOME: this.options.codexHome }
+    if (this.options.profile === 'own') {
+      delete env['AGENTCHAT_API_KEY']
+      delete env[this.options.keyEnv]
+      return env
+    }
     const key = this.options.apiKey()
     if (key !== null) env[this.options.keyEnv] = key
     return env
@@ -555,6 +599,7 @@ export class CodexRunner implements RunRunner {
 
   async start(request: RunRequest): Promise<RunOutcome> {
     const startedAt = Date.now()
+    if (this.options.refuse !== undefined) return { state: 'not_started', exitCode: null, durationMs: 0, detail: this.options.refuse }
     let args = this.args()
     if (this.options.profile === 'answer') {
       // Fail closed: an answer run starts only with every MCP server but AgentChat's switched off.
@@ -578,6 +623,60 @@ export class CodexRunner implements RunRunner {
   }
 }
 
+// ─── A listener's own runs: the key from a headers helper, not the environment ─
+//
+// An `own` run has the user's own shell, and Codex hands a run's commands its
+// whole environment (`shell_environment_policy` inherits everything in
+// 0.154.0). So a listener's `own` runs carry no key there: `[mcp_servers.agentchat]`
+// gets `http_headers_helper` — "Local-only shell command that prints a JSON
+// object of dynamic HTTP headers" (codex-rs config/src/mcp_types.rs), run with
+// `sh -c` (`cmd /Q /D /C` on Windows) on each connection and again after a
+// 401/403, its `Authorization` used when the server names no bearer token
+// (rmcp-client/src/http_headers.rs) — and the helper reads the listener home's
+// `credentials` itself. The same mechanism the Codex integration places.
+
+/** Where a listener's `own` runs' headers helper lives: `<home>/presets/codex.mcp-headers.mjs` (owner-only; it holds no key). */
+export function codexListenerHeadersHelperPath(home: string): string {
+  return path.join(home, 'presets', `${CODEX_PRESET}.mcp-headers.mjs`)
+}
+
+/**
+ * The helper, byte for byte. It reads the `credentials` file of the home whose
+ * `presets/` it sits in and nothing else (no environment variable: the
+ * identity is the home's), prints `{"Authorization":"Bearer <key>"}`, or `{}`
+ * when there is no key, and never fails.
+ */
+export const CODEX_LISTENER_HEADERS_HELPER_SOURCE = [
+  "// Written by @agentchatme/agent-core for a listener's Codex runs. Codex runs this on each",
+  '// connection to the MCP server "agentchat" (its http_headers_helper) and sends what it prints',
+  '// as headers: the Authorization header for the key in the credentials file of this identity',
+  '// home, or nothing when there is none. It reads no environment variable. Do not edit: the',
+  '// listener rewrites it.',
+  "import { readFileSync } from 'node:fs'",
+  'let headers = {}',
+  'try {',
+  "  const creds = JSON.parse(readFileSync(new URL('../credentials', import.meta.url), 'utf8'))",
+  "  const key = creds !== null && typeof creds.api_key === 'string' ? creds.api_key.trim() : ''",
+  '  if (key.length >= 20 && !/\\s/.test(key)) headers = { Authorization: `Bearer ${key}` }',
+  '} catch {}',
+  'process.stdout.write(JSON.stringify(headers))',
+  '',
+].join('\n')
+
+/**
+ * The helper command: this Node and the script, each quoted for the shell
+ * Codex runs it in — single quotes on POSIX (`sh -c`; a `'` inside written as
+ * `'\\''`), double quotes on Windows (`cmd /C`). Null when a path holds what
+ * that quoting cannot carry (`"`, `%`, `$` or a backtick on Windows) or a line
+ * break anywhere.
+ */
+export function codexHeadersHelperCommand(script: string, node: string = process.execPath, platform: NodeJS.Platform = process.platform): string | null {
+  const paths = [node, script]
+  if (paths.some((p) => /[\r\n]/.test(p))) return null
+  if (platform === 'win32') return paths.some((p) => /["%$`]/.test(p)) ? null : paths.map((p) => `"${p}"`).join(' ')
+  return paths.map((p) => `'${p.replace(/'/g, `'\\''`)}'`).join(' ')
+}
+
 /**
  * The keys of `[mcp_servers.agentchat]` in a config.toml, or null when the
  * table is absent. Keys only — a value can be a secret. A line scan, not a
@@ -599,7 +698,7 @@ export function agentchatTableKeys(configToml: string): string[] | null {
 
 export const codexPreset: Preset = {
   name: CODEX_PRESET,
-  describeMcp({ apiBase, env = process.env }) {
+  describeMcp({ home, apiBase, env = process.env, profile }) {
     const file = path.join(codexHomeFrom(env), 'config.toml')
     let own: string[] | null = null
     try {
@@ -609,7 +708,9 @@ export const codexPreset: Preset = {
     }
     return [
       `-c mcp_servers.${CODEX_MCP_SERVER_NAME}.url="${hostedMcpUrl(apiBase)}"`,
-      `-c mcp_servers.${CODEX_MCP_SERVER_NAME}.bearer_token_env_var="${LISTENER_KEY_ENV}" (the key set in the run's environment, never on argv)`,
+      profile === 'own'
+        ? `-c mcp_servers.${CODEX_MCP_SERVER_NAME}.http_headers_helper=<node> ${codexListenerHeadersHelperPath(home)} (own: reads this home's credentials on each connection; no key in the run's environment or on argv)`
+        : `-c mcp_servers.${CODEX_MCP_SERVER_NAME}.bearer_token_env_var="${LISTENER_KEY_ENV}" (the key set in the run's environment, never on argv)`,
       `-c mcp_servers.${CODEX_MCP_SERVER_NAME}.default_tools_approval_mode="approve"`,
       `-c mcp_servers.${CODEX_MCP_SERVER_NAME}.http_headers={ "X-AgentChat-Client" = "codex", "X-AgentChat-Client-Version" = <the listener's version> } (names the runtime to the hosted tools)`,
       own === null
@@ -620,8 +721,9 @@ export const codexPreset: Preset = {
   label: 'Codex',
   runtime: 'codex',
   serviceEnv: ['CODEX_HOME'],
-  // `work` and `full` read the whole filesystem (an `answer` run reads only its
-  // workdir): true, because the field is one for every profile.
+  // `own`, `work` and `full` read the whole filesystem (Codex's sandboxes never
+  // restrict reads; an `answer` run reads only its workdir): true, because the
+  // field is one for every profile.
   readsIdentityHome: true,
   async inspect(env = process.env, command = 'codex') {
     const home = codexHomeFrom(env)
@@ -634,15 +736,29 @@ export const codexPreset: Preset = {
     // A key in the listener's own environment is not handed to its runs.
     const env = withoutInheritedKey(ctx.env ?? process.env)
     const apiKey = ctx.apiKey
-    return new CodexRunner({
+    const base = {
       codexHome: codexHomeFrom(env),
       workdir: ctx.workdir,
       profile: ctx.profile,
-      apiKey: () => apiKey,
       keyEnv: LISTENER_KEY_ENV,
-      mcp: { url: hostedMcpUrl(ctx.apiBase), keyEnv: LISTENER_KEY_ENV, clientVersion: ctx.clientVersion ?? VERSION },
       ...(ctx.command !== undefined ? { command: ctx.command } : {}),
       env,
-    })
+    }
+    const mcp = { url: hostedMcpUrl(ctx.apiBase), keyEnv: LISTENER_KEY_ENV, clientVersion: ctx.clientVersion ?? VERSION }
+    if (ctx.profile !== 'own') return new CodexRunner({ ...base, apiKey: () => apiKey, mcp })
+    // own: the user's shell is the run's, so no key in its environment — the
+    // helper reads this home's credentials (rewritten for every identity the
+    // listener serves; it holds no key).
+    const script = codexListenerHeadersHelperPath(ctx.home)
+    const helper = codexHeadersHelperCommand(script)
+    if (helper === null) {
+      return new CodexRunner({ ...base, apiKey: () => null, mcp, refuse: `the path of Node (${process.execPath}) or of ${script} holds a character a shell command cannot carry quoted: an own run would have its key in its environment instead` })
+    }
+    try {
+      atomicWriteFile(script, CODEX_LISTENER_HEADERS_HELPER_SOURCE, 0o600)
+    } catch (err) {
+      return new CodexRunner({ ...base, apiKey: () => null, mcp, refuse: `could not write the headers helper ${script}: ${err instanceof Error ? err.message : String(err)}` })
+    }
+    return new CodexRunner({ ...base, apiKey: () => null, mcp: { ...mcp, headersHelper: helper } })
   },
 }

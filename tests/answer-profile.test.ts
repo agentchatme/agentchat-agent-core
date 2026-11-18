@@ -17,8 +17,9 @@ import { installFakeClaude, installFakeCodex, readFakeRuns } from './helpers/fak
 
 // ─── The `answer` profile: what a peer-started run can reach ────────────────
 //
-// `answer` is the default, and an `answer` run is started by any unread
-// message — a stranger's cold DM included. Private data + untrusted input + a
+// `answer` is the lock — an explicit opt-in, and what a value of
+// AGENTCHAT_RUN_PROFILE that names no profile means — and an `answer` run is
+// started by any unread message, a stranger's cold DM included. Private data + untrusted input + a
 // way out is the leak; so an `answer` run gets the AgentChat tools, file reads
 // inside its own workdir, and nothing else: no web, no shell, no read outside
 // the workdir. These tests fail if any of that is ever widened.
