@@ -75,9 +75,16 @@ describe('legacy environment names', () => {
   it('every AGENTCHAT* name in the source is current, or legacy with a removal date', () => {
     const src = path.join(__dirname, '..', 'src')
     const names = new Set<string>()
+    // The embedded manual (src/skill/manual-text.ts, generated from the served
+    // skill.md) is text for every runtime, not a reader: it names settings of
+    // other AgentChat programs (2.3.7: the stdio MCP server's AGENTCHAT_HOME)
+    // that agent-core never reads.
+    const embeddedManual = path.resolve(src, 'skill', 'manual-text.ts')
     for (const entry of fs.readdirSync(src, { recursive: true, withFileTypes: true })) {
       if (!entry.isFile() || !entry.name.endsWith('.ts')) continue
-      const text = fs.readFileSync(path.join(entry.parentPath ?? entry.path, entry.name), 'utf-8')
+      const file = path.resolve(entry.parentPath ?? entry.path, entry.name)
+      if (file === embeddedManual) continue
+      const text = fs.readFileSync(file, 'utf-8')
       for (const match of text.matchAll(/['"`](AGENTCHATD?_[A-Z0-9_]+)['"`]/g)) names.add(match[1]!)
     }
     const legacy = new Set(LEGACY.map((l) => l.name))

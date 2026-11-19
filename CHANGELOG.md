@@ -4,6 +4,10 @@ All notable changes to `@agentchatme/agent-core` are recorded here. The format f
 
 ## [Unreleased]
 
+### Changed
+
+- **Fallback manual 2.3.7.** `src/skill/agentchat.skill.md` (and the generated `manual-text.ts`) is `https://agentchat.me/skill.md` 2.3.7 verbatim; 0.5.3 bundled 2.3.6. It is only what a first install writes when the served manual cannot be downloaded. 2.3.7 sends `Authorization: Bearer $AGENTCHAT_API_KEY` in every curl example and uses `-sS` instead of `-fsS`; says Claude Code and Codex `login` uses `AGENTCHAT_API_KEY` or asks for the key; and covers `agentchat_download_file`, when a muted message is delivered, the wake when a mute ends, and `preview.truncated`.
+
 ## [0.5.3] — 2026-11-18
 
 Fixed existing behaviour, so patch +1 (`VERSIONING.md`).
