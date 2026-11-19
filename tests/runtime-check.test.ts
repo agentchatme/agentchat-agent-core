@@ -10,7 +10,10 @@ import {
   RUNTIME_CHECK_SETTINGS,
   claudeCodePreset,
   claudeRuntimeCheckArgs,
+  claudeRuntimeCheckJudge,
   claudeRuntimeCheckWorkdir,
+  CODEX_ANSWER_DISABLED_FEATURES,
+  CODEX_RUNTIME_CHECK_DISABLED_FEATURES,
   codexPreset,
   codexRuntimeCheckArgs,
   codexRuntimeCheckWorkdir,
@@ -81,14 +84,15 @@ async function eventually(cond: () => boolean, ms: number): Promise<boolean> {
 describe('Claude Code: one `claude -p` with no tool of any kind', () => {
   it('the flags, pinned: no MCP server (strict, no config), no built-in tool, no hooks, never waiting; the key-store deny rules as on every run', () => {
     expect(claudeRuntimeCheckArgs(['/h', '/c/.claude.json'])).toEqual([
-      '-p', '--output-format', 'text', '--no-session-persistence',
+      '-p', '--output-format', 'json', '--no-session-persistence',
       '--strict-mcp-config',
       '--tools', '',
       '--permission-prompts', 'none',
-      '--settings', '{"disableAllHooks":true}',
+      '--settings', RUNTIME_CHECK_SETTINGS,
       ...(posix ? ['--disallowedTools', 'Read(//h),Read(//h/**),Read(//c/.claude.json),Read(//c/.claude.json/**)'] : []),
     ])
-    expect(JSON.parse(RUNTIME_CHECK_SETTINGS)).toEqual({ disableAllHooks: true })
+    // No hooks; CLAUDE.md and memory off again in the settings, as ANSWER_SETTINGS does (a settings file's env wins over the process's).
+    expect(JSON.parse(RUNTIME_CHECK_SETTINGS)).toEqual({ env: { CLAUDE_CODE_DISABLE_CLAUDE_MDS: '1', CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1' }, disableAllHooks: true })
     expect(claudeRuntimeCheckArgs()).not.toContain('--mcp-config')
   })
 
@@ -101,7 +105,7 @@ describe('Claude Code: one `claude -p` with no tool of any kind', () => {
       expect(await runner.checkRuntime!()).toEqual({ ok: true })
       const [check] = readFakeRuns(fake)
       expect(check?.stdin).toBe(RUNTIME_CHECK_PROMPT)
-      expect(check?.argv.slice(0, 9)).toEqual(['-p', '--output-format', 'text', '--no-session-persistence', '--strict-mcp-config', '--tools', '', '--permission-prompts', 'none'])
+      expect(check?.argv.slice(0, 9)).toEqual(['-p', '--output-format', 'json', '--no-session-persistence', '--strict-mcp-config', '--tools', '', '--permission-prompts', 'none'])
       expect(check?.argv).not.toContain('--mcp-config')
       expect(check?.argv).not.toContain('--allowedTools')
       expect(check?.mcpConfig).toBeNull()
@@ -127,6 +131,36 @@ describe('Claude Code: one `claude -p` with no tool of any kind', () => {
     const silent = new ClaudeRunner({ configDir: path.join(sandbox, '.claude'), workdir: path.join(sandbox, 'w'), profile: 'own', denyReadPaths: [home], env: withFake(fake, { FAKE_RUNTIME_RUN_MODE: 'silent' }) })
     expect(await silent.checkRuntime()).toEqual({ ok: false, detail: 'claude runtime check failed: exit 0 with nothing on stdout' })
   }, 20_000)
+
+  it('exit 0 is not enough: an error result (a usage limit, a low balance, an expired sign-in) or plain text is not ok, and its text is never in the detail', async () => {
+    const fake = installFakeClaude(sandbox)
+    const runner = (mode: string): ClaudeRunner =>
+      new ClaudeRunner({ configDir: path.join(sandbox, '.claude'), workdir: path.join(sandbox, 'w'), profile: 'own', denyReadPaths: [home], env: withFake(fake, { FAKE_RUNTIME_RUN_MODE: mode }) })
+    const errored = await runner('error_exit0').checkRuntime()
+    expect(errored).toEqual({
+      ok: false,
+      detail: 'claude runtime check failed: exit 0, but the result is not a success (type result, subtype success, is_error true, api_error_status 400, terminal_reason api_error)',
+    })
+    const text = await runner('text').checkRuntime()
+    expect(text).toEqual({ ok: false, detail: 'claude runtime check failed: exit 0, but its answer is not a JSON result' })
+    for (const r of [errored, text]) expect(r.detail).not.toContain('must be discarded')
+  }, 20_000)
+
+  it('the judge: success means type result, subtype success and is_error false — as Claude Code 2.1.328 prints them', () => {
+    // Shapes as seen against a stand-in provider (texts shortened): an answer, and an API error, which is
+    // `subtype: "success"` with `is_error: true` — so the subtype alone says nothing.
+    const answer = JSON.stringify({ type: 'result', subtype: 'success', is_error: false, api_error_status: null, terminal_reason: 'completed', num_turns: 1, result: 'OK', session_id: 's' })
+    const apiError = JSON.stringify({ type: 'result', subtype: 'success', is_error: true, api_error_status: 401, api_error_type: 'authentication_error', terminal_reason: 'api_error', result: 'Invalid API key · Fix external API key' })
+    expect(claudeRuntimeCheckJudge(`${answer}\n`)).toBeNull()
+    expect(claudeRuntimeCheckJudge(apiError)).toBe('the result is not a success (type result, subtype success, is_error true, api_error_status 401, terminal_reason api_error)')
+    expect(claudeRuntimeCheckJudge(JSON.stringify({ type: 'result', subtype: 'error_during_execution', is_error: true }))).toBe('the result is not a success (type result, subtype error_during_execution, is_error true)')
+    expect(claudeRuntimeCheckJudge(JSON.stringify({ type: 'result', subtype: 'success' }))).toBe('the result is not a success (type result, subtype success, is_error ?)')
+    expect(claudeRuntimeCheckJudge('OK')).toBe('its answer is not a JSON result')
+    expect(claudeRuntimeCheckJudge('[1]')).toBe('its answer is not a JSON result')
+    // A line before the result (a warning) does not hide it.
+    expect(claudeRuntimeCheckJudge(`a warning\n${answer}`)).toBeNull()
+    expect(claudeRuntimeCheckJudge(apiError)).not.toContain('Invalid API key')
+  })
 
   it('a check that hangs is stopped when its signal aborts: the process is killed and the answer is not ok', async () => {
     const fake = installFakeClaude(sandbox)
@@ -166,12 +200,23 @@ describe('Codex: one `codex exec` in an empty folder, read-only, with the AgentC
     expect(codexRuntimeCheckArgs('/c/check', 'https://api.example/mcp')).toEqual([
       'exec', '--json', '--skip-git-repo-check', '--ephemeral', '-C', '/c/check',
       '--sandbox', 'read-only',
+      '-c', 'model_reasoning_effort="low"',
+      '-c', 'web_search="disabled"',
+      '--disable', 'memories', '--disable', 'plugins', '--disable', 'apps',
       '-c', 'mcp_servers.agentchat.url="https://api.example/mcp"',
       '-c', 'mcp_servers.agentchat.enabled=false',
       '-',
     ])
     // Without a URL (config.toml defines the table, as such runs need), only the switch.
-    expect(codexRuntimeCheckArgs('/c/check')).toEqual(['exec', '--json', '--skip-git-repo-check', '--ephemeral', '-C', '/c/check', '--sandbox', 'read-only', '-c', 'mcp_servers.agentchat.enabled=false', '-'])
+    expect(codexRuntimeCheckArgs('/c/check')).toEqual([
+      'exec', '--json', '--skip-git-repo-check', '--ephemeral', '-C', '/c/check', '--sandbox', 'read-only',
+      '-c', 'model_reasoning_effort="low"', '-c', 'web_search="disabled"',
+      '--disable', 'memories', '--disable', 'plugins', '--disable', 'apps',
+      '-c', 'mcp_servers.agentchat.enabled=false', '-',
+    ])
+    // The same features an answer run turns off, at the 0.154.0 floor.
+    expect(CODEX_RUNTIME_CHECK_DISABLED_FEATURES).toEqual(['memories', 'plugins', 'apps'])
+    for (const feature of CODEX_RUNTIME_CHECK_DISABLED_FEATURES) expect(CODEX_ANSWER_DISABLED_FEATURES).toContain(feature)
   })
 
   for (const profile of ['own', 'answer', 'work', 'full'] as const) {

@@ -89,19 +89,32 @@ import { withoutInheritedKey, withoutParentSession, type Preset, type PresetCont
 // with a fixed prompt, the same binary and environment as the runs (no key in
 // it), in an empty folder of its own, and nothing to act with:
 //
+//   --output-format json        one result object (code.claude.com/docs/en/
+//                               headless.md, "Output formats": `type`,
+//                               `subtype`, `is_error`, `result`, …). The check
+//                               is ok only on exit 0 with `type: "result"`,
+//                               `subtype: "success"` and `is_error: false`
+//                               (`claudeRuntimeCheckJudge`). Seen on 2.1.328
+//                               against a stand-in provider: an API error (a
+//                               refusal, an invalid key, a low credit balance)
+//                               is `subtype: "success"` with `is_error: true`,
+//                               `api_error_status` set, and exit 1 — so
+//                               `subtype` alone is not enough.
 //   --strict-mcp-config (no --mcp-config)  no MCP server at all: not the
 //                               hosted AgentChat tools, not the user's.
 //   --tools ""                  no built-in tool ("" for none, `claude --help`).
 //   --permission-prompts none   nothing waits on a prompt.
-//   --settings {"disableAllHooks":true}  the user's hooks do not fire on a
-//                               health check (managed hooks still run).
+//   --settings RUNTIME_CHECK_SETTINGS  the user's hooks do not fire on a health
+//                               check (managed hooks still run), and no
+//                               instruction file or memory, re-asserted the way
+//                               `ANSWER_SETTINGS` does (a settings file's `env`
+//                               would override the process environment).
 //   CLAUDE_CODE_DISABLE_CLAUDE_MDS=1, CLAUDE_CODE_DISABLE_AUTO_MEMORY=1
-//                               no instruction file or memory in its context.
+//                               the same two, in the environment.
 //   --disallowedTools <the key-store deny rules>  as on every run.
 //
 // Verified on 2.1.328 against a stand-in model provider: the request carries
-// no tool; a provider error prints `API Error: …` on stdout and exits 1; an
-// answer prints it and exits 0.
+// no tool; an answer is exit 0 with the result above.
 
 export const CLAUDE_CODE_PRESET = 'claude-code'
 
@@ -426,10 +439,46 @@ export interface ClaudeRunArgOptions {
 
 /**
  * The `--settings` a runtime check is given: no hook of the user's (or a
- * workdir repository's) fires on a health check. A constant (`claude --help`:
- * a settings value that fails validation is silently ignored in print mode).
+ * workdir repository's) fires on a health check, and the two `ANSWER_ENV`
+ * switches again (a settings file's `env` overrides the process environment;
+ * `--settings` outranks user, project and local settings). A constant
+ * (`claude --help`: a settings value that fails validation is silently ignored
+ * in print mode). Every key exists at the 2.1.274 floor.
  */
-export const RUNTIME_CHECK_SETTINGS = JSON.stringify({ disableAllHooks: true })
+export const RUNTIME_CHECK_SETTINGS = JSON.stringify({
+  env: { CLAUDE_CODE_DISABLE_CLAUDE_MDS: '1', CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1' },
+  disableAllHooks: true,
+})
+
+/**
+ * Whether a runtime check's stdout (`--output-format json`) is a good answer:
+ * null when it is one result object with `type: "result"`, `subtype:
+ * "success"` and `is_error: false`; otherwise why not, in ids and flags only
+ * (`is_error`, `api_error_status`, `terminal_reason`), never the result text.
+ */
+export function claudeRuntimeCheckJudge(stdout: string): string | null {
+  const text = stdout.trim()
+  let parsed: unknown = null
+  for (const candidate of [text, text.split(/\r?\n/).filter((line) => line.trim().length > 0).at(-1) ?? '']) {
+    try {
+      parsed = JSON.parse(candidate)
+      break
+    } catch {
+      parsed = null
+    }
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return 'its answer is not a JSON result'
+  const r = parsed as Record<string, unknown>
+  if (r['type'] === 'result' && r['subtype'] === 'success' && r['is_error'] === false) return null
+  const facts = [
+    `type ${typeof r['type'] === 'string' ? r['type'] : '?'}`,
+    `subtype ${typeof r['subtype'] === 'string' ? r['subtype'] : '?'}`,
+    `is_error ${typeof r['is_error'] === 'boolean' ? String(r['is_error']) : '?'}`,
+    ...(typeof r['api_error_status'] === 'number' ? [`api_error_status ${r['api_error_status']}`] : []),
+    ...(typeof r['terminal_reason'] === 'string' && /^[a-z_]{1,40}$/.test(r['terminal_reason']) ? [`terminal_reason ${r['terminal_reason']}`] : []),
+  ]
+  return `the result is not a success (${facts.join(', ')})`
+}
 
 /**
  * The argv of a runtime check: one `claude -p` with no tool of any kind (no
@@ -441,7 +490,7 @@ export function claudeRuntimeCheckArgs(denyReadPaths: readonly string[] = []): s
   return [
     '-p',
     '--output-format',
-    'text',
+    'json',
     '--no-session-persistence',
     // No --mcp-config: with this flag, no MCP server loads at all.
     '--strict-mcp-config',
@@ -858,8 +907,9 @@ export class ClaudeRunner implements RunRunner {
    * Does the model answer right now, through this runner's binary, sign-in
    * and environment? One `claude -p` with a fixed prompt and no tool at all
    * (`claudeRuntimeCheckArgs`), in its own empty folder, with no key in its
-   * environment and no instruction file or memory in its context. Its output
-   * is discarded. Never throws.
+   * environment and no instruction file or memory in its context; ok only
+   * when its JSON result says success with no error (`claudeRuntimeCheckJudge`).
+   * Its output is read for that alone and never logged. Never throws.
    */
   async checkRuntime(options: RunPreflightOptions = {}): Promise<RunPreflight> {
     return runRuntimeCheck({
@@ -869,6 +919,8 @@ export class ClaudeRunner implements RunRunner {
       cwd: claudeRuntimeCheckWorkdir(this.options.configDir),
       // No key (runRuntimeCheck takes every key variable out); no instruction file or memory.
       env: { ...this.runEnv(), ...ANSWER_ENV },
+      // Exit 0 is not enough: the JSON result must say success with no error.
+      judge: claudeRuntimeCheckJudge,
       ...(options.signal !== undefined ? { signal: options.signal } : {}),
     })
   }

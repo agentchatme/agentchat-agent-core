@@ -46,8 +46,14 @@ export interface TextsStatus {
 }
 
 export interface IntegrationLastRun {
-  /** `conversation`: a run for one conversation; `invite`: for the pending invites; `wake`: one run for the whole tray. */
-  kind: 'wake' | 'invite' | 'conversation'
+  /**
+   * `invite`: a run for the pending invites; `wake` otherwise — a conversation
+   * run included, so a reader from before conversation runs still reads the
+   * file. `run_kind` says which.
+   */
+  kind: 'wake' | 'invite'
+  /** What the run was for: `conversation`, `invite`, or `wake` (one run for the tray). Absent in a file an older daemon wrote. */
+  run_kind?: 'wake' | 'invite' | 'conversation' | null
   /** A `conversation` run's conversation; null otherwise (absent in a file an older daemon wrote). */
   conversation_id?: string | null
   started_at: string
@@ -120,6 +126,8 @@ export interface IntegrationStatus {
    * fails. Null or absent from an older daemon.
    */
   failed_runs_in_a_row?: number | null
+  /** When the last run that got done ended; null before one, or absent from an older daemon. */
+  last_ok_run_at?: string | null
   /** Could not process: the kit's reports and the server's answers, and the conversations paused for this agent. Null or absent from an older daemon. */
   could_not_process?: IntegrationCouldNotProcess | null
 }
@@ -233,10 +241,12 @@ export const REPEATED_FAILED_CYCLES = 3
 
 // What is accepted on read: the current shape (version 2, `wakes`) and the
 // one before it (version 1, `knocks`, `last_run.kind: 'knock'`, `ack_negotiated`).
-// `kind` is any string, so a run kind a newer daemon adds does not make the
-// whole file unreadable here (it reads as `wake`).
+// `kind` and `run_kind` are any string, so a run kind a newer daemon adds does
+// not make the whole file unreadable here (`kind` reads as `wake`, an unknown
+// `run_kind` as none).
 const LastRunSchema = z.object({
   kind: z.string(),
+  run_kind: z.string().nullable().optional(),
   conversation_id: z.string().nullable().optional(),
   started_at: z.string(),
   ended_at: z.string(),
@@ -310,6 +320,7 @@ const StatusSchema = z
       .optional(),
     intake_paused: z.boolean().nullable().optional(),
     failed_runs_in_a_row: z.number().nullable().optional(),
+    last_ok_run_at: z.string().nullable().optional(),
     could_not_process: CouldNotProcessSchema.nullable().optional(),
   })
   .passthrough()
@@ -320,7 +331,15 @@ function normalize(raw: z.infer<typeof StatusSchema>): IntegrationStatus {
       ? null
       : {
           ...raw.last_run,
-          kind: RUN_KINDS.has(raw.last_run.kind) ? (raw.last_run.kind as IntegrationLastRun['kind']) : 'wake',
+          kind: raw.last_run.kind === 'invite' ? 'invite' : 'wake',
+          run_kind:
+            typeof raw.last_run.run_kind === 'string' && RUN_KINDS.has(raw.last_run.run_kind)
+              ? (raw.last_run.run_kind as NonNullable<IntegrationLastRun['run_kind']>)
+              : raw.last_run.kind === 'invite' || raw.last_run.kind === 'conversation'
+                ? raw.last_run.kind
+                : raw.last_run.kind === 'knock' || raw.last_run.kind === 'wake'
+                  ? 'wake'
+                  : null,
           conversation_id: raw.last_run.conversation_id ?? null,
         }
   return {
@@ -355,6 +374,7 @@ function normalize(raw: z.infer<typeof StatusSchema>): IntegrationStatus {
     unservable: raw.unservable ?? null,
     lease_errors: raw.lease_errors ?? null,
     failed_runs_in_a_row: raw.failed_runs_in_a_row ?? null,
+    last_ok_run_at: raw.last_ok_run_at ?? null,
     could_not_process: raw.could_not_process ?? null,
   }
 }
@@ -468,6 +488,18 @@ export function describeCouldNotProcessCounts(c: IntegrationCouldNotProcess, now
   return `could not process: ${parts.join('; ')} — since the daemon started`
 }
 
+/**
+ * Whether the last runtime check failed and nothing has got done since: a run
+ * that completed after the check says the runtime works again, and the failed
+ * check is history (the counts say it).
+ */
+export function runtimeCheckFailingNow(status: Pick<IntegrationStatus, 'could_not_process' | 'last_ok_run_at'> | null): boolean {
+  const last = status?.could_not_process?.last_runtime_check ?? null
+  if (last === null || last.ok) return false
+  const okAt = Date.parse(status?.last_ok_run_at ?? '')
+  return !(Number.isFinite(okAt) && okAt > Date.parse(last.at))
+}
+
 /** Runs in a row that did not get done, when that is a pattern (`REPEATED_FAILED_CYCLES` or more) and no runtime reason explains it; null otherwise. */
 export function repeatedFailedRuns(status: Pick<IntegrationStatus, 'failed_runs_in_a_row' | 'runs_failing' | 'unservable'> | null): number | null {
   const count = status?.failed_runs_in_a_row ?? 0
@@ -548,7 +580,7 @@ export function formatIntegrationStatus(status: IntegrationStatus | null, now = 
   if (status.last_run) {
     const r = status.last_run
     lines.push(
-      `  last run: ${r.kind}${r.conversation_id ? ` ${r.conversation_id}` : ''}, ${r.state}${r.exit_code !== null ? ` (exit ${r.exit_code})` : ''}, ${Math.round(r.duration_ms / 1000)} s, ended ${ago(Math.max(0, now - Date.parse(r.ended_at)))}${r.detail ? ` — ${r.detail}` : ''}`,
+      `  last run: ${r.run_kind ?? r.kind}${r.conversation_id ? ` ${r.conversation_id}` : ''}, ${r.state}${r.exit_code !== null ? ` (exit ${r.exit_code})` : ''}, ${Math.round(r.duration_ms / 1000)} s, ended ${ago(Math.max(0, now - Date.parse(r.ended_at)))}${r.detail ? ` — ${r.detail}` : ''}`,
     )
   } else {
     lines.push('  last run: none yet')

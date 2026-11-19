@@ -99,15 +99,35 @@ import { withoutInheritedKey, withoutParentSession, type Preset, type PresetCont
 //
 // The runtime check (`checkRuntime`, runtime-check.ts) is one `codex exec`
 // with a fixed prompt, the same binary, CODEX_HOME and environment as the runs
-// (no key in it), in an empty folder of its own (`-C`), `--ephemeral`, with
-// `--sandbox read-only` and the hosted AgentChat server switched off for it:
-// `-c mcp_servers.agentchat.url=<the runs' URL>` and `-c
-// mcp_servers.agentchat.enabled=false` (with the URL the table is valid
-// whether or not a config layer defines one). The user's config.toml still
+// (no key in it), in an empty folder of its own (`-C`), `--ephemeral`, closed
+// the way an `answer` run is where the 0.154.0 floor allows
+// (`codexRuntimeCheckArgs`):
+//
+//   --sandbox read-only             nothing written, no network for commands.
+//   -c model_reasoning_effort="low" a short answer fits the check's 45 s budget
+//                                   (the runs keep the user's effort).
+//   -c web_search="disabled", --disable memories, plugins, apps
+//                                   as an `answer` run: no web search, no local
+//                                   memory, no plugin-bundled servers or skills,
+//                                   no ChatGPT connectors.
+//   -c mcp_servers.agentchat.url=<the runs' URL>, -c mcp_servers.agentchat.enabled=false
+//                                   the hosted AgentChat server switched off
+//                                   (with the URL the table is valid whether or
+//                                   not a config layer defines one).
+//
+// The user's OTHER MCP servers still load: Codex 0.154.0 has no documented
+// switch that turns every MCP server off, and switching each off by name
+// (`-c mcp_servers.<name>.enabled=false`) needs the names first — a `codex
+// mcp list --json` per check, as an `answer` run does, which would add its own
+// time and failure to a 45 s probe whose prompt asks for no tool. Codex loads
+// `$CODEX_HOME/.env` itself: an AgentChat key that a Codex integration before
+// 0.5.3 left there is removed by the upgrade (and a listener's own runs do not
+// start while one is there, `ownAuthProblem`). The user's config.toml still
 // decides the model and its provider, as for the runs. Verified on 0.154.0
-// against a stand-in provider: those overrides parse with and without an
-// `agentchat` table in config.toml, no agentchat tool is offered, a provider
-// error exits 1 and an answer exits 0.
+// against a stand-in provider: these flags parse with and without an
+// `agentchat` table in config.toml; the model is offered no agentchat tool and
+// no web search, and is asked for low effort; a provider error exits 1 and an
+// answer exits 0.
 
 export const CODEX_PRESET = 'codex'
 
@@ -216,13 +236,17 @@ export function codexProfileArgs(profile: RunProfile): string[] {
   }
 }
 
+/** The features a runtime check turns off, as an `answer` run does (names at the 0.154.0 floor). */
+export const CODEX_RUNTIME_CHECK_DISABLED_FEATURES = ['memories', 'plugins', 'apps'] as const
+
 /**
  * The argv of a runtime check: `codex exec` in `dir` (an empty folder), the
- * read-only sandbox, no session files, and the hosted AgentChat server
- * switched off for it; the prompt on stdin, as for a run. `agentchatUrl` is
- * the URL the runs pin (with it, the `agentchat` table stays valid whether or
- * not a config layer defines one); without it a config layer must define the
- * table, as the runs need.
+ * read-only sandbox, no session files, low reasoning effort, no web search,
+ * memories, plugins or connectors, and the hosted AgentChat server switched
+ * off for it; the prompt on stdin, as for a run. `agentchatUrl` is the URL the
+ * runs pin (with it, the `agentchat` table stays valid whether or not a config
+ * layer defines one); without it a config layer must define the table, as the
+ * runs need.
  */
 export function codexRuntimeCheckArgs(dir: string, agentchatUrl?: string): string[] {
   const table = `mcp_servers.${CODEX_MCP_SERVER_NAME}`
@@ -235,6 +259,11 @@ export function codexRuntimeCheckArgs(dir: string, agentchatUrl?: string): strin
     dir,
     '--sandbox',
     'read-only',
+    '-c',
+    'model_reasoning_effort="low"',
+    '-c',
+    'web_search="disabled"',
+    ...CODEX_RUNTIME_CHECK_DISABLED_FEATURES.flatMap((feature) => ['--disable', feature]),
     ...(agentchatUrl !== undefined ? ['-c', `${table}.url=${JSON.stringify(agentchatUrl)}`] : []),
     '-c',
     `${table}.enabled=false`,

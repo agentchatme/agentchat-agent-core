@@ -28,6 +28,7 @@ import {
   formatIntegrationStatus,
   readIntegrationStatus,
   repeatedFailedRuns,
+  runtimeCheckFailingNow,
 } from '../integration/status.js'
 
 // ─── Identity commands, for exactly one agent ───────────────────────────────
@@ -1112,7 +1113,7 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
       const counts = describeCouldNotProcessCounts(cnp)
       if (paused !== null) {
         checks.push({ name: 'could-not-process', verdict: 'WARN', detail: paused.replace(/^could not process: /, '') })
-      } else if (lastCheck !== null && !lastCheck.ok) {
+      } else if (lastCheck !== null && runtimeCheckFailingNow(integration)) {
         checks.push({
           name: 'could-not-process',
           verdict: 'WARN',

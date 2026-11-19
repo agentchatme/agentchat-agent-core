@@ -1,6 +1,6 @@
 import * as fs from 'node:fs'
 import type { RunPreflight } from '../integration/runner.js'
-import { spawnRun } from '../integration/spawn-run.js'
+import { spawnRunCapturing } from '../integration/spawn-run.js'
 
 // ─── The runtime check: does the agent's AI answer right now? ───────────────
 //
@@ -14,12 +14,16 @@ import { spawnRun } from '../integration/spawn-run.js'
 // the conversation's failure would hide its messages.
 //
 // The check is one headless run of the runtime with a fixed prompt: no peer
-// content, no AgentChat tools (no hosted tool server at all), nothing a run
-// could act on, in an empty folder of its own. Its output is discarded like a
-// run's (`spawnRun` counts stdout, never keeps it): only "it answered" and a
-// bounded, redacted diagnostic come back. It is bounded so that its kill path
-// ends inside the engine's 60 s deadline, and it stops (its process group
-// killed) when the integration stops.
+// content, no AgentChat tools, nothing a run could act on, in an empty folder
+// of its own. Exit 0 with some text is not enough (a usage limit, a low
+// credit balance or an expired sign-in can print a sentence and still be no
+// answer): a runtime whose result says what happened is judged on it
+// (`judge`, e.g. Claude Code's JSON result). For that, the first
+// `RUNTIME_CHECK_OUTPUT_BYTES` of its stdout are kept for the check alone —
+// the prompt is ours, so it holds no peer content — read, and dropped; never
+// logged. Only "it answered" and a bounded, redacted diagnostic come back. It
+// is bounded so that its kill path ends inside the engine's 60 s deadline, and
+// it stops (its process group killed) when the integration stops.
 
 /** The fixed prompt: nothing from any peer, nothing to act on. */
 export const RUNTIME_CHECK_PROMPT = 'Reply with the single word OK.'
@@ -30,6 +34,9 @@ export const RUNTIME_CHECK_PROMPT = 'Reply with the single word OK.'
  * `RUNTIME_CHECK_DEADLINE_MS` (60 s).
  */
 export const RUNTIME_CHECK_BUDGET_MS = 45_000
+
+/** The most of a check's stdout kept for its `judge` (a result line is a few kB); more is not read. */
+export const RUNTIME_CHECK_OUTPUT_BYTES = 128 * 1024
 
 /** The name of the empty folder a runtime check runs in, beside the runtime's own config. */
 export const RUNTIME_CHECK_DIR = 'agentchat-runtime-check'
@@ -61,6 +68,12 @@ export interface RuntimeCheckSpec {
   /** Another variable this runtime's runs carry a key in (a Codex runner's `keyEnv`). */
   readonly keyEnv?: string
   readonly signal?: AbortSignal
+  /**
+   * Reads the runtime's answer (its stdout, bounded) after an exit 0: null
+   * when it is a good answer, else why not (ids and flags only, never the
+   * text). Absent: exit 0 with something on stdout is ok.
+   */
+  readonly judge?: (stdout: string) => string | null
   /** Test seam: `RUNTIME_CHECK_BUDGET_MS`. */
   readonly budgetMs?: number
 }
@@ -73,7 +86,7 @@ export async function runRuntimeCheck(spec: RuntimeCheckSpec): Promise<RunPrefli
   } catch (err) {
     return { ok: false, detail: `${spec.label} runtime check: could not create its folder ${spec.cwd}: ${err instanceof Error ? err.message : String(err)}` }
   }
-  const outcome = await spawnRun({
+  const { outcome, stdout } = await spawnRunCapturing({
     command: spec.command,
     args: spec.args,
     cwd: spec.cwd,
@@ -82,7 +95,8 @@ export async function runRuntimeCheck(spec: RuntimeCheckSpec): Promise<RunPrefli
     budgetMs: spec.budgetMs ?? RUNTIME_CHECK_BUDGET_MS,
     requireStdout: true,
     ...(spec.signal !== undefined ? { signal: spec.signal } : {}),
-  })
-  if (outcome.state === 'ok') return { ok: true }
-  return { ok: false, detail: `${spec.label} runtime check ${outcome.state.replace('_', ' ')}${outcome.detail ? `: ${outcome.detail}` : ''}` }
+  }, spec.judge !== undefined ? RUNTIME_CHECK_OUTPUT_BYTES : 0)
+  if (outcome.state !== 'ok') return { ok: false, detail: `${spec.label} runtime check ${outcome.state.replace('_', ' ')}${outcome.detail ? `: ${outcome.detail}` : ''}` }
+  const verdict = spec.judge === undefined ? null : spec.judge(stdout)
+  return verdict === null ? { ok: true } : { ok: false, detail: `${spec.label} runtime check failed: exit 0, but ${verdict}` }
 }

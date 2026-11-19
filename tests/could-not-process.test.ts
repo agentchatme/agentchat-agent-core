@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { AgentChatClient } from 'agentchatme'
+import { AgentChatClient, integration as kit } from 'agentchatme'
 import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
@@ -42,7 +42,7 @@ const KEY = 'ac_' + 'k'.repeat(32)
 const TEMPLATE = 'SERVED CONVERSATION RUN for <conversation_id> (generic): only this one.'
 const promptFor = (id: string): string => `SERVED CONVERSATION RUN for ${id} (generic): only this one.\n\n${POINTER}`
 
-type Ending = 'ok' | 'failed' | 'timed_out' | 'not_started' | 'never'
+type Ending = 'ok' | 'failed' | 'timed_out' | 'not_started' | 'never' | 'hold'
 type Check = 'ok' | 'fail' | 'hang'
 
 /** A runner whose runs end as scripted per conversation (default `ok`), with an optional runtime check. */
@@ -63,6 +63,11 @@ class ScriptedRunner implements RunRunner {
     this.requests.push(request)
     const ending = this.endings.get(request.conversationId ?? request.kind) ?? 'ok'
     if (ending === 'never') return new Promise<RunOutcome>(() => undefined)
+    if (ending === 'hold') {
+      // Runs until the integration stops it.
+      await new Promise<void>((resolve) => request.signal?.addEventListener('abort', () => resolve(), { once: true }))
+      return { state: 'failed', exitCode: null, durationMs: 1, detail: 'interrupted' }
+    }
     if (ending === 'ok') return { state: 'ok', exitCode: 0, durationMs: 1 }
     if (ending === 'timed_out') return { state: 'timed_out', exitCode: null, durationMs: 1, detail: 'run exceeded its 1 s budget and was killed' }
     if (ending === 'not_started') return { state: 'not_started', exitCode: 127, durationMs: 1, detail: 'exit 127 with nothing on stdout' }
@@ -144,8 +149,10 @@ describe('conversation runs reach the runner as conversation runs', () => {
     const logged = info.mock.calls.map(([line]) => String(line))
     expect(logged.some((line) => /^run start kind=conversation conv=conv_0 id=\S+ budget=60s$/.test(line))).toBe(true)
     expect(logged.some((line) => /^run ok kind=conversation conv=conv_1 id=\S+ /.test(line))).toBe(true)
-    expect(i.snapshot().last_run).toMatchObject({ kind: 'conversation', conversation_id: 'conv_1', state: 'ok' })
-    expect(readIntegrationStatus(home)?.last_run).toMatchObject({ kind: 'conversation', conversation_id: 'conv_1' })
+    // `kind` stays within what a status reader from before conversation runs knows; `run_kind` says it.
+    expect(i.snapshot().last_run).toMatchObject({ kind: 'wake', run_kind: 'conversation', conversation_id: 'conv_1', state: 'ok' })
+    expect(readIntegrationStatus(home)?.last_run).toMatchObject({ kind: 'wake', run_kind: 'conversation', conversation_id: 'conv_1' })
+    expect(i.snapshot().last_ok_run_at).toBe(i.snapshot().last_run?.ended_at)
     expect(formatIntegrationStatus(readIntegrationStatus(home)).join('\n')).toMatch(/last run: conversation conv_1, ok/)
     expect(i.snapshot().recent_cycles?.at(-1)?.outcome).toBe('runs_started')
   }, 10_000)
@@ -157,7 +164,7 @@ describe('conversation runs reach the runner as conversation runs', () => {
     await until(() => runner.requests.length === 1 && i.snapshot().runs_ok === 1, 5_000)
     expect(runner.requests[0]).toMatchObject({ kind: 'invite', prompt: `${textsFor('me').invite_prompt}\n\n${POINTER}` })
     expect(runner.requests[0]?.conversationId).toBeUndefined()
-    expect(i.snapshot().last_run).toMatchObject({ kind: 'invite', conversation_id: null })
+    expect(i.snapshot().last_run).toMatchObject({ kind: 'invite', run_kind: 'invite', conversation_id: null })
 
     double!.setTray({ waiting: 1, invites: ['inv_2'] })
     i.wake()
@@ -190,31 +197,66 @@ describe('conversation runs reach the runner as conversation runs', () => {
 })
 
 describe('a failed conversation run is reported with the outcome the runner saw', () => {
-  for (const [ending, outcome] of [
-    ['timed_out', 'timed_out'],
-    ['failed', 'failed'],
-  ] as const) {
-    it(`a run that ended ${ending} → reported as \`${outcome}\` through the card's anchor, with the runtime check as evidence`, async () => {
-      await serve({ tray: { waiting: 1 } })
-      const runner = new ScriptedRunner('ok')
-      runner.endings.set('conv_0', ending)
-      const i = await integration(runner)
-      await until(() => reports().length === 1, 5_000)
-      expect(reports()[0]).toMatchObject({ conversationId: 'conv_0', body: { through_message_id: 'msg_0', outcome, evidence: 'runtime_check' } })
-      expect(reports()[0]?.idempotencyKey).toBeTruthy()
-      await until(() => i.snapshot().could_not_process?.none === 1, 3_000)
-      expect(i.snapshot().could_not_process).toMatchObject({ runtime_check: true, reported: 1, none: 1, runtime_checks_ok: 1 })
-    }, 10_000)
-  }
-
-  it('a runner that never returns is abandoned at its deadline and counts as timed out (`timed_out` in the report)', async () => {
+  it('a run that failed → reported as `failed` through the card\'s anchor, with the runtime check as evidence', async () => {
     await serve({ tray: { waiting: 1 } })
     const runner = new ScriptedRunner('ok')
+    runner.endings.set('conv_0', 'failed')
+    const i = await integration(runner)
+    await until(() => reports().length === 1, 5_000)
+    expect(reports()[0]).toMatchObject({ conversationId: 'conv_0', body: { through_message_id: 'msg_0', outcome: 'failed', evidence: 'runtime_check' } })
+    expect(reports()[0]?.idempotencyKey).toBeTruthy()
+    await until(() => i.snapshot().could_not_process?.none === 1, 3_000)
+    expect(i.snapshot().could_not_process).toMatchObject({ runtime_check: true, reported: 1, none: 1, runtime_checks_ok: 1 })
+  }, 10_000)
+
+  // A timed-out run is reported on another conversation's completed run (the
+  // runtime check does not use the tools, hooks and memory a run does).
+  it('a run that timed out → `RunEnd.timedOut`, reported as `timed_out` once another conversation\'s run completed', async () => {
+    await serve({ tray: { waiting: 2 } })
+    const runner = new ScriptedRunner(null)
+    runner.endings.set('conv_0', 'timed_out')
+    const i = await integration(runner)
+    await until(() => reports().length === 1, 5_000)
+    expect(reports()[0]).toMatchObject({ conversationId: 'conv_0', body: { through_message_id: 'msg_0', outcome: 'timed_out', evidence: 'other_run_completed' } })
+    expect(i.snapshot()).toMatchObject({ runs_timed_out: 1, runs_ok: 1 })
+  }, 10_000)
+
+  it('a runner that never returns is abandoned at its deadline and counts as timed out (`timed_out` in the report)', async () => {
+    await serve({ tray: { waiting: 2 } })
+    const runner = new ScriptedRunner(null)
     runner.endings.set('conv_0', 'never')
     const i = await integration(runner, { budgetMs: 200, runnerDeadlineSlackMs: 100 })
     await until(() => reports().length === 1, 5_000)
-    expect(reports()[0]?.body).toMatchObject({ outcome: 'timed_out', evidence: 'runtime_check' })
+    expect(reports()[0]?.body).toMatchObject({ outcome: 'timed_out', evidence: 'other_run_completed' })
     expect(i.snapshot()).toMatchObject({ runs_timed_out: 1 })
+  }, 10_000)
+
+  it('a cycle whose conversations are all running is not an empty tray: logged as such, not counted as skipped', async () => {
+    const info = vi.spyOn(log, 'info')
+    await serve({ tray: { waiting: 1 } })
+    const runner = new ScriptedRunner(null)
+    runner.endings.set('conv_0', 'hold')
+    const i = await integration(runner)
+    await until(() => runner.requests.length === 1, 5_000)
+    i.wake()
+    await until(() => info.mock.calls.some(([line]) => String(line).startsWith('wake: nothing new to start')), 5_000)
+    const line = info.mock.calls.map(([l]) => String(l)).find((l) => l.startsWith('wake: nothing new to start'))
+    expect(line).toBe('wake: nothing new to start — 1 conversation(s) already running or waiting (1 card(s), 0 invite(s))')
+    expect(info.mock.calls.some(([l]) => String(l).includes('nothing owed'))).toBe(false)
+    expect(i.snapshot().runs_skipped_empty).toBe(0)
+    expect(runner.requests).toHaveLength(1)
+  }, 10_000)
+
+  it('a kit without the could-not-process block (an older SDK) does not stop the status write: zero counts', async () => {
+    const original = kit.ReceiveLoop.prototype.status
+    vi.spyOn(kit.ReceiveLoop.prototype, 'status').mockImplementation(function (this: kit.ReceiveLoop) {
+      const { processingFailures: _gone, ...rest } = original.call(this)
+      return rest as ReturnType<typeof original>
+    })
+    await serve({ tray: { waiting: 0 } })
+    const i = await integration(new ScriptedRunner('ok'))
+    expect(i.snapshot().could_not_process).toMatchObject({ reported: 0, awaiting_evidence: 0, last_runtime_check: null, runtime_check: true })
+    expect(readIntegrationStatus(home)?.could_not_process?.reported).toBe(0)
   }, 10_000)
 
   it('a run that did not start is not this conversation\'s failure: nothing is reported, no runtime check is spent', async () => {
@@ -422,15 +464,26 @@ describe('the status file: new fields read back; older and newer files still rea
     const old = { ...sample(), last_run: { kind: 'knock', started_at: 'x', ended_at: new Date().toISOString(), state: 'ok', exit_code: 0, duration_ms: 1, detail: null } }
     fs.writeFileSync(path.join(home, 'integration.status.json'), JSON.stringify(old))
     const read = readIntegrationStatus(home)
-    expect(read?.last_run).toMatchObject({ kind: 'wake', conversation_id: null })
+    expect(read?.last_run).toMatchObject({ kind: 'wake', run_kind: 'wake', conversation_id: null })
     expect(read?.could_not_process).toBeNull()
     expect(read?.failed_runs_in_a_row).toBeNull()
+    expect(read?.last_ok_run_at).toBeNull()
+  })
+
+  it('a conversation run is written with `kind: wake`, so a reader that knows only wake and invite (0.6.0 and before) still reads the file', () => {
+    const lastRun = { kind: 'wake' as const, run_kind: 'conversation' as const, conversation_id: 'conv_3', started_at: 'x', ended_at: new Date().toISOString(), state: 'ok' as const, exit_code: 0, duration_ms: 1, detail: null }
+    writeIntegrationStatus(home, sample({ last_run: lastRun }))
+    const written = JSON.parse(fs.readFileSync(path.join(home, 'integration.status.json'), 'utf-8')) as { last_run: { kind: string } }
+    // The 0.6.0 reader's enum.
+    expect(['wake', 'invite', 'knock']).toContain(written.last_run.kind)
+    expect(readIntegrationStatus(home)?.last_run).toMatchObject({ kind: 'wake', run_kind: 'conversation', conversation_id: 'conv_3' })
+    expect(formatIntegrationStatus(readIntegrationStatus(home)).join('\n')).toContain('last run: conversation conv_3, ok')
   })
 
   it('a run kind a newer daemon adds does not make the file unreadable (it reads as `wake`)', () => {
     const newer = { ...sample(), last_run: { kind: 'something-new', started_at: 'x', ended_at: new Date().toISOString(), state: 'ok', exit_code: 0, duration_ms: 1, detail: null } }
     fs.writeFileSync(path.join(home, 'integration.status.json'), JSON.stringify(newer))
-    expect(readIntegrationStatus(home)?.last_run?.kind).toBe('wake')
+    expect(readIntegrationStatus(home)?.last_run).toMatchObject({ kind: 'wake', run_kind: null })
   })
 
   it('the could-not-process block round-trips; nothing to say says nothing', () => {
@@ -447,7 +500,7 @@ describe('the status file: new fields read back; older and newer files still rea
   it('runs that keep failing with no runtime reason found are a warning (conversation-run cycles only say runs_started)', () => {
     const failing = sample({
       failed_runs_in_a_row: 3,
-      last_run: { kind: 'conversation', conversation_id: 'conv_9', started_at: 'x', ended_at: new Date().toISOString(), state: 'failed', exit_code: 1, duration_ms: 1000, detail: 'exit 1' },
+      last_run: { kind: 'wake', run_kind: 'conversation', conversation_id: 'conv_9', started_at: 'x', ended_at: new Date().toISOString(), state: 'failed', exit_code: 1, duration_ms: 1000, detail: 'exit 1' },
     })
     expect(repeatedFailedRuns(failing)).toBe(3)
     expect(formatIntegrationStatus(failing).join('\n')).toContain('WARNING: the last 3 runs did not get done (latest: failed — exit 1); the cards stay on the tray')
@@ -488,6 +541,20 @@ describe('doctor says it too', () => {
   it('a runtime check that fails is a warning: failures are then not reported as a conversation\'s', async () => {
     const out = await doctor(sample({ could_not_process: block({ runtime_checks_failed: 1, last_runtime_check: { at: '2026-11-19T10:00:00.000Z', ok: false, detail: 'claude runtime check failed: exit 1' } }) }))
     expect(out).toContain('WARN could-not-process: the runtime check failed (claude runtime check failed: exit 1; 2026-11-19T10:00:00.000Z): while it fails, a conversation whose run fails is not reported')
+    // A run that got done before the check does not clear it.
+    const before = await doctor(sample({ last_ok_run_at: '2026-11-19T09:59:00.000Z', could_not_process: block({ runtime_checks_failed: 1, last_runtime_check: { at: '2026-11-19T10:00:00.000Z', ok: false, detail: 'x' } }) }))
+    expect(before).toContain('WARN could-not-process: the runtime check failed')
+  })
+
+  it('a failed check followed by a run that got done is history: PASS with the counts', async () => {
+    const out = await doctor(
+      sample({
+        last_ok_run_at: '2026-11-19T10:05:00.000Z',
+        could_not_process: block({ runtime_checks_failed: 1, last_runtime_check: { at: '2026-11-19T10:00:00.000Z', ok: false, detail: 'claude runtime check failed: exit 1' } }),
+      }),
+    )
+    expect(out).not.toContain('WARN could-not-process')
+    expect(out).toContain('PASS could-not-process: 0 report(s) answered (0 retry, 0 hidden, 0 paused, 0 nothing to do); runtime check 0 ok, 1 failed (last: failed')
   })
 
   it('reports and answers with nothing paused pass, with the counts; nothing at all says nothing', async () => {
@@ -501,7 +568,7 @@ describe('doctor says it too', () => {
     const out = await doctor(
       sample({
         failed_runs_in_a_row: 4,
-        last_run: { kind: 'conversation', conversation_id: 'conv_y', started_at: 'x', ended_at: new Date().toISOString(), state: 'timed_out', exit_code: null, duration_ms: 600_000, detail: 'run exceeded its 600 s budget and was killed' },
+        last_run: { kind: 'wake', run_kind: 'conversation', conversation_id: 'conv_y', started_at: 'x', ended_at: new Date().toISOString(), state: 'timed_out', exit_code: null, duration_ms: 600_000, detail: 'run exceeded its 600 s budget and was killed' },
       }),
     )
     expect(out).toContain('WARN runs: the last 4 runs did not get done (latest: timed_out — run exceeded its 600 s budget and was killed); the cards stay on the tray')

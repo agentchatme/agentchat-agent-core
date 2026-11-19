@@ -44,7 +44,8 @@ import { describeManualSync, type ManualFetch } from '../skill/served-manual.js'
 //     instruction, as before; a tray that cannot be read starts it anyway.
 //     A run records its own verdicts; nothing is recorded on its behalf;
 //   * could not process — a conversation's run that failed or timed out
-//     while the runtime otherwise works (another run completed since, or the
+//     while the runtime otherwise works (another conversation's run completed
+//     since, or — for a run that failed, not one that timed out — the
 //     runner's `checkRuntime`, a minimal model call, passes) is reported; the
 //     server answers retry, hidden (the span is shown to this agent as a
 //     note), paused (a 24 h mute) or none, and the kit follows it once;
@@ -146,6 +147,24 @@ export interface IntegrationOptions {
   readonly runtimeCheckDeadlineMs?: number
 }
 
+type ProcessingFailureCounts = ReturnType<kit.ReceiveLoop['status']>['processingFailures']
+
+/** The kit's could-not-process counts when it keeps none (a kit from before could not process). */
+const NO_PROCESSING_FAILURES: ProcessingFailureCounts = {
+  reported: 0,
+  retry: 0,
+  hidden: 0,
+  paused: 0,
+  none: 0,
+  reportErrors: 0,
+  reruns: 0,
+  rerunsCapped: 0,
+  awaitingEvidence: 0,
+  runtimeChecksOk: 0,
+  runtimeChecksFailed: 0,
+  lastRuntimeCheck: null,
+} as ProcessingFailureCounts
+
 /** Most of a failure line: enough to diagnose, bounded for the status file. */
 const CYCLE_FAILURE_CHARS = 240
 
@@ -225,6 +244,8 @@ export class Integration {
   private runsNotStarted = 0
   private runsSkippedEmpty = 0
   private lastRun: IntegrationLastRun | null = null
+  /** When the last run that got done ended (`last_ok_run_at`). */
+  private lastOkRunAt: string | null = null
   /** The newest wake since the last run started (for `RunRequest.wake`). */
   private pendingWake: RunWake | null = null
   /** The rung of the newest `unanswered` wake frame (the kit's wake event does not carry it). */
@@ -429,6 +450,7 @@ export class Integration {
       runs_skipped_empty: this.runsSkippedEmpty,
       last_run: this.lastRun,
       failed_runs_in_a_row: this.failingRuns,
+      last_ok_run_at: this.lastOkRunAt,
       could_not_process: this.couldNotProcess(status),
       // No local retry ladder (the server re-wakes, D3); kept for older readers.
       retry_rung: 0,
@@ -518,7 +540,9 @@ export class Integration {
     }
 
     this.lastRun = {
-      kind,
+      // Readers from before conversation runs know only `wake` and `invite`.
+      kind: kind === 'invite' ? 'invite' : 'wake',
+      run_kind: kind,
       conversation_id: conversationId ?? null,
       started_at: new Date(startedAt).toISOString(),
       ended_at: new Date().toISOString(),
@@ -530,6 +554,7 @@ export class Integration {
     switch (outcome.state) {
       case 'ok':
         this.runsOk += 1
+        this.lastOkRunAt = this.lastRun.ended_at
         log.info(`run ok ${subject} ${Math.round(outcome.durationMs / 1000)}s (output discarded; any send was the agent's own hosted-tool call)`)
         // A conversation that ran is not paused (any more).
         if (conversationId !== undefined) this.paused.clear(conversationId)
@@ -604,7 +629,8 @@ export class Integration {
 
   /** The kit's could-not-process counts and the paused conversations, as the status file keeps them. */
   private couldNotProcess(status: ReturnType<kit.ReceiveLoop['status']>): IntegrationCouldNotProcess {
-    const f = status.processingFailures
+    // A kit from before could not process has no such block: zero, never a throw (the status write runs at start).
+    const f = (status as { processingFailures?: ProcessingFailureCounts }).processingFailures ?? NO_PROCESSING_FAILURES
     return {
       runtime_check: this.options.runner.checkRuntime !== undefined,
       reported: f.reported,
@@ -706,17 +732,23 @@ export class Integration {
         log.debug(`own echo${event.conversationId ? ` in ${event.conversationId}` : ''} — not a wake`)
         break
       case 'cycle': {
-        const { outcome, cards, invites } = event.summary
-        if (outcome === 'empty' || outcome === 'nothing_owed') {
+        const { outcome, cards, invites, heldByTurns, paced } = event.summary
+        if (outcome === 'nothing_owed' && (heldByTurns > 0 || paced > 0)) {
+          // Conversation runs: everything owed is running, waiting for its
+          // turn, or paced after a run that just looked. Not an empty tray.
+          log.info(
+            `wake: nothing new to start — ${heldByTurns} conversation(s) already running or waiting${paced > 0 ? `, ${paced} paced after a recent run` : ''} (${cards} card(s), ${invites} invite(s))`,
+          )
+        } else if (outcome === 'empty' || outcome === 'nothing_owed') {
           this.runsSkippedEmpty += 1
-          log.info(`wake: ${outcome === 'empty' ? 'the tray is empty' : 'nothing owed (muted cards only)'} — no run (${cards} card(s), ${invites} invite(s))`)
+          log.info(`wake: ${outcome === 'empty' ? 'the tray is empty' : 'nothing owed (muted or notices-only cards)'} — no run (${cards} card(s), ${invites} invite(s))`)
         } else if (outcome === 'abandoned') {
           log.warn(`wake cycle abandoned by the watchdog: ${event.summary.failure ?? 'it ran past its deadline'} — the next wake starts a new one`)
         } else if (outcome === 'texts_missing') {
           this.runsNotStarted += 1
           log.warn('no served texts in hand: GET /v1/texts has not answered yet and nothing is cached in the identity home — no run this time')
         } else if (outcome === 'runs_started') {
-          const { turnsStarted, turnsQueued, heldByTurns, paced } = event.summary
+          const { turnsStarted, turnsQueued } = event.summary
           log.info(
             `wake: ${turnsStarted + turnsQueued} run(s) for ${cards} card(s), ${invites} invite(s) — ${turnsStarted} started, ${turnsQueued} queued (one at a time)${
               heldByTurns > 0 ? `; ${heldByTurns} conversation(s) already running or waiting` : ''

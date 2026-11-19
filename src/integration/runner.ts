@@ -131,7 +131,10 @@ export interface RunRunner {
    * during a provider outage. Asked by the kit after a conversation's run
    * failed when no other run has completed since: `ok` is the evidence a
    * could-not-process report needs (the runtime works, so the failure is that
-   * conversation's). Bounded by the engine (`RUNTIME_CHECK_DEADLINE_MS`), and
+   * conversation's). A timed-out run is reported only once another run
+   * completed, never on this check alone: the check does not use the hosted
+   * tools, hooks or memory a run uses. Bounded by the engine
+   * (`RUNTIME_CHECK_DEADLINE_MS`), and
    * killed with everything it started when `signal` aborts. Never throws; its
    * output is discarded, never logged.
    *

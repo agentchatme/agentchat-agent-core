@@ -175,6 +175,7 @@ export {
   describePausedConversations,
   describeCouldNotProcessCounts,
   repeatedFailedRuns,
+  runtimeCheckFailingNow,
   FAILED_CYCLE_OUTCOMES,
   REPEATED_FAILED_CYCLES,
   failedCyclesInARow,
