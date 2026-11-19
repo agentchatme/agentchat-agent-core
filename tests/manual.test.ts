@@ -28,7 +28,7 @@ describe('the bundled manual (the fallback for a skill file that cannot be downl
     // copy is only what a first install writes when it cannot download one.
     // Refresh it at release time with the two-command refresh (README §
     // Refreshing the bundled manual) so the fallback is never far behind.
-    expect(manualVersion()).toBe('2.3.6')
+    expect(manualVersion()).toBe('2.3.7')
   })
 
   it('is the main line’s text, not a per-host rendering: what it says about one integration it says about all', () => {
