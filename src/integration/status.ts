@@ -3,7 +3,7 @@ import * as path from 'node:path'
 import { z } from 'zod'
 import { atomicWriteFile, readJsonFile } from '../util/fsutil.js'
 import { log } from '../util/log.js'
-import { runProfileWarning, workdirExposesHome } from './profile.js'
+import { describeRunProfile, workdirExposesHome } from './profile.js'
 
 // ─── Integration status, for `status` and `doctor` ──────────────────────────
 //
@@ -59,6 +59,8 @@ export interface IntegrationStatus {
   updated_at: string
   pid: number
   runtime: string | null
+  /** The runtime's name for people (`RunRunner.label`), as `status` says it; absent in a file an older daemon wrote. */
+  runtime_label?: string | null
   handle: string | null
   profile: string
   /** The run workdir the daemon was given (absent in a file an older daemon wrote). */
@@ -201,6 +203,7 @@ const StatusSchema = z
     updated_at: z.string(),
     pid: z.number(),
     runtime: z.string().nullable(),
+    runtime_label: z.string().nullable().optional(),
     handle: z.string().nullable(),
     profile: z.string(),
     workdir: z.string().optional(),
@@ -242,6 +245,7 @@ function normalize(raw: z.infer<typeof StatusSchema>): IntegrationStatus {
     updated_at: raw.updated_at,
     pid: raw.pid,
     runtime: raw.runtime,
+    ...(raw.runtime_label !== undefined ? { runtime_label: raw.runtime_label } : {}),
     handle: raw.handle,
     profile: raw.profile,
     ...(raw.workdir !== undefined ? { workdir: raw.workdir } : {}),
@@ -340,7 +344,6 @@ export function formatIntegrationStatus(status: IntegrationStatus | null, now = 
   if (status === null) return ['Integration: no status recorded yet (the daemon has not run, or is still starting)']
   const age = integrationStatusAge(status, now)
   const stale = age !== null && age > 3 * 60_000
-  const profileWarning = runProfileWarning(status.profile)
   const standby = status.standby ?? null
   const failing = status.runs_failing ?? null
   const unservable = status.unservable ?? null
@@ -385,11 +388,12 @@ export function formatIntegrationStatus(status: IntegrationStatus | null, now = 
             ? '  re-wake: the server wakes this agent again for cards it has not answered (+1 m, +5 m, +30 m, +3 h)'
             : '  re-wake: not offered by this server — an unanswered card waits for the next message',
         ]),
-    `  profile: ${status.profile}${status.runtime ? ` (${status.runtime})` : ''}${profileWarning !== null ? ` — ${profileWarning}` : ''}`,
+    // What the active profile does, in one line with its warning (`describeRunProfile`).
+    `  profile: ${status.profile}${status.runtime ? ` (${status.runtime})` : ''} — ${describeRunProfile(status.profile, status.runtime_label ?? null)}`,
     ...(status.workdir !== undefined && workdirExposesHome(status.workdir)
       ? [
           `  workdir: ${status.workdir} is your home folder or contains it — a run started by a peer's message there can see everything under it${
-            status.profile === 'answer' ? " (the presets' answer runs use their own empty folder instead)" : ''
+            status.profile === 'answer' || status.profile === 'own' ? " (the presets' own and answer runs use their own empty folder instead)" : ''
           }; point the workdir at a folder of its own`,
         ]
       : []),

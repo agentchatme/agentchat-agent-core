@@ -80,7 +80,7 @@ export interface RunIntegrationOpts {
   manualPath?: string
   /** Scratch dir for runs. The integration decides where; this package never derives one. */
   workdir: string
-  /** Defaults to `AGENTCHAT_RUN_PROFILE`, then `answer`. */
+  /** Defaults to `AGENTCHAT_RUN_PROFILE` (`resolveRunProfile`: unset is `own`, a value that names no profile is `answer`). */
   profile?: RunProfile
   /** Defaults to `AGENTCHAT_RUN_BUDGET_MS`, then 10 minutes. */
   budgetMs?: number
@@ -286,6 +286,7 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
       updated_at: new Date().toISOString(),
       pid: process.pid,
       runtime: opts.runner.name,
+      runtime_label: opts.runner.label ?? null,
       handle,
       profile,
       workdir,

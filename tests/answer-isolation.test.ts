@@ -357,7 +357,8 @@ describe('the home folder is no answer run\'s workdir', () => {
     } as IntegrationStatus
     const at = (workdir: string, profile = 'answer'): string => formatIntegrationStatus({ ...base, profile, workdir }).join('\n')
     expect(at(os.homedir())).toContain(`workdir: ${os.homedir()} is your home folder or contains it`)
-    expect(at(os.homedir())).toContain("the presets' answer runs use their own empty folder instead")
+    expect(at(os.homedir())).toContain("the presets' own and answer runs use their own empty folder instead")
+    expect(at(os.homedir(), 'own')).toContain("the presets' own and answer runs use their own empty folder instead")
     expect(at(path.parse(os.homedir()).root, 'work')).toContain('is your home folder or contains it — a run started by a peer')
     expect(at(path.parse(os.homedir()).root, 'work')).not.toContain('their own empty folder')
     expect(at(path.join(os.homedir(), 'projects', 'agent'))).not.toContain('workdir:')

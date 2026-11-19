@@ -130,7 +130,9 @@ describe('integration status file', () => {
   it('says plainly what work and full mean for the machine; answer carries no warning', () => {
     expect(formatIntegrationStatus(sample()).join('\n')).not.toContain("peers' messages")
     for (const profile of ['work', 'full']) {
-      expect(formatIntegrationStatus(sample({ profile })).join('\n')).toContain(`profile: ${profile} (fake) — runs started by peers' messages can read and change this machine`)
+      const line = formatIntegrationStatus(sample({ profile })).join('\n').split('\n').find((l) => l.includes('profile:'))
+      expect(line).toContain(`profile: ${profile} (fake) — `)
+      expect(line).toContain("runs started by peers' messages can read and change this machine")
     }
   })
 
@@ -170,8 +172,8 @@ describe('integration status file', () => {
 })
 
 describe('profile and switches', () => {
-  it('defaults to answer and ignores unknown values', () => {
-    expect(resolveRunProfile({})).toBe('answer')
+  it('defaults to own; an unknown value is answer (fail-safe)', () => {
+    expect(resolveRunProfile({})).toBe('own')
     expect(resolveRunProfile({ AGENTCHAT_RUN_PROFILE: 'WORK' })).toBe('work')
     expect(resolveRunProfile({ AGENTCHAT_RUN_PROFILE: 'full' })).toBe('full')
     expect(resolveRunProfile({ AGENTCHAT_RUN_PROFILE: 'yolo' })).toBe('answer')

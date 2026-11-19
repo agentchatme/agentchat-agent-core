@@ -2,20 +2,30 @@
 //
 // What a headless run may do is the operator's decision, not the peer's and
 // not ours. A run is started by ANY peer's unread message — a stranger's cold
-// DM included — so the default gives it nothing to leak and no way to leak it.
-// Three profiles, mapped by each integration to its runtime's real flags
-// (documented per runtime in that integration's README):
+// DM included. Four profiles, mapped by each integration to its runtime's
+// real flags (documented per runtime in that integration's README):
 //
+//   own    — the agent itself: the runtime's own permission settings (the
+//            user's permission mode, allow and deny rules, sandbox, MCP
+//            servers, instruction files, memory, hooks) decide what the run
+//            may do, exactly as in the user's own headless runs. AgentChat
+//            adds only what a run cannot do without — its own tools,
+//            pre-approved — and what keeps the key out of reach (the key
+//            store's deny rules where the runtime has them; no key in the
+//            run's environment). The default.
 //   answer — every AgentChat hosted tool and no other MCP server, and file
 //            reads inside the run's own working folder only (never the home
 //            folder or above it): no web search or fetch, no shell, no edits,
-//            nothing outside the workdir readable. The default.
+//            nothing outside the workdir readable. The lock: an explicit
+//            opt-in, and what a value that names no profile means.
 //   work   — plus the web, edits and shell (in the run's workspace).
 //   full   — the runtime's own bypass-everything mode.
 //
-// `work` and `full` are explicit opt-ins: with either, runs started by peers'
-// messages can read and change this machine. Wherever they are offered or
-// described, `PEER_RUN_WARNING` says so.
+// `own`, `work` and `full` let runs started by peers' messages act beyond
+// AgentChat: `own` with the user's own permissions (`OWN_RUN_WARNING`), `work`
+// and `full` reading and changing this machine (`PEER_RUN_WARNING`). Wherever
+// a profile is offered or described, its sentence says so
+// (`runProfileWarning`, `describeRunProfile`).
 //
 // Whatever the profile, a headless run NEVER waits on a permission prompt:
 // anything that would prompt is denied, not waited on.
@@ -24,15 +34,48 @@ import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 
-export const RUN_PROFILES = ['answer', 'work', 'full'] as const
+export const RUN_PROFILES = ['own', 'answer', 'work', 'full'] as const
 export type RunProfile = (typeof RUN_PROFILES)[number]
 
 /** What `work` and `full` mean, said plainly wherever either is offered or described. */
 export const PEER_RUN_WARNING = "runs started by peers' messages can read and change this machine"
 
-/** `PEER_RUN_WARNING` for `work` and `full`; null for `answer` (and anything that is not a profile). */
+/** What `own` means for a run a peer's message started, said after `ownProfileLine` wherever `own` is offered or described. */
+export const OWN_RUN_WARNING = "runs started by peers' messages act with those permissions"
+
+/**
+ * The one line that says what `own` does: `reply runs use your own Claude
+ * Code permission settings, with anything that would ask refused`. The
+ * runtime is the caller's to name (this engine names none); without it, the
+ * line names none either.
+ */
+export function ownProfileLine(runtimeLabel?: string | null): string {
+  const settings = runtimeLabel !== undefined && runtimeLabel !== null && runtimeLabel.trim().length > 0 ? `your own ${runtimeLabel.trim()} permission settings` : 'your own permission settings'
+  return `reply runs use ${settings}, with anything that would ask refused`
+}
+
+/** `OWN_RUN_WARNING` for `own`, `PEER_RUN_WARNING` for `work` and `full`; null for `answer` (and anything that is not a profile). */
 export function runProfileWarning(profile: string): string | null {
-  return profile === 'work' || profile === 'full' ? PEER_RUN_WARNING : null
+  if (profile === 'work' || profile === 'full') return PEER_RUN_WARNING
+  return profile === 'own' ? OWN_RUN_WARNING : null
+}
+
+/**
+ * What a run of `profile` may do, in one plain line for `status`, `doctor`
+ * and install output, with the profile's warning in it. A value that is not a
+ * profile is described as `answer`, which is what it means (`resolveRunProfile`).
+ */
+export function describeRunProfile(profile: string, runtimeLabel?: string | null): string {
+  switch (profile) {
+    case 'own':
+      return `${ownProfileLine(runtimeLabel)}; ${OWN_RUN_WARNING}`
+    case 'work':
+      return `reply runs also get the shell and edits in their work folder; ${PEER_RUN_WARNING}`
+    case 'full':
+      return `reply runs use ${runtimeLabel !== undefined && runtimeLabel !== null && runtimeLabel.trim().length > 0 ? `${runtimeLabel.trim()}'s` : "the runtime's"} bypass mode; ${PEER_RUN_WARNING}`
+    default:
+      return 'reply runs get the AgentChat tools and reads inside their own work folder, nothing else'
+  }
 }
 
 /**
@@ -97,16 +140,24 @@ export function workdirExposesHome(workdir: string, home: string = os.homedir())
 }
 
 export const RUN_PROFILE_ENV = 'AGENTCHAT_RUN_PROFILE'
-export const DEFAULT_RUN_PROFILE: RunProfile = 'answer'
+/** The profile when `AGENTCHAT_RUN_PROFILE` is unset or blank: the agent itself. */
+export const DEFAULT_RUN_PROFILE: RunProfile = 'own'
+/**
+ * The profile when `AGENTCHAT_RUN_PROFILE` names no profile (a typo, a value
+ * from a newer release): `answer`, the lock. Fail-safe: a value someone set
+ * on purpose and got wrong never gives a run more than they meant.
+ */
+export const FALLBACK_RUN_PROFILE: RunProfile = 'answer'
 
 export function isRunProfile(value: unknown): value is RunProfile {
   return typeof value === 'string' && (RUN_PROFILES as readonly string[]).includes(value)
 }
 
-/** `AGENTCHAT_RUN_PROFILE`, defaulting to `answer`; an unknown value is `answer` too. */
+/** `AGENTCHAT_RUN_PROFILE`: unset or blank is `own` (the default); a value that names no profile is `answer` (fail-safe). */
 export function resolveRunProfile(env: NodeJS.ProcessEnv = process.env): RunProfile {
   const raw = env[RUN_PROFILE_ENV]?.trim().toLowerCase()
-  return isRunProfile(raw) ? raw : DEFAULT_RUN_PROFILE
+  if (raw === undefined || raw.length === 0) return DEFAULT_RUN_PROFILE
+  return isRunProfile(raw) ? raw : FALLBACK_RUN_PROFILE
 }
 
 /** The one switch: `AGENTCHAT_INTEGRATION=off` holds no socket and starts no run. Tools and manual stay. */

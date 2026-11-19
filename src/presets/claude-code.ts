@@ -64,9 +64,25 @@ import { withoutInheritedKey, withoutParentSession, type Preset, type PresetCont
 //                               the hosted server from a file, and ONLY it: a
 //                               listener's run acts as the listener's agent,
 //                               never as whatever key the user scope registers.
+//   --mcp-config <file> (no --strict-mcp-config)
+//                               `own`: the file's `agentchat` wins over a
+//                               user-scope `agentchat` (verified on 2.1.327: the
+//                               user-scope one is not even connected), and every
+//                               other server the user configured still loads.
 //
 // Whatever the profile, every AgentChat hosted tool is pre-approved: the run
-// exists to read the tray and decide or send through them.
+// exists to read the tray and decide or send through them. In `own` that is
+// all `--allowedTools` says. It cannot be left to the user's settings: in
+// print mode an MCP tool no rule allows is denied (verified on 2.1.327:
+// "requires approval, and this session has no approval surface"), and
+// naming the server there is also what makes the first turn wait for it
+// (agent-sdk/mcp.md, "Named servers"). A user's deny rule still wins over it.
+//
+// `own` passes nothing else that decides what a run may do: no `--tools`,
+// `--permission-mode`, `--settings` or `--strict-mcp-config`. The user's
+// permission mode (`permissions.defaultMode`; Manual when none is set, the
+// documented built-in for `claude -p`), allow and deny rules, MCP servers,
+// CLAUDE.md, auto memory and hooks apply as in their own `claude -p` runs.
 
 export const CLAUDE_CODE_PRESET = 'claude-code'
 
@@ -327,6 +343,10 @@ export function workdirReadRules(workdir: string | undefined): string[] {
  */
 export function claudeProfileArgs(profile: RunProfile, workdir?: string): string[] {
   switch (profile) {
+    // The agent itself: the user's own settings decide; AgentChat's tools are
+    // pre-approved and nothing waits on a prompt (see the header).
+    case 'own':
+      return ['--permission-prompts', 'none', '--allowedTools', AGENTCHAT_TOOL_ALLOW]
     case 'answer':
       return [
         '--permission-mode',
@@ -378,8 +398,9 @@ export interface ClaudeRunArgOptions {
   /**
    * A file whose text is appended to the system prompt (`--append-system-prompt-file`,
    * documented since 2.1.69): how an `answer` run, which loads no CLAUDE.md,
-   * is told its identity line. A file, not argv text: an argument cannot carry
-   * a line break through a Windows `.cmd` shim.
+   * is told its identity line, and how an `own` run is told it whatever its
+   * CLAUDE.md holds (a listener's agent is not the one there). A file, not
+   * argv text: an argument cannot carry a line break through a Windows `.cmd` shim.
    */
   readonly appendSystemPromptFile?: string | undefined
 }
@@ -427,8 +448,9 @@ export function claudeRunArgs(profile: RunProfile, options: ClaudeRunArgOptions 
     // session list and off the disk.
     '--no-session-persistence',
     ...(budget !== undefined && /^\d+(\.\d+)?$/.test(budget) ? ['--max-budget-usd', budget] : []),
-    // Variadic, so it is closed by the boolean flag right after it.
-    ...(options.mcpConfigPath !== undefined ? ['--mcp-config', options.mcpConfigPath, '--strict-mcp-config'] : []),
+    // Variadic, so it is closed by the option right after it. `own` keeps the
+    // user's other servers: the file's `agentchat` wins over theirs by name.
+    ...(options.mcpConfigPath !== undefined ? ['--mcp-config', options.mcpConfigPath, ...(profile === 'own' ? [] : ['--strict-mcp-config'])] : []),
     ...(options.appendSystemPromptFile !== undefined ? ['--append-system-prompt-file', options.appendSystemPromptFile] : []),
     ...claudeProfileArgs(profile, options.workdir),
     // Last: the option is variadic and the prompt arrives on stdin, so there
@@ -559,6 +581,8 @@ function extraDirectoriesRefusal(grant: { file: string; detail: string }): strin
  * loads no other MCP server — the user's own, a project's, a plugin's, a
  * claude.ai connector — whatever the user scope registers. `file` must sit
  * inside a `denyReadPaths` entry (it holds the key), or preflight refuses.
+ * An `own` run writes no tool config (it uses the user's servers); its
+ * identity-line file is written beside `file` all the same.
  */
 export interface ClaudeAnswerMcp {
   readonly file: string
@@ -573,8 +597,9 @@ export interface ClaudeRunnerOptions {
   /**
    * The run's working directory; the `work` profile edits and runs shell here.
    * Must lie outside `denyReadPaths`, or the run cannot read its own cwd —
-   * preflight says so once and still runs. An `answer` run whose workdir is the
-   * home folder or contains it works in `answerFallbackWorkdir` instead.
+   * preflight says so once and still runs. An `own` or `answer` run whose
+   * workdir is the home folder or contains it works in
+   * `claudeAnswerFallbackWorkdir` instead.
    */
   readonly workdir: string
   readonly profile: RunProfile
@@ -601,17 +626,26 @@ export interface ClaudeRunnerOptions {
 }
 
 /**
- * The folder an `answer` run works in when its configured workdir is the
- * user's home folder or contains it (`workdirExposesHome`): an empty folder of
- * its own beside Claude Code's config, never inside a denied path. The run
- * keeps working — it only cannot read the user's files.
+ * The folder an `own` or `answer` run works in when its configured workdir is
+ * the user's home folder or contains it (`workdirExposesHome`): an empty folder
+ * of its own beside Claude Code's config, never inside a denied path. The run
+ * keeps working — it only cannot read the user's files. An `own` run needs
+ * this as much: Claude Code lets a run read its working directory without
+ * asking in every permission mode, so a home-folder workdir would hand a
+ * peer-started run `~/.ssh` whatever the user's allow rules say.
  */
 export function claudeAnswerFallbackWorkdir(configDirOverride: string | undefined): string {
   return path.join(claudeHomeFor(configDirOverride), 'agentchat-answer-workdir')
 }
 
+/** The profiles whose runs never work in the home folder or above it (`claudeAnswerFallbackWorkdir`). */
+function guardsHomeWorkdir(profile: RunProfile): boolean {
+  return profile === 'answer' || profile === 'own'
+}
+
 export class ClaudeRunner implements RunRunner {
   readonly name = 'claude'
+  readonly label = 'Claude Code'
   private readonly command: string
   /** The workdir warning is one line per process, not one per preflight (preflight repeats every few minutes). */
   private warnedWorkdir = false
@@ -624,11 +658,11 @@ export class ClaudeRunner implements RunRunner {
 
   /**
    * Where this runner's runs work: the configured workdir, except that an
-   * `answer` run never works in the home folder or above it — it gets
+   * `own` or `answer` run never works in the home folder or above it — it gets
    * `claudeAnswerFallbackWorkdir` (its readable folder would be the whole home).
    */
   workdir(): string {
-    if (this.options.profile === 'answer' && workdirExposesHome(this.options.workdir)) return claudeAnswerFallbackWorkdir(this.options.configDir)
+    if (guardsHomeWorkdir(this.options.profile) && workdirExposesHome(this.options.workdir)) return claudeAnswerFallbackWorkdir(this.options.configDir)
     return this.options.workdir
   }
 
@@ -660,7 +694,7 @@ export class ClaudeRunner implements RunRunner {
     }
     if (this.workdir() !== this.options.workdir && !this.warnedHome) {
       this.warnedHome = true
-      log.warn(`the run workdir ${this.options.workdir} is your home folder or contains it: answer runs work in ${this.workdir()} instead, so a peer-started run reads none of your files there. Point the workdir at a folder of its own to choose another.`)
+      log.warn(`the run workdir ${this.options.workdir} is your home folder or contains it: ${this.options.profile} runs work in ${this.workdir()} instead, so a peer-started run reads none of your files there. Point the workdir at a folder of its own to choose another.`)
     }
     // A cwd inside the key store is an operator choice the deny rules then
     // make unreadable to the run. Said once, with the fix; the run still
@@ -700,12 +734,17 @@ export class ClaudeRunner implements RunRunner {
     return path.join(path.dirname(file), `${stem}.${id}${ext}`)
   }
 
-  /** The answer run's own files for `runId`: its AgentChat-only tool config (integration path) and its identity-line file. */
-  private answerRunFiles(runId: string): { mcpConfigPath?: string; identityFile?: string } {
-    if (this.options.profile !== 'answer') return {}
+  /**
+   * A run's own files for `runId`: an answer run's AgentChat-only tool config
+   * (integration path), and the identity-line file of an answer or own run.
+   * `work` and `full` write none (they load CLAUDE.md, as before).
+   */
+  private runFiles(runId: string): { mcpConfigPath?: string; identityFile?: string } {
+    const profile = this.options.profile
+    if (profile !== 'answer' && profile !== 'own') return {}
     const base = this.options.mcpConfigPath ?? this.options.answerMcp?.file
     return {
-      ...(this.options.mcpConfigPath === undefined && this.options.answerMcp !== undefined ? { mcpConfigPath: ClaudeRunner.perRun(this.options.answerMcp.file, runId, '.json') } : {}),
+      ...(profile === 'answer' && this.options.mcpConfigPath === undefined && this.options.answerMcp !== undefined ? { mcpConfigPath: ClaudeRunner.perRun(this.options.answerMcp.file, runId, '.json') } : {}),
       ...(base !== undefined ? { identityFile: ClaudeRunner.perRun(base, runId, '.identity.md') } : {}),
     }
   }
@@ -734,21 +773,28 @@ export class ClaudeRunner implements RunRunner {
 
   /**
    * The argv of a run — exported for tests to pin per profile. With a `runId`,
-   * that run's own files (an answer run's tool config and identity-line file);
-   * without, the configured `answerMcp.file` stands in and no identity file.
+   * that run's own files (an answer run's tool config, an answer or own run's
+   * identity-line file); without, the configured `answerMcp.file` stands in
+   * for an answer run's tool config, and no identity file.
    */
   args(runId?: string, identityLine?: boolean): string[] {
     if (runId === undefined) {
       const mcpConfigPath = this.options.mcpConfigPath ?? (this.options.profile === 'answer' ? this.options.answerMcp?.file : undefined)
       return this.argsFor(mcpConfigPath, undefined)
     }
-    const files = this.answerRunFiles(runId)
+    const files = this.runFiles(runId)
     return this.argsFor(files.mcpConfigPath ?? this.options.mcpConfigPath, identityLine === true ? files.identityFile : undefined)
   }
 
-  /** The run's environment: no parent session; an answer run loads no CLAUDE.md and no auto memory (`ANSWER_ENV`). */
+  /**
+   * The run's environment: no parent session; an answer run loads no CLAUDE.md
+   * and no auto memory (`ANSWER_ENV`); an own run carries no `AGENTCHAT_API_KEY`
+   * the daemon inherited — it has the user's own shell, and it reaches the
+   * hosted tools through its MCP entry, never through that variable.
+   */
   runEnv(): NodeJS.ProcessEnv {
-    const env = buildClaudeEnv(this.options.configDir, this.options.env ?? process.env)
+    const source = this.options.env ?? process.env
+    const env = buildClaudeEnv(this.options.configDir, this.options.profile === 'own' ? withoutInheritedKey(source) : source)
     return this.options.profile === 'answer' ? { ...env, ...ANSWER_ENV } : env
   }
 
@@ -766,8 +812,9 @@ export class ClaudeRunner implements RunRunner {
       const grant = claudeExtraDirectoriesGrant(this.options.configDir, this.workdir())
       if (grant !== null) return notStarted(extraDirectoriesRefusal(grant))
     }
-    const files = this.answerRunFiles(request.runId)
-    const identityFile = answer && request.identityLine !== undefined ? files.identityFile : undefined
+    const files = this.runFiles(request.runId)
+    // answer: it loads no CLAUDE.md. own: whatever CLAUDE.md holds, the run is told who it is (a listener's agent is not the one there).
+    const identityFile = request.identityLine !== undefined ? files.identityFile : undefined
     const written: string[] = []
     const cleanup = (): void => {
       for (const file of written) fs.rmSync(file, { force: true })
@@ -789,7 +836,7 @@ export class ClaudeRunner implements RunRunner {
         written.push(identityFile)
       } catch (err) {
         cleanup()
-        return notStarted(`could not write the answer run's identity line ${identityFile}: ${err instanceof Error ? err.message : String(err)}`)
+        return notStarted(`could not write the run's identity line ${identityFile}: ${err instanceof Error ? err.message : String(err)}`)
       }
     }
     try {
@@ -822,10 +869,12 @@ export function claudeMcpConfigPath(home: string): string {
 
 export const claudeCodePreset: Preset = {
   name: CLAUDE_CODE_PRESET,
-  describeMcp({ home, apiBase }) {
+  describeMcp({ home, apiBase, profile }) {
     return [
       `--mcp-config ${claudeMcpConfigPath(home)} (owner-only): ${CLAUDE_MCP_SERVER_NAME} → ${hostedMcpUrl(apiBase)}, Authorization: Bearer <this home's key>, X-AgentChat-Client: claude-code`,
-      '--strict-mcp-config: no other MCP server (user, project or plugin) is loaded in these runs',
+      profile === 'own'
+        ? `own: your other MCP servers load too (the file is not made the only one); this file's ${CLAUDE_MCP_SERVER_NAME} is used in place of a user-scope ${CLAUDE_MCP_SERVER_NAME} (verified); a project- or local-scope one is not covered`
+        : '--strict-mcp-config: no other MCP server (user, project or plugin) is loaded in these runs',
     ]
   },
   label: 'Claude Code',

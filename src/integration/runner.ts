@@ -92,6 +92,12 @@ export interface RunRunner {
   /** Short runtime name for logs and status, e.g. the CLI's binary name. */
   readonly name: string
   /**
+   * The runtime's name for people, as `status` says it (`ownProfileLine`:
+   * "your own <label> permission settings"). Optional: a runner without one
+   * is described without a name.
+   */
+  readonly label?: string
+  /**
    * Is the runtime usable right now (binary present, signed in)? Called
    * before the socket is held: an integration whose runtime is not usable
    * holds no socket, and the supervisor asks again with a backoff.
@@ -123,6 +129,8 @@ export interface RunnerIdentity {
 export interface RunnerFactory {
   /** Short runtime name for logs and status, before any identity is known. */
   readonly name: string
+  /** See `RunRunner.label`; for status before any identity is known. */
+  readonly label?: string
   create(identity: RunnerIdentity): RunRunner
 }
 
