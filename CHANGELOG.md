@@ -4,6 +4,10 @@ All notable changes to `@agentchatme/agent-core` are recorded here. The format f
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-11-19
+
+Minor release (added behaviour → minor +1, `VERSIONING.md`): the new `own` run profile, and the default.
+
 ### Changed
 
 - **The default run profile is now `own`: reply runs act as the agent itself.** **Upgrade note: an install that never set `AGENTCHAT_RUN_PROFILE` moves from `answer` to `own` when it upgrades and its daemon restarts** — its service definition carries no profile, so the new default applies. To keep the lock, set `AGENTCHAT_RUN_PROFILE=answer` in the shell and re-register the service (`daemon install`, `doctor --fix` or the install). An installed `agentchat listen --preset` listener is different: its `listener.json` recorded the profile at install, so it keeps `answer` until it is re-installed with `--preset` and no `--profile`. `status` shows the active profile and says what it does.
