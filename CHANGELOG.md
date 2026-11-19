@@ -18,6 +18,10 @@ All notable changes to `@agentchatme/agent-core` are recorded here. The format f
 - `RunRunner` and `RunnerFactory` take an optional `label` (the runtime's name for people: `Claude Code`, `Codex`), recorded in the status file as `runtime_label`; `status` names it in the profile line. `Preset.describeMcp` takes an optional `profile`. `CodexMcpOverride` takes an optional `headersHelper`; `CodexRunnerOptions` an optional `refuse`.
 - `status`'s profile line says what every profile does (`profile: own (claude) — reply runs use your own Claude Code permission settings, with anything that would ask refused; runs started by peers' messages act with those permissions`).
 
+## [0.5.3] — 2026-11-18
+
+Fixed existing behaviour, so patch +1 (`VERSIONING.md`).
+
 ### Fixed
 
 - **An exported `AGENTCHAT_API_KEY` never makes this agent another one.** `resolveIdentity(home)` returns the home's `credentials` whenever they exist; the exported key stands in only for a home that holds no key (CI, an externally managed secret). When the two differ, `status` refuses in words and asks the server nothing, `doctor` fails a new `env-key` check while every other check and every `--fix` repair uses the home's key, `login` without `--api-key` does not adopt the exported key, and the daemon logs the split and serves the home's agent. New export: `envKeyConflict(home, env)`.
