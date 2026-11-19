@@ -55,9 +55,15 @@ function alive(pid: number): boolean {
 }
 
 /** A process that has exited: its pid is a dead holder. */
+/**
+ * A pid no process can have. Not the pid of a child that just exited:
+ * Windows hands a freed pid to the next process within milliseconds (often
+ * another test file's child), so a "dead" holder read as alive. 4194305 is
+ * odd (Windows pids are multiples of 4) and above the largest pid Linux
+ * (2^22) and macOS (99998) allow.
+ */
 function deadPid(): number {
-  const r = spawnSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))'], { encoding: 'utf-8' })
-  return Number(r.stdout)
+  return 4_194_305
 }
 
 /** A process that keeps running until killed. */
