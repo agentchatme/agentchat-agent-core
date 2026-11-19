@@ -80,6 +80,12 @@ export interface SpawnRunSpec {
   readonly signal?: AbortSignal
   /** Called once when the child process has been spawned (`RunRequest.onStarted`). */
   readonly onStarted?: () => void
+  /**
+   * An exit 0 with nothing on stdout is `failed`, not `ok`: for a probe whose
+   * answer must be there (a model call that printed nothing did not answer).
+   * Still counted, never kept.
+   */
+  readonly requireStdout?: boolean
 }
 
 /** Strip anything key-shaped or terminal-styled from a diagnostic, and bound it. */
@@ -311,6 +317,7 @@ export function spawnRun(spec: SpawnRunSpec): Promise<RunOutcome> {
       if (interrupted) {
         return { state: 'failed', exitCode: code, detail: `interrupted — the integration was stopping; the tray stays unread for the next run${extra}` }
       }
+      if (code === 0 && spec.requireStdout === true && stdoutBytes === 0) return { state: 'failed', exitCode: 0, detail: `exit 0 with nothing on stdout${extra}` }
       if (code === 0) return note ? { state: 'ok', exitCode: 0, detail: note } : { state: 'ok', exitCode: 0 }
       const exit = code === null ? `signal ${signal ?? 'unknown'}` : `exit ${code}`
       // Nothing on stdout: the runtime did not get going (missing, refused

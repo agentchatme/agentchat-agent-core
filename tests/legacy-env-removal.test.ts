@@ -50,6 +50,10 @@ const CURRENT = new Set([
   'AGENTCHAT_RUN_MAX_BUDGET_USD',
   'AGENTCHAT_LISTENER_API_KEY',
   'AGENTCHAT_SERVICE_DRY_RUN',
+  // A run's context, set for a command the owner configured (`runContextEnv`), never read here.
+  'AGENTCHAT_WAKE_KIND',
+  'AGENTCHAT_RUN_ID',
+  'AGENTCHAT_CONVERSATION_ID',
   // A test and headless-install knob (do not start the Windows launcher now), not an old spelling of anything.
   'AGENTCHATD_SERVICE_NO_START',
 ])

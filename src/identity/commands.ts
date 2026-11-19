@@ -20,7 +20,15 @@ import { loadTexts, readCachedTexts } from '../integration/texts.js'
 import { identityLineOf } from '../skill/identity-line.js'
 import { anchorLabelOf, type DoctorCheck, type HostProfile, type StatusContext, type Verdict } from './host-profile.js'
 import { clientIdentityOf } from '../client-identity.js'
-import { REPEATED_FAILED_CYCLES, failedCyclesInARow, formatIntegrationStatus, readIntegrationStatus } from '../integration/status.js'
+import {
+  REPEATED_FAILED_CYCLES,
+  describeCouldNotProcessCounts,
+  describePausedConversations,
+  failedCyclesInARow,
+  formatIntegrationStatus,
+  readIntegrationStatus,
+  repeatedFailedRuns,
+} from '../integration/status.js'
 
 // ─── Identity commands, for exactly one agent ───────────────────────────────
 //
@@ -1082,6 +1090,37 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
             }
           : { name: 'wake-cycles', verdict: 'PASS', detail: `last cycle ${last.outcome} at ${last.at} (${cycles.length} recent)` },
       )
+    }
+    // With conversation runs a cycle only starts runs: runs that keep failing
+    // with no runtime reason found are said here.
+    const failedRuns = repeatedFailedRuns(integration)
+    if (failedRuns !== null) {
+      const lastRun = integration?.last_run ?? null
+      checks.push({
+        name: 'runs',
+        verdict: 'WARN',
+        detail: `the last ${failedRuns} runs did not get done${lastRun !== null ? ` (latest: ${lastRun.state}${lastRun.detail ? ` — ${lastRun.detail}` : ''})` : ''}; the cards stay on the tray`,
+      })
+    }
+    // Could not process: the conversations paused for this agent, and a
+    // runtime check that fails (then no failure is reported as a
+    // conversation's: a broken runtime is not its fault).
+    const cnp = integration?.could_not_process ?? null
+    if (cnp !== null) {
+      const paused = describePausedConversations(cnp.paused_conversations)
+      const lastCheck = cnp.last_runtime_check
+      const counts = describeCouldNotProcessCounts(cnp)
+      if (paused !== null) {
+        checks.push({ name: 'could-not-process', verdict: 'WARN', detail: paused.replace(/^could not process: /, '') })
+      } else if (lastCheck !== null && !lastCheck.ok) {
+        checks.push({
+          name: 'could-not-process',
+          verdict: 'WARN',
+          detail: `the runtime check failed (${lastCheck.detail ?? 'no detail'}; ${lastCheck.at}): while it fails, a conversation whose run fails is not reported, its card stays on the tray and the server wakes the agent again`,
+        })
+      } else if (counts !== null) {
+        checks.push({ name: 'could-not-process', verdict: 'PASS', detail: counts.replace(/^could not process: /, '') })
+      }
     }
 
     if (profile.extraDoctorChecks !== undefined) {

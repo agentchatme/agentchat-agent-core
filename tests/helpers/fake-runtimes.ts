@@ -16,6 +16,10 @@ import * as path from 'node:path'
 //   FAKE_RUNTIME_PROBE_HANG=version|auth   that probe hangs, with a child holding its output pipe
 //   FAKE_RUNTIME_PROBE_PIDS=<file> where the hung probe writes its pid and its child's
 //   FAKE_MCP_LIST_RECORD=<file>    where `mcp list` appends its argv, cwd and env
+//   FAKE_RUNTIME_RUN_MODE=fail|silent|hang  how a headless run (or a runtime
+//                                  check) ends instead of answering: exit 1
+//                                  after some output, exit 0 with no output,
+//                                  or never (its pid to FAKE_RUNTIME_RUN_PIDS)
 //
 // A run's record also says what its `--mcp-config` file held at that moment:
 // the server names and the file mode (never its contents — it carries a key).
@@ -108,7 +112,11 @@ function install(root: string, name: string, version: string, authArgs: [string,
       "  if (sp >= 0) { try { appendedSystemPrompt = fs.readFileSync(args[sp + 1], 'utf8') } catch { appendedSystemPrompt = 'unreadable' } }",
       '  const record = { argv: args, stdin, cwd: process.cwd(), env, mcpConfig, appendedSystemPrompt }',
       "  if (process.env.FAKE_RUNTIME_RECORD) fs.appendFileSync(process.env.FAKE_RUNTIME_RECORD, JSON.stringify(record) + '\\n')",
+      "  const runMode = process.env.FAKE_RUNTIME_RUN_MODE",
+      "  if (runMode === 'silent') process.exit(0)",
+      "  if (runMode === 'hang') { if (process.env.FAKE_RUNTIME_RUN_PIDS) fs.writeFileSync(process.env.FAKE_RUNTIME_RUN_PIDS, JSON.stringify([process.pid])); setTimeout(() => {}, 600000); throw 'hang' }",
       "  process.stdout.write('model output that must be discarded\\n')",
+      "  if (runMode === 'fail') { console.error('API Error: the provider refused this request'); process.exit(1) }",
       '  process.exit(0)',
       '}',
       `console.error('unsupported fake ${name} command: ' + args.join(' '))`,

@@ -12,6 +12,7 @@ import type { Preset } from './types.js'
 export type { Preset, PresetContext, PresetInspection } from './types.js'
 export { withoutParentSession, isParentSessionEnv, CLAUDE_CODE_ENV_KEPT, CLAUDE_SESSION_ENV, CODEX_SESSION_ENV, CODEX_MANAGED_PROXY_ENV } from './types.js'
 export { semverAtLeast } from './semver.js'
+export { RUNTIME_CHECK_PROMPT, RUNTIME_CHECK_BUDGET_MS, RUNTIME_CHECK_DIR, RUNTIME_CHECK_KEY_ENV, runRuntimeCheck, type RuntimeCheckSpec } from './runtime-check.js'
 export {
   CLAUDE_CODE_PRESET,
   MIN_CLAUDE_CODE_VERSION,
@@ -40,6 +41,9 @@ export {
   readDenyRules,
   inexpressibleDenyPaths,
   claudeRunArgs,
+  claudeRuntimeCheckArgs,
+  claudeRuntimeCheckWorkdir,
+  RUNTIME_CHECK_SETTINGS,
   claudeMcpConfig,
   claudeMcpConfigPath,
   ClaudeRunner,
@@ -74,6 +78,8 @@ export {
   codexPinnedUrlArgs,
   codexClientHeadersToml,
   codexRunArgs,
+  codexRuntimeCheckArgs,
+  codexRuntimeCheckWorkdir,
   agentchatTableKeys,
   CodexRunner,
   codexPreset,

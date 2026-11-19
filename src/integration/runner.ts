@@ -1,14 +1,26 @@
 // ─── The runner seam ────────────────────────────────────────────────────────
 //
-// The integration starts ONE headless run of the resident coding agent and
-// discards everything the run says: the agent's only way to say anything on
+// The integration starts headless runs of the resident coding agent and
+// discards everything a run says: the agent's only way to say anything on
 // AgentChat is the hosted send tool during its own run. How a runtime is
 // started — its binary, its headless flags, its permission profile — is the
 // one genuinely host-specific piece, so each integration implements this and
 // the engine never names a runtime.
+//
+// What a run is for comes from the SDK kit's receive loop: with served texts
+// that carry `conversation_run_template`, one run per conversation that owes
+// a reply (`conversation`, with its `conversationId`) and one run for the
+// pending invites (`invite`); with texts from an older server, one run for the
+// whole tray (`wake`).
 
-/** `invite` when the tray held only pending invites (the served invite prompt); `wake` otherwise. */
-export type RunKind = 'wake' | 'invite'
+/**
+ * `conversation`: a run for ONE conversation (the served conversation-run
+ * prompt names it; `RunRequest.conversationId`). `invite`: a run for the
+ * pending invites (the served invite prompt). `wake`: one run for the whole
+ * tray (the served wake instruction), from texts without the conversation-run
+ * template.
+ */
+export type RunKind = 'wake' | 'invite' | 'conversation'
 
 /**
  * The wake that started a run, named as the webhook wake names it (contract
@@ -23,6 +35,13 @@ export interface RunWake {
 
 export interface RunRequest {
   readonly kind: RunKind
+  /**
+   * A `conversation` run: the one conversation it is for (an id, never
+   * content). Absent on `wake` and `invite` runs. A runner may hand it to its
+   * run as context (the CLI's custom command gets `AGENTCHAT_CONVERSATION_ID`,
+   * `runContextEnv`); the prompt already names it.
+   */
+  readonly conversationId?: string
   /** The wake that started this run (the newest since the previous run started). */
   readonly wake?: RunWake
   /** The prompt for this kind of run: the served text (the kit's receive loop picks it), then the manual pointer. */
@@ -105,6 +124,22 @@ export interface RunRunner {
   preflight(options?: RunPreflightOptions): Promise<RunPreflight>
   /** Start one run and wait for it. Never throws — returns an outcome. */
   start(request: RunRequest): Promise<RunOutcome>
+  /**
+   * Does the agent's AI answer right now? A minimal model call through the
+   * same binary, account and environment the runs use, with no peer content
+   * and no AgentChat tools — not a version or sign-in check, which passes
+   * during a provider outage. Asked by the kit after a conversation's run
+   * failed when no other run has completed since: `ok` is the evidence a
+   * could-not-process report needs (the runtime works, so the failure is that
+   * conversation's). Bounded by the engine (`RUNTIME_CHECK_DEADLINE_MS`), and
+   * killed with everything it started when `signal` aborts. Never throws; its
+   * output is discarded, never logged.
+   *
+   * Optional. Without it (a custom command), a failed conversation run is
+   * reported only once another run completes after it (`other_run_completed`
+   * evidence) within the kit's window, and never when every run fails.
+   */
+  checkRuntime?(options?: RunPreflightOptions): Promise<RunPreflight>
 }
 
 /** The agent a runner's runs act as: what a `RunnerFactory` is given for each identity the integration serves. */
