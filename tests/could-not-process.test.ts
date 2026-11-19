@@ -7,6 +7,7 @@ import { Integration } from '../src/integration/integration.js'
 import { couldNotProcessPath, PausedConversations } from '../src/integration/could-not-process.js'
 import { RUN_CONTEXT_ENV, runContextEnv } from '../src/integration/run-context.js'
 import {
+  clearIntegrationStatus,
   describeCouldNotProcessCounts,
   describePausedConversations,
   formatIntegrationStatus,
@@ -385,6 +386,18 @@ describe('a pause is said plainly in status, until it ends', () => {
     const other = await integration(new ScriptedRunner('ok'), {}, 'someone-else')
     expect(other.snapshot().could_not_process?.paused_conversations).toEqual([])
   }, 15_000)
+
+  it('uninstall leaves nothing behind: clearIntegrationStatus removes the ledger with the status files', () => {
+    new PausedConversations(home, 'me').record('conv_a', until24h())
+    writeIntegrationStatus(home, { version: 2, updated_at: new Date().toISOString(), pid: 1, runtime: 'x', handle: 'me', profile: 'own', socket: 'idle', wakes: 0, wakes_absorbed: 0, invites: 0, runs_started: 0, runs_ok: 0, runs_failed: 0, runs_timed_out: 0, runs_not_started: 0, runs_skipped_empty: 0, last_run: null, retry_rung: 0, retry_due_at: null, last_error: null, texts: null })
+    fs.writeFileSync(path.join(home, 'doorbell.status.json'), '{}')
+    expect(fs.existsSync(couldNotProcessPath(home))).toBe(true)
+    clearIntegrationStatus(home)
+    for (const file of ['integration.status.json', 'doorbell.status.json', 'could-not-process.json']) expect(fs.existsSync(path.join(home, file)), file).toBe(false)
+    expect(new PausedConversations(home, 'me').list()).toEqual([])
+    // A home with none of them is fine.
+    expect(() => clearIntegrationStatus(home)).not.toThrow()
+  })
 
   it('another answer for that conversation, or a completed run there, ends what was kept', () => {
     const ledger = new PausedConversations(home, 'me')

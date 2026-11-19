@@ -4,6 +4,7 @@ import { z } from 'zod'
 import { atomicWriteFile, readJsonFile } from '../util/fsutil.js'
 import { log } from '../util/log.js'
 import { describeRunProfile, workdirExposesHome } from './profile.js'
+import { couldNotProcessPath } from './could-not-process.js'
 
 // ─── Integration status, for `status` and `doctor` ──────────────────────────
 //
@@ -407,9 +408,14 @@ export function readIntegrationStatus(home: string): IntegrationStatus | null {
   return null
 }
 
-/** Remove both spellings: a stale legacy file must not outlive the daemon that wrote it. */
+/**
+ * Remove what the daemon keeps for `status` in the identity home: both
+ * spellings of the status file (a stale legacy file must not outlive the
+ * daemon that wrote it) and the could-not-process ledger
+ * (`could-not-process.json`). For uninstall: nothing of it is left behind.
+ */
 export function clearIntegrationStatus(home: string): void {
-  for (const file of [integrationStatusPath(home), legacyStatusPath(home)]) {
+  for (const file of [integrationStatusPath(home), legacyStatusPath(home), couldNotProcessPath(home)]) {
     try {
       fs.rmSync(file, { force: true })
     } catch {
