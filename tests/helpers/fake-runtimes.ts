@@ -44,6 +44,25 @@ import * as path from 'node:path'
 // A run's record also says what its `--mcp-config` file held at that moment:
 // the server names and the file mode (never its contents — it carries a key).
 
+/**
+ * `writeWhole(file, text)` for a fake's script (needs `fs` in scope): a pid file
+ * appears whole or not at all, written beside it and renamed into place. A test
+ * that waits for the file to exist and then kills the tree must never find it
+ * created but not yet written. The rename is retried briefly on Windows' transient
+ * sharing errors, as src/util/fsutil.ts does.
+ */
+export const WRITE_WHOLE_JS = [
+  'const writeWhole = (file, text) => {',
+  "  fs.writeFileSync(file + '.part', text)",
+  '  for (let attempt = 1; ; attempt++) {',
+  "    try { fs.renameSync(file + '.part', file); return } catch (e) {",
+  "      if (process.platform !== 'win32' || attempt >= 6 || !['EPERM', 'EBUSY', 'EACCES'].includes(e.code)) throw e",
+  '      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20)',
+  '    }',
+  '  }',
+  '}',
+].join('\n')
+
 export interface FakeRuntime {
   readonly binDir: string
   readonly recordPath: string
@@ -84,6 +103,7 @@ function install(root: string, name: string, version: string, authArgs: [string,
     [
       '#!/usr/bin/env node',
       "const fs = require('node:fs')",
+      WRITE_WHOLE_JS,
       'const args = process.argv.slice(2)',
       // A probe that hangs (FAKE_RUNTIME_PROBE_HANG=version|auth), with a child of its own
       // holding the output pipe, as an npm launcher and its native binary do; both pids
@@ -91,7 +111,7 @@ function install(root: string, name: string, version: string, authArgs: [string,
       'const hangProbe = (which) => {',
       "  if (process.env.FAKE_RUNTIME_PROBE_HANG !== which) return",
       "  const kid = require('node:child_process').spawn(process.execPath, ['-e', 'setTimeout(() => {}, 600000)'], { stdio: ['ignore', 'inherit', 'inherit'] })",
-      "  if (process.env.FAKE_RUNTIME_PROBE_PIDS) fs.writeFileSync(process.env.FAKE_RUNTIME_PROBE_PIDS, JSON.stringify([process.pid, kid.pid]))",
+      "  if (process.env.FAKE_RUNTIME_PROBE_PIDS) writeWhole(process.env.FAKE_RUNTIME_PROBE_PIDS, JSON.stringify([process.pid, kid.pid]))",
       '  setTimeout(() => {}, 600000)',
       "  throw 'hang'",
       '}',
@@ -112,7 +132,7 @@ function install(root: string, name: string, version: string, authArgs: [string,
       // launcher and the native binary do: both pids go to FAKE_MCP_LIST_PIDS.
       "  if (mode === 'hang') {",
       "    const kid = require('node:child_process').spawn(process.execPath, ['-e', 'setTimeout(() => {}, 600000)'], { stdio: ['ignore', 'inherit', 'inherit'] })",
-      "    if (process.env.FAKE_MCP_LIST_PIDS) fs.writeFileSync(process.env.FAKE_MCP_LIST_PIDS, JSON.stringify([process.pid, kid.pid]))",
+      "    if (process.env.FAKE_MCP_LIST_PIDS) writeWhole(process.env.FAKE_MCP_LIST_PIDS, JSON.stringify([process.pid, kid.pid]))",
       '    setTimeout(() => {}, 600000)',
       '    return',
       '  }',
@@ -134,7 +154,7 @@ function install(root: string, name: string, version: string, authArgs: [string,
       "  if (process.env.FAKE_RUNTIME_RECORD) fs.appendFileSync(process.env.FAKE_RUNTIME_RECORD, JSON.stringify(record) + '\\n')",
       "  const runMode = process.env.FAKE_RUNTIME_RUN_MODE",
       "  if (runMode === 'silent') process.exit(0)",
-      "  if (runMode === 'hang') { if (process.env.FAKE_RUNTIME_RUN_PIDS) fs.writeFileSync(process.env.FAKE_RUNTIME_RUN_PIDS, JSON.stringify([process.pid])); setTimeout(() => {}, 600000); throw 'hang' }",
+      "  if (runMode === 'hang') { if (process.env.FAKE_RUNTIME_RUN_PIDS) writeWhole(process.env.FAKE_RUNTIME_RUN_PIDS, JSON.stringify([process.pid])); setTimeout(() => {}, 600000); throw 'hang' }",
       "  const SECRET = 'model output that must be discarded'",
       "  const isError = runMode === 'fail' || runMode === 'error_exit0'",
       "  const claudeJson = args.includes('--output-format') && args[args.indexOf('--output-format') + 1] === 'json'",

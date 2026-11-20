@@ -19,7 +19,7 @@ import { mockServedTexts } from './helpers/served-texts.js'
 import { runProbe } from '../src/util/probe.js'
 import { claudeIsLoggedIn, claudeSignIn, inspectClaudeRuntime, inspectCodexRuntime, codexIsLoggedIn, CodexRunner } from '../src/presets/index.js'
 import type { RunOutcome, RunPreflight, RunPreflightOptions, RunRequest, RunRunner } from '../src/integration/runner.js'
-import { installFakeClaude, installFakeCodex } from './helpers/fake-runtimes.js'
+import { installFakeClaude, installFakeCodex, WRITE_WHOLE_JS } from './helpers/fake-runtimes.js'
 import { startServerDouble, until, type ServerDouble } from './helpers/server-double.js'
 
 // ─── Listener health and single ownership ───────────────────────────────────
@@ -618,13 +618,19 @@ describe('one agent, one listener: the supervisor', () => {
     const home2 = path.join(sandbox, 'recovered-home')
     signIn(home1, oldKey, double.apiBase)
     signIn(home2, newKey, double.apiBase)
-    const a = daemon(home1, okRunner())
+    // The holder's supervisor looks every 200 ms here, as the standby does (the
+    // default is 5 s, which alone took a third of the wait below). It looks
+    // again only after a minute, so it does not contend for the agent while the
+    // standby takes it over.
+    const a = daemon(home1, okRunner(), { pollMs: 200, unservableRecheckMs: 60_000 })
     await until(() => readIntegrationStatus(home1)?.socket === 'ready', 10_000)
     const b = daemon(home2, okRunner())
     try {
       await until(() => (readIntegrationStatus(home2)?.standby ?? null) !== null, 10_000)
       double.refuseKey(oldKey)
       double.kick(oldKey)
+      // Two steps, each with its own bound: the holder gives the agent up, then the standby serves it.
+      await until(() => readIntegrationStatus(home1)?.unservable?.reason === 'key_refused', 15_000)
       await until(() => readIntegrationStatus(home2)?.socket === 'ready', 15_000)
       const gaveUp = readIntegrationStatus(home1)
       expect(gaveUp?.socket).toBe('idle')
@@ -636,7 +642,7 @@ describe('one agent, one listener: the supervisor', () => {
       await a.stop()
       await b.stop()
     }
-  }, 40_000)
+  }, 60_000)
 
   it('the holder whose runs fail for a runtime reason gives the agent up; the standby takes over; when the standby stops and this home checks out again, it serves again', async () => {
     double = await startServerDouble({ tray: { waiting: 1 } })
@@ -750,7 +756,8 @@ describe('one agent, one listener: the supervisor', () => {
     const oldKey = 'ac_' + 'r'.repeat(40)
     const home1 = path.join(sandbox, 'refused-home')
     signIn(home1, oldKey, double.apiBase)
-    const a = daemon(home1, okRunner(), { unservableRecheckMs: 60_000 })
+    // The supervisor looks every 200 ms here (the default 5 s would be most of the wait below).
+    const a = daemon(home1, okRunner(), { unservableRecheckMs: 60_000, pollMs: 200 })
     try {
       await until(() => readIntegrationStatus(home1)?.socket === 'ready', 10_000)
       double.refuseKey(oldKey)
@@ -1258,8 +1265,11 @@ describe('a probe that hangs is killed with everything it started, and answers',
   it('runProbe: stopped by its signal once the hung tree exists, it kills the whole tree and answers', async () => {
     const pids = path.join(sandbox, 'pids.json')
     const script = [
+      "const fs = require('node:fs')",
+      WRITE_WHOLE_JS,
       "const kid = require('node:child_process').spawn(process.execPath, ['-e', 'setTimeout(() => {}, 600000)'], { stdio: ['ignore', 'inherit', 'inherit'] })",
-      `require('node:fs').writeFileSync(${JSON.stringify(pids)}, JSON.stringify([process.pid, kid.pid]))`,
+      // Written whole: the wait below sees the file only once it holds both pids.
+      `writeWhole(${JSON.stringify(pids)}, JSON.stringify([process.pid, kid.pid]))`,
       'setTimeout(() => {}, 600000)',
     ].join('\n')
     const stop = new AbortController()
