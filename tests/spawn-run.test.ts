@@ -64,11 +64,48 @@ describe('spawnRun', () => {
     expect(outcome.detail).toContain('[redacted')
   })
 
-  it('non-zero exit with nothing on stdout AFTER it ran a while is FAILED (a crash partway), not "did not start"', async () => {
+  it('non-zero exit with nothing on stdout AFTER it ran a while is FAILED (a crash partway), not "did not start" — and SILENT, as ambiguous as a timeout', async () => {
     const outcome = await run(script("setTimeout(() => { process.stderr.write('fatal: out of memory\\n'); process.exit(134) }, 600)"), { notStartedWithinMs: 300 })
-    expect(outcome).toMatchObject({ state: 'failed', exitCode: 134 })
+    expect(outcome).toMatchObject({ state: 'failed', silent: true, exitCode: 134 })
     expect(outcome.detail).toMatch(/^exit 134 after \d+ s with nothing on stdout \(it ran, then ended\): fatal: out of memory$/)
   })
+
+  it('a failure that printed something is not silent: a refusal says `API Error: …` on stdout, so the runtime check can stand as evidence', async () => {
+    const outcome = await run(script("setTimeout(() => { process.stdout.write('API Error: 400 refused\\n'); process.exit(1) }, 600)"), { notStartedWithinMs: 300 })
+    expect(outcome).toMatchObject({ state: 'failed', exitCode: 1 })
+    expect(outcome.silent).toBeUndefined()
+    // Nor is a quick quit (not started), an exit 0, or a timeout.
+    expect((await run(script('process.exit(3)'))).silent).toBeUndefined()
+    expect((await run(script('process.exit(0)'))).silent).toBeUndefined()
+  })
+
+  it('the window is measured to the process\'s EXIT, not to when the run is classified: a quick quit whose pipes a leftover holds past the window is still NOT STARTED', async () => {
+    // The run exits at once with nothing on stdout; a process it started keeps
+    // its pipes open, so `close` does not come and the drain classifies it
+    // long after the window. It never ran: not_started, not a silent failure.
+    const pidFile = path.join(dir, 'quick-holder.pid')
+    const quick = script(
+      [
+        "const { spawn } = require('node:child_process')",
+        "const g = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: ['ignore', 'inherit', 'inherit'] })",
+        `require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(g.pid))`,
+        'process.exit(2)',
+      ].join('\n'),
+    )
+    const outcome = await run(quick, { notStartedWithinMs: 1_500, drainMs: 2_500 })
+    const holder = Number(fs.readFileSync(pidFile, 'utf-8'))
+    try {
+      expect(outcome).toMatchObject({ state: 'not_started', exitCode: 2 })
+      expect(outcome.silent).toBeUndefined()
+      if (process.platform !== 'win32') expect(outcome.durationMs).toBeGreaterThanOrEqual(1_500)
+    } finally {
+      try {
+        process.kill(holder, 'SIGKILL')
+      } catch {
+        /* gone */
+      }
+    }
+  }, 15_000)
 
   it('killed from outside partway (SIGKILL, an OOM killer) with nothing on stdout yet is FAILED, not "did not start"', async () => {
     const pidFile = path.join(dir, 'self.pid')
@@ -78,6 +115,7 @@ describe('spawnRun', () => {
     process.kill(Number(fs.readFileSync(pidFile, 'utf-8')), 'SIGKILL')
     const outcome = await pending
     expect(outcome.state).toBe('failed')
+    expect(outcome.silent).toBe(true)
     expect(outcome.detail).toMatch(/with nothing on stdout \(it ran, then ended\)/)
   }, 10_000)
 

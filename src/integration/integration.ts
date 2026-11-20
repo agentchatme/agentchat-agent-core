@@ -572,9 +572,11 @@ export class Integration {
     if (outcome.state !== 'ok') {
       log.warn(
         `run ${outcome.state} ${subject}${outcome.detail ? `: ${outcome.detail}` : ''} — ${
-          kind === 'conversation'
-            ? 'its card stays on the tray; if the runtime otherwise works, the failure is reported (could not process) and the server decides what follows'
-            : 'the cards stay on the tray; the next wake (or the server\'s re-wake) finds them'
+          kind !== 'conversation'
+            ? 'the cards stay on the tray; the next wake (or the server\'s re-wake) finds them'
+            : outcome.state === 'failed' && outcome.silent === true
+              ? 'its card stays on the tray; a silent failure counts as a timeout: it is reported (could not process) only once another conversation\'s run completes, and the server decides what follows'
+              : 'its card stays on the tray; if the runtime otherwise works, the failure is reported (could not process) and the server decides what follows'
         }`,
       )
     }
@@ -584,7 +586,13 @@ export class Integration {
     if (outcome.state === 'not_started') return { status: 'not_started', ...(outcome.detail !== undefined ? { detail: outcome.detail } : {}) }
     // A run past its budget (killed, or abandoned by the deadline above) is a
     // timed-out failure: a could-not-process report then says `timed_out`.
-    return { status: 'failed', ...(outcome.state === 'timed_out' ? { timedOut: true } : {}), ...(outcome.detail !== undefined ? { detail: outcome.detail } : {}) }
+    // So is a silent failure (`RunOutcome.silent`: it ran, then exited
+    // non-zero with nothing on stdout): as ambiguous as a timeout — a broken
+    // hook, MCP server or instruction file of the user's ends a run that way,
+    // and the runtime check, which loads none of them, would pass. The kit
+    // reports either only once another conversation's run completed.
+    const timedOut = outcome.state === 'timed_out' || (outcome.state === 'failed' && outcome.silent === true)
+    return { status: 'failed', ...(timedOut ? { timedOut: true } : {}), ...(outcome.detail !== undefined ? { detail: outcome.detail } : {}) }
   }
 
   /**
@@ -780,7 +788,9 @@ export class Integration {
     if (result === null) {
       log.warn(`could not process: ${what} — the report failed (${event.error ?? 'no detail'}); nothing more is done for it now: its card stays on the tray and the server re-wakes it`)
     } else {
-      const hidden = result.hidden_message_ids.length
+      // `hidden_message_ids` names at most the newest 200; `hidden_count` counts
+      // them all (absent from a server that predates it: the list then is all).
+      const hidden = result.hidden_count ?? result.hidden_message_ids.length
       const answered =
         result.action === 'retry'
           ? 'retry (the first failure for these messages)'

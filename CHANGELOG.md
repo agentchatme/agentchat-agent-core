@@ -2,6 +2,23 @@
 
 All notable changes to `@agentchatme/agent-core` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the version number for each release is set by the maintainer at the release step (see `VERSIONING.md`).
 
+## [0.7.1] — 2026-11-20
+
+Patch release (fixed existing behaviour → patch +1, `VERSIONING.md`).
+
+### Fixed
+
+- **The Claude Code runtime check reads verbose output.** With verbose on (the `--verbose` flag, the user's `verbose` setting or its `~/.claude.json` copy, or `viewMode: "verbose"`), `claude -p --output-format json` prints a JSON array of every message instead of one result object, and the judge refused every array: the check never passed, so a lone failed conversation was never reported on it and kept being run again. The judge now reads the array's last `type: "result"` element, and the check's settings turn verbose off (`verbose: false`, `viewMode: "default"`, both documented settings that `--settings` outranks). The judge is also stricter, since a false pass hides an innocent conversation: the result must have at least one turn (`num_turns >= 1`) and its text must answer OK (`RUNTIME_CHECK_ANSWER`, the prompt being our own fixed text). Verified on Claude Code 2.1.328 against a stand-in provider: the user's `verbose: true`, `viewMode: "verbose"` or `~/.claude.json` `verbose` printed an array with the 0.7.0 settings and one result object with these; an unknown key or an invalid value in `--settings` leaves the rest (hooks off included) in force.
+- **A silent failure counts as a timeout.** A run that ran past 5 s and then exited non-zero with nothing on stdout was a plain `failed`, so with one conversation failing the runtime check could pass and report it, and a broken hook, MCP server or `CLAUDE.md` of the user's (which the check does not load) would get an innocent conversation hidden. Such a run is now `RunOutcome.silent` and reaches the kit as `RunEnd.timedOut`: it is reported, as `timed_out`, only once another conversation's run completed. A provider's refusal prints `API Error: …` on stdout and stays a plain failure. The run's detail still says `… with nothing on stdout (it ran, then ended)`; `status` counts it as failed; the log says it waits for another conversation's run.
+- **The 5 s not-started window is measured to the process's exit** (`exit` time minus spawn time), not to when the run is classified: a quick quit whose output a leftover process held open past the window was counted as a run that ran and failed.
+- **The could-not-process log line counts every hidden message** (`hidden_count`), not the at most 200 ids the server lists; a server without `hidden_count` falls back to the list.
+- **The Codex runtime check:** the user's hooks are off (`--disable hooks`, the 0.154.0 feature key); it is ok only on exit 0 with a `turn.completed` and an `agent_message` holding text in its `--json` events, and no `turn.failed` (`codexRuntimeCheckJudge`, read from a bounded capture, never logged); and it no longer forces `model_reasoning_effort="low"`: Codex sends a configured effort as is, so a model that does not take `low` refused every check. It now uses the runs' own effort. Verified on Codex 0.154.0 against a stand-in provider.
+- **`doctor` says the runtime check failed only while the daemon runs.** The warning stayed after the daemon stopped. It is now said only while the status file is fresh (written within 3 minutes; a running daemon rewrites it every 30 s); from an older file, `doctor` says the daemon is not running and that the old check says nothing about now. A paused conversation is still said either way (the pause is the server's and ends on its own).
+
+### Changed
+
+- New exports, for the fixes above: `RunOutcome.silent`; `RUNTIME_CHECK_ANSWER` and `codexRuntimeCheckJudge` (from `./presets`); `INTEGRATION_STATUS_STALE_MS`, `integrationStatusFresh` and `integrationStatusWritten`. `CODEX_RUNTIME_CHECK_DISABLED_FEATURES` gains `hooks`; `RUNTIME_CHECK_SETTINGS` gains `verbose` and `viewMode`.
+
 ## [0.7.0] — 2026-11-20
 
 Minor release (added behaviour → minor +1, `VERSIONING.md`). Needs `agentchatme` 1.5.0 or later. Fallback manual 2.4.0 (sha256 7439b4eb…).

@@ -104,16 +104,33 @@ import { withoutInheritedKey, withoutParentSession, type Preset, type PresetCont
 // (`codexRuntimeCheckArgs`):
 //
 //   --sandbox read-only             nothing written, no network for commands.
-//   -c model_reasoning_effort="low" a short answer fits the check's 45 s budget
-//                                   (the runs keep the user's effort).
 //   -c web_search="disabled", --disable memories, plugins, apps
 //                                   as an `answer` run: no web search, no local
 //                                   memory, no plugin-bundled servers or skills,
 //                                   no ChatGPT connectors.
+//   --disable hooks                 none of the user's hooks fire on a health
+//                                   check (`hooks` is the feature key of
+//                                   Feature::CodexHooks, stable and on by
+//                                   default in 0.154.0, `codex features list`;
+//                                   it sets HooksConfig.feature_enabled,
+//                                   core/src/session/mod.rs:4726).
 //   -c mcp_servers.agentchat.url=<the runs' URL>, -c mcp_servers.agentchat.enabled=false
 //                                   the hosted AgentChat server switched off
 //                                   (with the URL the table is valid whether or
 //                                   not a config layer defines one).
+//
+// No reasoning effort is set: the check asks with the effort the runs use (the
+// user's `model_reasoning_effort`, else the model's default). Codex sends a
+// configured effort as is (protocol/src/openai_models/reasoning_effort.rs:
+// only `ultra` and `persistent` are mapped), so `low` would make a model
+// without it (one that accepts only `high`, or no reasoning effort at all)
+// refuse every check; the check would then never pass for that user.
+//
+// The check is ok only on exit 0 AND, in its `--json` events
+// (exec/src/exec_events.rs), a `turn.completed` with an `agent_message` item
+// that holds text, and no `turn.failed` (`codexRuntimeCheckJudge`): exit 0
+// alone is not an answer. The events are read from a bounded capture
+// (`RUNTIME_CHECK_OUTPUT_BYTES`), never logged.
 //
 // The user's OTHER MCP servers still load: Codex 0.154.0 has no documented
 // switch that turns every MCP server off, and switching each off by name
@@ -126,8 +143,10 @@ import { withoutInheritedKey, withoutParentSession, type Preset, type PresetCont
 // decides the model and its provider, as for the runs. Verified on 0.154.0
 // against a stand-in provider: these flags parse with and without an
 // `agentchat` table in config.toml; the model is offered no agentchat tool and
-// no web search, and is asked for low effort; a provider error exits 1 and an
-// answer exits 0.
+// no web search; a provider error exits 1 and an answer exits 0. Rechecked for
+// 0.7.1 (stand-in provider): `--disable hooks` parses, the request carries no
+// effort of ours, and an answer prints `item.completed` (`agent_message`,
+// "OK") then `turn.completed`; a refusal prints `turn.failed` and exits 1.
 
 export const CODEX_PRESET = 'codex'
 
@@ -236,17 +255,21 @@ export function codexProfileArgs(profile: RunProfile): string[] {
   }
 }
 
-/** The features a runtime check turns off, as an `answer` run does (names at the 0.154.0 floor). */
-export const CODEX_RUNTIME_CHECK_DISABLED_FEATURES = ['memories', 'plugins', 'apps'] as const
+/**
+ * The features a runtime check turns off: as an `answer` run does (memories,
+ * plugins, apps), and the user's hooks (names at the 0.154.0 floor, `codex
+ * features list`).
+ */
+export const CODEX_RUNTIME_CHECK_DISABLED_FEATURES = ['memories', 'plugins', 'apps', 'hooks'] as const
 
 /**
  * The argv of a runtime check: `codex exec` in `dir` (an empty folder), the
- * read-only sandbox, no session files, low reasoning effort, no web search,
- * memories, plugins or connectors, and the hosted AgentChat server switched
- * off for it; the prompt on stdin, as for a run. `agentchatUrl` is the URL the
- * runs pin (with it, the `agentchat` table stays valid whether or not a config
- * layer defines one); without it a config layer must define the table, as the
- * runs need.
+ * read-only sandbox, no session files, no web search, memories, plugins,
+ * connectors or hooks, and the hosted AgentChat server switched off for it;
+ * the prompt on stdin, as for a run. The model and its reasoning effort are
+ * the runs' (see the header). `agentchatUrl` is the URL the runs pin (with
+ * it, the `agentchat` table stays valid whether or not a config layer defines
+ * one); without it a config layer must define the table, as the runs need.
  */
 export function codexRuntimeCheckArgs(dir: string, agentchatUrl?: string): string[] {
   const table = `mcp_servers.${CODEX_MCP_SERVER_NAME}`
@@ -260,8 +283,6 @@ export function codexRuntimeCheckArgs(dir: string, agentchatUrl?: string): strin
     '--sandbox',
     'read-only',
     '-c',
-    'model_reasoning_effort="low"',
-    '-c',
     'web_search="disabled"',
     ...CODEX_RUNTIME_CHECK_DISABLED_FEATURES.flatMap((feature) => ['--disable', feature]),
     ...(agentchatUrl !== undefined ? ['-c', `${table}.url=${JSON.stringify(agentchatUrl)}`] : []),
@@ -274,6 +295,49 @@ export function codexRuntimeCheckArgs(dir: string, agentchatUrl?: string): strin
 /** The empty folder a runtime check runs in, under CODEX_HOME. */
 export function codexRuntimeCheckWorkdir(codexHome: string): string {
   return path.join(codexHome, RUNTIME_CHECK_DIR)
+}
+
+/** A JSON object, or null for anything else. */
+function jsonObject(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : null
+}
+
+/**
+ * Whether a runtime check's stdout (`codex exec --json`: one event per line,
+ * exec/src/exec_events.rs) is a good answer: null when it holds a
+ * `turn.completed` event and an `item.completed` whose item is an
+ * `agent_message` with text, and no `turn.failed`; otherwise why not, in event
+ * types only, never a message or an error's text. Exit 0 alone is not an
+ * answer. A line that is not a JSON object is skipped (a cut-off last line
+ * included: its events are then missing, and the check is not ok).
+ */
+export function codexRuntimeCheckJudge(stdout: string): string | null {
+  let events = 0
+  let completed = false
+  let failed = false
+  let answered = false
+  for (const line of stdout.split(/\r?\n/)) {
+    if (line.trim().length === 0) continue
+    let event: Record<string, unknown> | null
+    try {
+      event = jsonObject(JSON.parse(line))
+    } catch {
+      continue
+    }
+    if (event === null) continue
+    events += 1
+    if (event['type'] === 'turn.completed') completed = true
+    else if (event['type'] === 'turn.failed') failed = true
+    else if (event['type'] === 'item.completed') {
+      const item = jsonObject(event['item'])
+      if (item !== null && item['type'] === 'agent_message' && typeof item['text'] === 'string' && item['text'].trim().length > 0) answered = true
+    }
+  }
+  if (events === 0) return 'its answer holds no JSON event'
+  if (failed) return 'the turn failed (turn.failed)'
+  if (!completed) return 'the turn did not complete (no turn.completed)'
+  if (!answered) return 'the turn completed with no agent message'
+  return null
 }
 
 /** Where a run's hosted tool server points, and which variable carries its bearer token. */
@@ -763,9 +827,11 @@ export class CodexRunner implements RunRunner {
   /**
    * Does the model answer right now, through this runner's binary, sign-in,
    * CODEX_HOME and environment? One `codex exec` with a fixed prompt in its
-   * own empty folder, read-only, with the hosted AgentChat server switched off
-   * (`codexRuntimeCheckArgs`) and no key in its environment. Its output is
-   * discarded. Never throws.
+   * own empty folder, read-only, with the hosted AgentChat server and the
+   * user's hooks switched off (`codexRuntimeCheckArgs`) and no key in its
+   * environment; ok only on exit 0 with a completed turn that holds an agent
+   * message (`codexRuntimeCheckJudge`). Its output is read for that alone and
+   * never logged. Never throws.
    */
   async checkRuntime(options: RunPreflightOptions = {}): Promise<RunPreflight> {
     if (this.options.refuse !== undefined) return { ok: false, detail: this.options.refuse }
@@ -778,6 +844,8 @@ export class CodexRunner implements RunRunner {
       // The runs' environment; runRuntimeCheck takes every key variable out, this runner's own included.
       env: this.env(),
       keyEnv: this.options.keyEnv,
+      // Exit 0 is not enough: the events must show a completed turn with the model's answer.
+      judge: codexRuntimeCheckJudge,
       ...(options.signal !== undefined ? { signal: options.signal } : {}),
     })
   }

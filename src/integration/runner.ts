@@ -77,11 +77,13 @@ export interface RunRequest {
 
 /**
  * `not_started` — the runtime never got going: binary missing, or a non-zero
- * exit with NOTHING ON STDOUT (an auth gate, a bad flag, a missing config —
- * all of which print their complaint on stderr and quit; stderr does not
- * count as output). `failed` — it produced output and exited non-zero, or was
- * interrupted. `timed_out` — it ran past its budget and was killed. `ok` —
- * exit 0. Anything but `ok` leaves the cards on the tray: there is no local retry —
+ * exit with NOTHING ON STDOUT within `NOT_STARTED_WITHIN_MS` of the spawn (an
+ * auth gate, a bad flag, a missing config — all of which print their
+ * complaint on stderr and quit; stderr does not count as output). `failed` —
+ * it produced output and exited non-zero, exited non-zero with nothing on
+ * stdout after running longer than that (`silent`), or was interrupted.
+ * `timed_out` — it ran past its budget and was killed. `ok` — exit 0.
+ * Anything but `ok` leaves the cards on the tray: there is no local retry —
  * the server re-wakes an agent for cards it has not answered (contract v1, D3).
  */
 export type RunOutcomeState = 'ok' | 'failed' | 'timed_out' | 'not_started'
@@ -92,6 +94,17 @@ export interface RunOutcome {
   readonly durationMs: number
   /** Bounded, credential-redacted diagnostic. Never message content. */
   readonly detail?: string
+  /**
+   * A `failed` run that ran past `NOT_STARTED_WITHIN_MS` and then exited
+   * non-zero with NOTHING on stdout: a crash, a kill, or something the run
+   * loads that the runtime check does not (a user's hook, MCP server or
+   * instruction file) ending it. As ambiguous as a timeout, so the engine
+   * hands it to the kit as one (`RunEnd.timedOut`): it is reported as a
+   * conversation's only once another conversation's run completed, never on
+   * the runtime check alone. A provider's refusal prints its error on stdout
+   * (`API Error: …`), so it is a plain `failed`, not this.
+   */
+  readonly silent?: boolean
 }
 
 export interface RunPreflightOptions {

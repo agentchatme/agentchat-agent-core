@@ -16,18 +16,28 @@ import * as path from 'node:path'
 //   FAKE_RUNTIME_PROBE_HANG=version|auth   that probe hangs, with a child holding its output pipe
 //   FAKE_RUNTIME_PROBE_PIDS=<file> where the hung probe writes its pid and its child's
 //   FAKE_MCP_LIST_RECORD=<file>    where `mcp list` appends its argv, cwd and env
-//   FAKE_RUNTIME_RUN_MODE=fail|silent|hang|error_exit0|text
+//   FAKE_RUNTIME_RUN_MODE=fail|silent|hang|error_exit0|text|not_ok|no_turns|no_message|no_turn
 //                                  how a headless run (or a runtime check)
 //                                  ends instead of answering: exit 1 after
-//                                  some output (with `--output-format json`, a
-//                                  result with `is_error: true`), exit 0 with
-//                                  no output, never (its pid to
+//                                  some output (with JSON asked for, a result
+//                                  with `is_error: true` / a `turn.failed`),
+//                                  exit 0 with no output, never (its pid to
 //                                  FAKE_RUNTIME_RUN_PIDS), exit 0 with an
-//                                  `is_error: true` result, or exit 0 with
-//                                  plain text where JSON was asked for
+//                                  `is_error: true` result / a `turn.failed`,
+//                                  exit 0 with plain text where JSON was asked
+//                                  for, an answer that is not OK, a Claude
+//                                  result with `num_turns: 0`, a Codex turn
+//                                  with no agent message, or a Codex agent
+//                                  message with no `turn.completed`
+//   FAKE_RUNTIME_VERBOSE=1         Claude Code's verbose output whatever the
+//                                  flags say (a user or managed setting)
 //
-// With `--output-format json` a run answers one result object, shaped as
-// Claude Code's (`type`, `subtype`, `is_error`, `result`).
+// With `--output-format json` a Claude run answers one result object, shaped
+// as Claude Code's (`type`, `subtype`, `is_error`, `num_turns`, `result`), or
+// with `--verbose` (FAKE_RUNTIME_VERBOSE=1) the array of every message, the
+// result last. With `exec --json` a Codex run prints Codex's events, one per
+// line (`thread.started`, `turn.started`, `item.completed` with an
+// `agent_message`, `turn.completed`). An answer says `OK`.
 //
 // A run's record also says what its `--mcp-config` file held at that moment:
 // the server names and the file mode (never its contents — it carries a key).
@@ -123,10 +133,27 @@ function install(root: string, name: string, version: string, authArgs: [string,
       "  const runMode = process.env.FAKE_RUNTIME_RUN_MODE",
       "  if (runMode === 'silent') process.exit(0)",
       "  if (runMode === 'hang') { if (process.env.FAKE_RUNTIME_RUN_PIDS) fs.writeFileSync(process.env.FAKE_RUNTIME_RUN_PIDS, JSON.stringify([process.pid])); setTimeout(() => {}, 600000); throw 'hang' }",
-      "  const json = args[args.indexOf('--output-format') + 1] === 'json' && args.includes('--output-format')",
-      "  const result = (isError) => JSON.stringify({ type: 'result', subtype: 'success', is_error: isError, result: 'model output that must be discarded', ...(isError ? { api_error_status: 400, terminal_reason: 'api_error' } : { terminal_reason: 'completed' }) }) + '\\n'",
-      "  if (runMode === 'text' || !json) process.stdout.write('model output that must be discarded\\n')",
-      "  else process.stdout.write(result(runMode === 'fail' || runMode === 'error_exit0'))",
+      "  const SECRET = 'model output that must be discarded'",
+      "  const isError = runMode === 'fail' || runMode === 'error_exit0'",
+      "  const claudeJson = args.includes('--output-format') && args[args.indexOf('--output-format') + 1] === 'json'",
+      "  const codexJson = args[0] === 'exec' && args.includes('--json')",
+      "  if (runMode === 'text' || (!claudeJson && !codexJson)) process.stdout.write(SECRET + '\\n')",
+      '  else if (claudeJson) {',
+      // Claude Code's result object; with verbose on (`--verbose`, or the user's setting: FAKE_RUNTIME_VERBOSE=1) the array of every message, the result last.
+      "    const result = { type: 'result', subtype: 'success', is_error: isError, num_turns: runMode === 'no_turns' ? 0 : 1, result: isError || runMode === 'not_ok' ? SECRET : 'OK', ...(isError ? { api_error_status: 400, terminal_reason: 'api_error' } : { terminal_reason: 'completed' }) }",
+      "    const verbose = args.includes('--verbose') || process.env.FAKE_RUNTIME_VERBOSE === '1'",
+      "    process.stdout.write(JSON.stringify(verbose ? [{ type: 'system', subtype: 'init', tools: [], mcp_servers: [] }, { type: 'assistant', message: { content: [{ type: 'text', text: result.result }] } }, result] : result) + '\\n')",
+      '  } else {',
+      // Codex's `exec --json` events, one per line (exec/src/exec_events.rs).
+      "    const ev = (e) => process.stdout.write(JSON.stringify(e) + '\\n')",
+      "    ev({ type: 'thread.started', thread_id: 'fake-thread' })",
+      "    ev({ type: 'turn.started' })",
+      "    if (isError) { ev({ type: 'error', message: SECRET }); ev({ type: 'turn.failed', error: { message: SECRET } }) }",
+      '    else {',
+      "      if (runMode !== 'no_message') ev({ type: 'item.completed', item: { id: 'item_0', type: 'agent_message', text: runMode === 'not_ok' ? SECRET : 'OK' } })",
+      "      if (runMode !== 'no_turn') ev({ type: 'turn.completed', usage: { input_tokens: 1, cached_input_tokens: 0, output_tokens: 1, reasoning_output_tokens: 0 } })",
+      '    }',
+      '  }',
       "  if (runMode === 'fail') { console.error('API Error: the provider refused this request'); process.exit(1) }",
       '  process.exit(0)',
       '}',

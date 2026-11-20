@@ -15,13 +15,22 @@ import { log } from '../util/log.js'
 // Classification: `ok` on exit 0; `timed_out` when the budget killed it;
 // `failed` when it was interrupted, exited non-zero after writing to stdout,
 // or exited non-zero with nothing on stdout after it had run a while
-// (`NOT_STARTED_WITHIN_MS`: a crash, an out-of-memory kill, a SIGKILL partway
-// through — a runtime that prints its answer only at the end has said
-// nothing yet); `not_started` when it could not be spawned, or exited
-// non-zero with NOTHING ON STDOUT within that window — a signed-out CLI, a
-// bad flag, a missing config all print their complaint on stderr and quit at
-// once, and they are "the runtime did not get going", stderr or not. The
-// stderr tail rides along in the detail either way.
+// (`NOT_STARTED_WITHIN_MS`, measured from the spawn to the process's exit: a
+// crash, an out-of-memory kill, a SIGKILL partway through — a runtime that
+// prints its answer only at the end has said nothing yet); `not_started` when
+// it could not be spawned, or exited non-zero with NOTHING ON STDOUT within
+// that window — a signed-out CLI, a bad flag, a missing config all print
+// their complaint on stderr and quit at once, and they are "the runtime did
+// not get going", stderr or not. The stderr tail rides along in the detail
+// either way.
+//
+// The silent failure past the window is `failed` with `silent: true`
+// (`RunOutcome.silent`): it says nothing about why. A provider's refusal
+// prints its `API Error: …` on stdout, so it is a plain `failed`; a run that
+// a broken hook, MCP server or instruction file ends prints nothing, and the
+// runtime check, which loads none of those, would pass. So the engine counts
+// a silent failure like a timeout (`RunEnd.timedOut`): it is reported as a
+// conversation's only once another conversation's run completed.
 //
 // The run is spawned as its own process group (detached) so the whole tree
 // can be signalled at once: on the budget, and when the integration is stopping
@@ -52,8 +61,9 @@ import { log } from '../util/log.js'
 const DEFAULT_GRACE_MS = 5_000
 /**
  * A run that exits non-zero with nothing on stdout counts as `not_started`
- * only within this long of its spawn (a refused flag, a signed-out CLI: they
- * quit at once). Past it, it ran and then died: `failed`.
+ * only when it exited within this long of its spawn (a refused flag, a
+ * signed-out CLI: they quit at once). Exited later, it ran and then died:
+ * `failed`, `silent`.
  */
 export const NOT_STARTED_WITHIN_MS = 5_000
 /** After the run's process exited: how long its pipes get to close before the run is detached from them. */
@@ -337,8 +347,13 @@ function runSpawned(spec: SpawnRunSpec, captureBytes: number): Promise<{ outcome
       }
     }
 
-    /** The outcome for an exit the run did make; `note` says why `close` was not waited for. */
-    const classify = (code: number | null, signal: NodeJS.Signals | null, note: string | null): Omit<RunOutcome, 'durationMs'> => {
+    /**
+     * The outcome for an exit the run did make; `note` says why `close` was
+     * not waited for. `exitedAt`: when the process exited (its `exit` event),
+     * not when it is classified — `close` can follow much later (a process
+     * the run started holding its pipes, the drain).
+     */
+    const classify = (code: number | null, signal: NodeJS.Signals | null, note: string | null, exitedAt: number): Omit<RunOutcome, 'durationMs'> => {
       const tail = redactDiagnostic(stderrTail)
       const extra = `${note ? ` (${note})` : ''}${tail ? `: ${tail}` : ''}`
       if (timedOut) {
@@ -352,10 +367,12 @@ function runSpawned(spec: SpawnRunSpec, captureBytes: number): Promise<{ outcome
       const exit = code === null ? `signal ${signal ?? 'unknown'}` : `exit ${code}`
       if (stdoutBytes === 0) {
         // It ran a while and then died (a crash, an OOM kill, a SIGKILL
-        // partway through) before printing anything: a failed run.
-        const ranMs = spawnedAt === null ? 0 : Date.now() - spawnedAt
+        // partway through, a hook or MCP server the run loads) before printing
+        // anything: a failed run, and a silent one — as ambiguous as a
+        // timeout (`RunOutcome.silent`). Measured to the exit, not to now.
+        const ranMs = spawnedAt === null ? 0 : Math.max(0, exitedAt - spawnedAt)
         if (spawnedAt !== null && ranMs >= notStartedWithinMs) {
-          return { state: 'failed', exitCode: code, detail: `${exit} after ${Math.round(ranMs / 1000)} s with nothing on stdout (it ran, then ended)${extra}` }
+          return { state: 'failed', silent: true, exitCode: code, detail: `${exit} after ${Math.round(ranMs / 1000)} s with nothing on stdout (it ran, then ended)${extra}` }
         }
         // It quit at once: the runtime did not get going (refused to start,
         // a bad flag, an auth gate). Whatever it complained about is in the tail.
@@ -489,13 +506,16 @@ function runSpawned(spec: SpawnRunSpec, captureBytes: number): Promise<{ outcome
             process.platform === 'win32'
               ? 'a process the run started kept its output open after it exited; its children were swept (taskkill) and the run detached from it — a process the sweep cannot see can survive'
               : 'a process the run started kept its output open after it exited; the run\'s process group was signalled (SIGKILL) and the run detached from it — a process that left the group can survive',
+            exited.at,
           ),
         )
       })
     })
 
     proc.on('close', (code, signal) => {
-      finish(classify(code, signal, null))
+      // `exit` comes before `close` (Node emits `close` only once the process
+      // has exited and its pipes are closed); `now` only if it somehow did not.
+      finish(classify(code, signal, null, exited?.at ?? Date.now()))
     })
   })
 }

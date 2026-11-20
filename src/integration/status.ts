@@ -431,6 +431,26 @@ export function integrationStatusAge(status: IntegrationStatus | null, now = Dat
   return Number.isNaN(t) ? null : Math.max(0, now - t)
 }
 
+/**
+ * Past this age the status file is not the daemon's current word: a running
+ * integration rewrites it every 30 s, connected or not (the heartbeat file
+ * beats only while connected), so a file this old means the daemon is not
+ * running.
+ */
+export const INTEGRATION_STATUS_STALE_MS = 3 * 60_000
+
+/** Whether the status file was written within `INTEGRATION_STATUS_STALE_MS`: the daemon that wrote it is running. */
+export function integrationStatusFresh(status: IntegrationStatus | null, now = Date.now()): boolean {
+  const age = integrationStatusAge(status, now)
+  return age !== null && age <= INTEGRATION_STATUS_STALE_MS
+}
+
+/** When the status file was written, in words (`3 hour(s) ago`), for a line that says the daemon is not running. */
+export function integrationStatusWritten(status: IntegrationStatus | null, now = Date.now()): string {
+  const age = integrationStatusAge(status, now)
+  return age === null ? 'at a time that cannot be read' : ago(age)
+}
+
 function ago(ms: number): string {
   if (ms < 45_000) return 'just now'
   if (ms < 90_000) return '1 minute ago'
@@ -497,7 +517,10 @@ export function describeCouldNotProcessCounts(c: IntegrationCouldNotProcess, now
 /**
  * Whether the last runtime check failed and nothing has got done since: a run
  * that completed after the check says the runtime works again, and the failed
- * check is history (the counts say it).
+ * check is history (the counts say it). It does not look at the file's age:
+ * a caller that warns about it does so only while the daemon runs
+ * (`integrationStatusFresh`), since a check from before the daemon stopped
+ * says nothing about now.
  */
 export function runtimeCheckFailingNow(status: Pick<IntegrationStatus, 'could_not_process' | 'last_ok_run_at'> | null): boolean {
   const last = status?.could_not_process?.last_runtime_check ?? null
@@ -528,7 +551,7 @@ function textsLine(texts: TextsStatus | null, now: number): string {
 export function formatIntegrationStatus(status: IntegrationStatus | null, now = Date.now()): string[] {
   if (status === null) return ['Integration: no status recorded yet (the daemon has not run, or is still starting)']
   const age = integrationStatusAge(status, now)
-  const stale = age !== null && age > 3 * 60_000
+  const stale = age !== null && age > INTEGRATION_STATUS_STALE_MS
   const standby = status.standby ?? null
   const failing = status.runs_failing ?? null
   const unservable = status.unservable ?? null

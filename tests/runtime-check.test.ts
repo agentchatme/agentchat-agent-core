@@ -16,6 +16,7 @@ import {
   CODEX_RUNTIME_CHECK_DISABLED_FEATURES,
   codexPreset,
   codexRuntimeCheckArgs,
+  codexRuntimeCheckJudge,
   codexRuntimeCheckWorkdir,
   runRuntimeCheck,
 } from '../src/presets/index.js'
@@ -91,8 +92,15 @@ describe('Claude Code: one `claude -p` with no tool of any kind', () => {
       '--settings', RUNTIME_CHECK_SETTINGS,
       ...(posix ? ['--disallowedTools', 'Read(//h),Read(//h/**),Read(//c/.claude.json),Read(//c/.claude.json/**)'] : []),
     ])
-    // No hooks; CLAUDE.md and memory off again in the settings, as ANSWER_SETTINGS does (a settings file's env wins over the process's).
-    expect(JSON.parse(RUNTIME_CHECK_SETTINGS)).toEqual({ env: { CLAUDE_CODE_DISABLE_CLAUDE_MDS: '1', CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1' }, disableAllHooks: true })
+    // No hooks; CLAUDE.md and memory off again in the settings, as ANSWER_SETTINGS does (a settings file's env wins over the process's);
+    // verbose output off (`viewMode` overrides `verbose`; both outranked only by the `--verbose` flag, never passed, and managed settings).
+    expect(JSON.parse(RUNTIME_CHECK_SETTINGS)).toEqual({
+      env: { CLAUDE_CODE_DISABLE_CLAUDE_MDS: '1', CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1' },
+      disableAllHooks: true,
+      verbose: false,
+      viewMode: 'default',
+    })
+    expect(claudeRuntimeCheckArgs()).not.toContain('--verbose')
     expect(claudeRuntimeCheckArgs()).not.toContain('--mcp-config')
   })
 
@@ -146,21 +154,72 @@ describe('Claude Code: one `claude -p` with no tool of any kind', () => {
     for (const r of [errored, text]) expect(r.detail).not.toContain('must be discarded')
   }, 20_000)
 
-  it('the judge: success means type result, subtype success and is_error false — as Claude Code 2.1.328 prints them', () => {
+  it('the judge: a result object — success, no error, a turn, and an answer that says OK — as Claude Code 2.1.328 prints it', () => {
     // Shapes as seen against a stand-in provider (texts shortened): an answer, and an API error, which is
     // `subtype: "success"` with `is_error: true` — so the subtype alone says nothing.
     const answer = JSON.stringify({ type: 'result', subtype: 'success', is_error: false, api_error_status: null, terminal_reason: 'completed', num_turns: 1, result: 'OK', session_id: 's' })
-    const apiError = JSON.stringify({ type: 'result', subtype: 'success', is_error: true, api_error_status: 401, api_error_type: 'authentication_error', terminal_reason: 'api_error', result: 'Invalid API key · Fix external API key' })
+    const apiError = JSON.stringify({ type: 'result', subtype: 'success', is_error: true, num_turns: 1, api_error_status: 401, api_error_type: 'authentication_error', terminal_reason: 'api_error', result: 'Invalid API key · Fix external API key' })
     expect(claudeRuntimeCheckJudge(`${answer}\n`)).toBeNull()
+    expect(claudeRuntimeCheckJudge(JSON.stringify({ ...JSON.parse(answer), result: 'OK.' }))).toBeNull()
+    expect(claudeRuntimeCheckJudge(JSON.stringify({ ...JSON.parse(answer), result: 'ok' }))).toBeNull()
     expect(claudeRuntimeCheckJudge(apiError)).toBe('the result is not a success (type result, subtype success, is_error true, api_error_status 401, terminal_reason api_error)')
     expect(claudeRuntimeCheckJudge(JSON.stringify({ type: 'result', subtype: 'error_during_execution', is_error: true }))).toBe('the result is not a success (type result, subtype error_during_execution, is_error true)')
     expect(claudeRuntimeCheckJudge(JSON.stringify({ type: 'result', subtype: 'success' }))).toBe('the result is not a success (type result, subtype success, is_error ?)')
     expect(claudeRuntimeCheckJudge('OK')).toBe('its answer is not a JSON result')
-    expect(claudeRuntimeCheckJudge('[1]')).toBe('its answer is not a JSON result')
     // A line before the result (a warning) does not hide it.
     expect(claudeRuntimeCheckJudge(`a warning\n${answer}`)).toBeNull()
     expect(claudeRuntimeCheckJudge(apiError)).not.toContain('Invalid API key')
   })
+
+  it('the judge: no turn (num_turns 0 or missing) is not an answer, and neither is a success whose text is not OK; the text is never in the reason', () => {
+    const base = { type: 'result', subtype: 'success', is_error: false, terminal_reason: 'completed', num_turns: 1, result: 'OK' }
+    expect(claudeRuntimeCheckJudge(JSON.stringify({ ...base, num_turns: 0 }))).toBe('the result has no turn (num_turns 0)')
+    const { num_turns: _turns, ...noTurns } = base
+    expect(claudeRuntimeCheckJudge(JSON.stringify(noTurns))).toBe('the result has no turn (num_turns ?)')
+    for (const text of ["I can't help with that. PEER-LIKE TEXT", 'Okay', 'token', '', 'Credit balance is too low']) {
+      const reason = claudeRuntimeCheckJudge(JSON.stringify({ ...base, result: text }))
+      expect(reason, text).toBe('the result does not answer OK')
+    }
+    expect(claudeRuntimeCheckJudge(JSON.stringify({ ...base, result: null }))).toBe('the result does not answer OK')
+    expect(claudeRuntimeCheckJudge(JSON.stringify({ ...base, result: "I can't help with that. PEER-LIKE TEXT" }))).not.toContain('PEER-LIKE')
+  })
+
+  it('the judge: verbose output (a JSON array of every message) is judged on its last result, as Claude Code 2.1.328 prints it', () => {
+    // As seen with `--verbose`, the `verbose` setting or `viewMode: "verbose"` (stand-in provider, fields shortened):
+    // one line, `[init, assistant, result]`.
+    const init = { type: 'system', subtype: 'init', cwd: '/x/agentchat-runtime-check', tools: [], mcp_servers: [], model: 'claude-opus-5-5', permissionMode: 'default' }
+    const assistant = { type: 'assistant', message: { content: [{ type: 'text', text: 'OK' }] }, parent_tool_use_id: null }
+    const ok = { type: 'result', subtype: 'success', is_error: false, num_turns: 1, result: 'OK', terminal_reason: 'completed', api_error_status: null }
+    const apiError = { type: 'result', subtype: 'success', is_error: true, num_turns: 1, result: 'API Error: 400 refused', terminal_reason: 'api_error', api_error_status: 400 }
+    expect(claudeRuntimeCheckJudge(JSON.stringify([init, assistant, ok]))).toBeNull()
+    expect(claudeRuntimeCheckJudge(`${JSON.stringify([init, assistant, ok])}\n`)).toBeNull()
+    expect(claudeRuntimeCheckJudge(JSON.stringify([init, apiError]))).toBe('the result is not a success (type result, subtype success, is_error true, api_error_status 400, terminal_reason api_error)')
+    expect(claudeRuntimeCheckJudge(JSON.stringify([init, { ...ok, num_turns: 0 }]))).toBe('the result has no turn (num_turns 0)')
+    expect(claudeRuntimeCheckJudge(JSON.stringify([init, assistant, { ...ok, result: 'Not that' }]))).toBe('the result does not answer OK')
+    // The last result counts: an earlier good one does not cover a later error.
+    expect(claudeRuntimeCheckJudge(JSON.stringify([init, ok, apiError]))).toMatch(/^the result is not a success/)
+    // No result in it, or nothing that is a message.
+    expect(claudeRuntimeCheckJudge(JSON.stringify([init, assistant]))).toBe('its answer is a list of messages with no result')
+    expect(claudeRuntimeCheckJudge('[1]')).toBe('its answer is a list of messages with no result')
+    expect(claudeRuntimeCheckJudge('[]')).toBe('its answer is a list of messages with no result')
+    // An array cut off by the capture is not JSON: not ok.
+    expect(claudeRuntimeCheckJudge(JSON.stringify([init, assistant, ok]).slice(0, 80))).toBe('its answer is not a JSON result')
+  })
+
+  it('the runner: verbose output (a setting the flags cannot turn off, e.g. a managed one) still passes; a non-OK answer or no turn does not', async () => {
+    const fake = installFakeClaude(sandbox)
+    const runner = (extra: NodeJS.ProcessEnv): ClaudeRunner =>
+      new ClaudeRunner({ configDir: path.join(sandbox, '.claude'), workdir: path.join(sandbox, 'w'), profile: 'own', denyReadPaths: [home], env: withFake(fake, extra) })
+    expect(await runner({ FAKE_RUNTIME_VERBOSE: '1' }).checkRuntime()).toEqual({ ok: true })
+    expect(await runner({ FAKE_RUNTIME_VERBOSE: '1', FAKE_RUNTIME_RUN_MODE: 'error_exit0' }).checkRuntime()).toEqual({
+      ok: false,
+      detail: 'claude runtime check failed: exit 0, but the result is not a success (type result, subtype success, is_error true, api_error_status 400, terminal_reason api_error)',
+    })
+    const notOk = await runner({ FAKE_RUNTIME_RUN_MODE: 'not_ok' }).checkRuntime()
+    expect(notOk).toEqual({ ok: false, detail: 'claude runtime check failed: exit 0, but the result does not answer OK' })
+    expect(await runner({ FAKE_RUNTIME_RUN_MODE: 'no_turns' }).checkRuntime()).toEqual({ ok: false, detail: 'claude runtime check failed: exit 0, but the result has no turn (num_turns 0)' })
+    expect(notOk.detail).not.toContain('must be discarded')
+  }, 20_000)
 
   it('a check that hangs is stopped when its signal aborts: the process is killed and the answer is not ok', async () => {
     const fake = installFakeClaude(sandbox)
@@ -200,9 +259,8 @@ describe('Codex: one `codex exec` in an empty folder, read-only, with the AgentC
     expect(codexRuntimeCheckArgs('/c/check', 'https://api.example/mcp')).toEqual([
       'exec', '--json', '--skip-git-repo-check', '--ephemeral', '-C', '/c/check',
       '--sandbox', 'read-only',
-      '-c', 'model_reasoning_effort="low"',
       '-c', 'web_search="disabled"',
-      '--disable', 'memories', '--disable', 'plugins', '--disable', 'apps',
+      '--disable', 'memories', '--disable', 'plugins', '--disable', 'apps', '--disable', 'hooks',
       '-c', 'mcp_servers.agentchat.url="https://api.example/mcp"',
       '-c', 'mcp_servers.agentchat.enabled=false',
       '-',
@@ -210,13 +268,39 @@ describe('Codex: one `codex exec` in an empty folder, read-only, with the AgentC
     // Without a URL (config.toml defines the table, as such runs need), only the switch.
     expect(codexRuntimeCheckArgs('/c/check')).toEqual([
       'exec', '--json', '--skip-git-repo-check', '--ephemeral', '-C', '/c/check', '--sandbox', 'read-only',
-      '-c', 'model_reasoning_effort="low"', '-c', 'web_search="disabled"',
-      '--disable', 'memories', '--disable', 'plugins', '--disable', 'apps',
+      '-c', 'web_search="disabled"',
+      '--disable', 'memories', '--disable', 'plugins', '--disable', 'apps', '--disable', 'hooks',
       '-c', 'mcp_servers.agentchat.enabled=false', '-',
     ])
-    // The same features an answer run turns off, at the 0.154.0 floor.
-    expect(CODEX_RUNTIME_CHECK_DISABLED_FEATURES).toEqual(['memories', 'plugins', 'apps'])
-    for (const feature of CODEX_RUNTIME_CHECK_DISABLED_FEATURES) expect(CODEX_ANSWER_DISABLED_FEATURES).toContain(feature)
+    // The features an answer run turns off, and the user's hooks (`hooks`, Feature::CodexHooks at the 0.154.0 floor).
+    expect(CODEX_RUNTIME_CHECK_DISABLED_FEATURES).toEqual(['memories', 'plugins', 'apps', 'hooks'])
+    for (const feature of ['memories', 'plugins', 'apps']) expect(CODEX_ANSWER_DISABLED_FEATURES).toContain(feature)
+    // No reasoning effort of ours: a model that does not take `low` would refuse every check. The runs' effort applies.
+    expect(codexRuntimeCheckArgs('/c/check').join(' ')).not.toContain('reasoning')
+  })
+
+  it('the judge: a completed turn with an agent message, as Codex 0.154.0 prints it; anything less is not an answer, and no text is in the reason', () => {
+    // As seen against a stand-in provider (one event per line; the metadata warning is an `error` item).
+    const lines = (...events: object[]): string => events.map((e) => JSON.stringify(e)).join('\n') + '\n'
+    const started = { type: 'thread.started', thread_id: '01a1f68f-394f-7e12-9d33-05a89172b741' }
+    const warning = { type: 'item.completed', item: { id: 'item_0', type: 'error', message: 'Model metadata for `fake-model` not found. Defaulting to fallback metadata; this can degrade performance and cause issues.' } }
+    const turn = { type: 'turn.started' }
+    const message = { type: 'item.completed', item: { id: 'item_1', type: 'agent_message', text: 'OK' } }
+    const done = { type: 'turn.completed', usage: { input_tokens: 10, cached_input_tokens: 0, cache_write_input_tokens: 0, output_tokens: 1, reasoning_output_tokens: 0 } }
+    const refused = { type: 'turn.failed', error: { message: '{"error":{"type":"invalid_request_error","message":"SECRET REFUSAL TEXT"}}' } }
+    expect(codexRuntimeCheckJudge(lines(started, warning, turn, message, done))).toBeNull()
+    expect(codexRuntimeCheckJudge(lines(started, warning, turn, { type: 'error', message: 'SECRET REFUSAL TEXT' }, refused))).toBe('the turn failed (turn.failed)')
+    // A failure anywhere in the events is a failure, whatever else is there.
+    expect(codexRuntimeCheckJudge(lines(started, turn, message, refused, done))).toBe('the turn failed (turn.failed)')
+    expect(codexRuntimeCheckJudge(lines(started, turn, message))).toBe('the turn did not complete (no turn.completed)')
+    expect(codexRuntimeCheckJudge(lines(started, turn, done))).toBe('the turn completed with no agent message')
+    expect(codexRuntimeCheckJudge(lines(started, turn, { type: 'item.completed', item: { id: 'i', type: 'agent_message', text: '  ' } }, done))).toBe('the turn completed with no agent message')
+    expect(codexRuntimeCheckJudge(lines(started, turn, { type: 'item.completed', item: { id: 'i', type: 'reasoning', text: 'thinking' } }, done))).toBe('the turn completed with no agent message')
+    // Not JSON events at all; a capture cut off inside the last event loses it.
+    expect(codexRuntimeCheckJudge('OK\n')).toBe('its answer holds no JSON event')
+    expect(codexRuntimeCheckJudge('')).toBe('its answer holds no JSON event')
+    expect(codexRuntimeCheckJudge(lines(started, turn, message) + JSON.stringify(done).slice(0, 20))).toBe('the turn did not complete (no turn.completed)')
+    for (const reason of [codexRuntimeCheckJudge(lines(started, turn, refused))]) expect(reason).not.toContain('SECRET')
   })
 
   for (const profile of ['own', 'answer', 'work', 'full'] as const) {
@@ -256,6 +340,25 @@ describe('Codex: one `codex exec` in an empty folder, read-only, with the AgentC
     const result = await runner.checkRuntime()
     expect(result.ok).toBe(false)
     expect(result.detail).toMatch(/^codex runtime check failed: exit 1/)
+  }, 20_000)
+
+  it('exit 0 is not enough: a failed turn, a turn with no agent message, no completed turn, or plain text is not ok; no text is in the detail', async () => {
+    const fake = installFakeCodex(sandbox)
+    const runner = (mode: string): CodexRunner =>
+      new CodexRunner({ codexHome: path.join(sandbox, '.codex'), workdir: path.join(sandbox, 'w'), profile: 'own', apiKey: () => null, keyEnv: 'AGENTCHAT_API_KEY', pinMcpUrl: 'https://api.example/mcp', env: withFake(fake, { FAKE_RUNTIME_RUN_MODE: mode }) })
+    const results = {
+      error_exit0: await runner('error_exit0').checkRuntime(),
+      no_message: await runner('no_message').checkRuntime(),
+      no_turn: await runner('no_turn').checkRuntime(),
+      text: await runner('text').checkRuntime(),
+    }
+    expect(results).toEqual({
+      error_exit0: { ok: false, detail: 'codex runtime check failed: exit 0, but the turn failed (turn.failed)' },
+      no_message: { ok: false, detail: 'codex runtime check failed: exit 0, but the turn completed with no agent message' },
+      no_turn: { ok: false, detail: 'codex runtime check failed: exit 0, but the turn did not complete (no turn.completed)' },
+      text: { ok: false, detail: 'codex runtime check failed: exit 0, but its answer holds no JSON event' },
+    })
+    expect(JSON.stringify(results)).not.toContain('must be discarded')
   }, 20_000)
 })
 

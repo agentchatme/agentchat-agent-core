@@ -11,7 +11,7 @@ import { log } from '../util/log.js'
 import { runProbe } from '../util/probe.js'
 import { VERSION } from '../version.js'
 import { semverAtLeast } from './semver.js'
-import { RUNTIME_CHECK_DIR, runRuntimeCheck } from './runtime-check.js'
+import { RUNTIME_CHECK_ANSWER, RUNTIME_CHECK_DIR, runRuntimeCheck } from './runtime-check.js'
 import { withoutInheritedKey, withoutParentSession, type Preset, type PresetContext, type PresetInspection } from './types.js'
 
 // ─── Claude Code: one headless run (`claude -p`) ────────────────────────────
@@ -93,22 +93,30 @@ import { withoutInheritedKey, withoutParentSession, type Preset, type PresetCont
 //                               headless.md, "Output formats": `type`,
 //                               `subtype`, `is_error`, `result`, …). The check
 //                               is ok only on exit 0 with `type: "result"`,
-//                               `subtype: "success"` and `is_error: false`
-//                               (`claudeRuntimeCheckJudge`). Seen on 2.1.328
-//                               against a stand-in provider: an API error (a
-//                               refusal, an invalid key, a low credit balance)
-//                               is `subtype: "success"` with `is_error: true`,
-//                               `api_error_status` set, and exit 1 — so
-//                               `subtype` alone is not enough.
+//                               `subtype: "success"`, `is_error: false`,
+//                               `num_turns` 1 or more and a `result` that
+//                               answers OK (`claudeRuntimeCheckJudge`). Seen
+//                               on 2.1.328 against a stand-in provider: an API
+//                               error (a refusal, an invalid key, a low credit
+//                               balance) is `subtype: "success"` with
+//                               `is_error: true`, `api_error_status` set, and
+//                               exit 1 — so `subtype` alone is not enough. With
+//                               verbose on (`--verbose`, the `verbose` or
+//                               `viewMode` setting) it prints a JSON array of
+//                               every message instead, the result last: the
+//                               judge reads that result.
 //   --strict-mcp-config (no --mcp-config)  no MCP server at all: not the
 //                               hosted AgentChat tools, not the user's.
 //   --tools ""                  no built-in tool ("" for none, `claude --help`).
 //   --permission-prompts none   nothing waits on a prompt.
 //   --settings RUNTIME_CHECK_SETTINGS  the user's hooks do not fire on a health
-//                               check (managed hooks still run), and no
+//                               check (managed hooks still run), no
 //                               instruction file or memory, re-asserted the way
 //                               `ANSWER_SETTINGS` does (a settings file's `env`
-//                               would override the process environment).
+//                               would override the process environment), and
+//                               verbose output off (`verbose: false`,
+//                               `viewMode: "default"`), so the answer is the one
+//                               result object.
 //   CLAUDE_CODE_DISABLE_CLAUDE_MDS=1, CLAUDE_CODE_DISABLE_AUTO_MEMORY=1
 //                               the same two, in the environment.
 //   --disallowedTools <the key-store deny rules>  as on every run.
@@ -439,22 +447,56 @@ export interface ClaudeRunArgOptions {
 
 /**
  * The `--settings` a runtime check is given: no hook of the user's (or a
- * workdir repository's) fires on a health check, and the two `ANSWER_ENV`
+ * workdir repository's) fires on a health check, the two `ANSWER_ENV`
  * switches again (a settings file's `env` overrides the process environment;
- * `--settings` outranks user, project and local settings). A constant
- * (`claude --help`: a settings value that fails validation is silently ignored
- * in print mode). Every key exists at the 2.1.274 floor.
+ * `--settings` outranks user, project and local settings), and verbose output
+ * off. A constant (`claude --help`: a settings value that fails validation is
+ * silently ignored in print mode).
+ *
+ *   verbose: false, viewMode: "default"  with verbose on (the user's `verbose`
+ *       setting or its older `~/.claude.json` copy, or `viewMode: "verbose"`),
+ *       `--output-format json` prints a JSON array of every message instead of
+ *       the one result object. Both keys are documented settings
+ *       (settings-reference.md: `viewMode` overrides `verbose`; only the
+ *       `--verbose` flag, never passed here, outranks them). `verbose` is a
+ *       settings key since 2.1.119, below the floor; `viewMode` is newer, and a
+ *       version that does not know it ignores just that key (seen on 2.1.328:
+ *       an unknown key or an invalid value leaves the rest of `--settings` in
+ *       force, hooks off included). Managed settings outrank `--settings`, so
+ *       the judge reads the array too (`claudeRuntimeCheckJudge`).
+ *
+ * Verified on 2.1.328 against a stand-in provider: with the user's `verbose:
+ * true`, `viewMode: "verbose"` or the `~/.claude.json` `verbose`, settings
+ * without these two keys printed an array; with them, one result object.
  */
 export const RUNTIME_CHECK_SETTINGS = JSON.stringify({
   env: { CLAUDE_CODE_DISABLE_CLAUDE_MDS: '1', CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1' },
   disableAllHooks: true,
+  verbose: false,
+  viewMode: 'default',
 })
+
+/** The result message in verbose output (a JSON array of messages): the last one with `type: "result"`. */
+function lastResultMessage(messages: readonly unknown[]): unknown {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const m = messages[i]
+    if (m !== null && typeof m === 'object' && !Array.isArray(m) && (m as Record<string, unknown>)['type'] === 'result') return m
+  }
+  return null
+}
 
 /**
  * Whether a runtime check's stdout (`--output-format json`) is a good answer:
- * null when it is one result object with `type: "result"`, `subtype:
- * "success"` and `is_error: false`; otherwise why not, in ids and flags only
- * (`is_error`, `api_error_status`, `terminal_reason`), never the result text.
+ * null when its result has `type: "result"`, `subtype: "success"`,
+ * `is_error: false`, at least one turn (`num_turns >= 1`) and a `result` text
+ * that answers OK (`RUNTIME_CHECK_ANSWER`); otherwise why not, in ids and
+ * flags only (`is_error`, `api_error_status`, `terminal_reason`,
+ * `num_turns`), never the result text. The result is the one object Claude
+ * Code prints, or, with verbose output on (the `--verbose` flag, the `verbose`
+ * or `viewMode` setting), the last `type: "result"` element of the JSON array
+ * it prints instead. A false pass is the dangerous direction (an outage
+ * reported as one conversation's failure hides its messages), so anything
+ * short of all of that is not ok.
  */
 export function claudeRuntimeCheckJudge(stdout: string): string | null {
   const text = stdout.trim()
@@ -467,9 +509,18 @@ export function claudeRuntimeCheckJudge(stdout: string): string | null {
       parsed = null
     }
   }
+  if (Array.isArray(parsed)) {
+    parsed = lastResultMessage(parsed)
+    if (parsed === null) return 'its answer is a list of messages with no result'
+  }
   if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return 'its answer is not a JSON result'
   const r = parsed as Record<string, unknown>
-  if (r['type'] === 'result' && r['subtype'] === 'success' && r['is_error'] === false) return null
+  if (r['type'] === 'result' && r['subtype'] === 'success' && r['is_error'] === false) {
+    const turns = r['num_turns']
+    if (typeof turns !== 'number' || !(turns >= 1)) return `the result has no turn (num_turns ${typeof turns === 'number' ? turns : '?'})`
+    if (typeof r['result'] !== 'string' || !RUNTIME_CHECK_ANSWER.test(r['result'])) return 'the result does not answer OK'
+    return null
+  }
   const facts = [
     `type ${typeof r['type'] === 'string' ? r['type'] : '?'}`,
     `subtype ${typeof r['subtype'] === 'string' ? r['subtype'] : '?'}`,
