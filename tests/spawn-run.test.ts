@@ -351,10 +351,11 @@ describe('spawnRun — a command line through the platform shell (shell: true)',
     expect(await shellRun("process.stdout.write('started'); process.exit(2)")).toMatchObject({ state: 'failed', exitCode: 2 })
   }, 30_000)
 
-  it('a command the shell cannot find is NOT STARTED (sh: 127, cmd.exe: 9009, nothing on stdout)', async () => {
+  it('a command the shell cannot find is NOT STARTED: nothing on stdout (sh exits 127; cmd.exe /c exits 1, the same code as a command that ran and failed)', async () => {
     const outcome = await spawnRun({ command: `agentchat-no-such-command-${process.pid}`, args: [], shell: true, cwd: dir, env: { ...process.env }, stdin: null, budgetMs: 20_000 })
     expect(outcome.state).toBe('not_started')
-    expect(outcome.exitCode).toBe(process.platform === 'win32' ? 9009 : 127)
+    expect(outcome.exitCode).toBe(process.platform === 'win32' ? 1 : 127)
+    expect(outcome.detail ?? '').toMatch(/nothing on stdout/)
   }, 30_000)
 })
 

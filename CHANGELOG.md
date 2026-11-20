@@ -2,6 +2,12 @@
 
 All notable changes to `@agentchatme/agent-core` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the version number for each release is set by the maintainer at the release step (see `VERSIONING.md`).
 
+## [Unreleased]
+
+### Fixed
+
+- **A shell run's exit 1 is a failed run on Windows, not "not found".** `spawnRun({ shell: true })` (the CLI's `agentchat listen --run "<command>"`) went through cross-spawn, whose Windows hook re-emits every exit 1 of a shell spawn as `spawn "<command>" ENOENT`. So a command line that ran and failed with 1 (a provider refusal, a crash) was `not_started`, said to be missing, and never a could-not-process failure. Shell runs now use Node's own `spawn` (cross-spawn resolves nothing for them anyway) and keep the command's exit code; as everywhere, a non-zero exit with nothing on stdout is `not_started` (`cmd.exe /c` exits 1 for a command it cannot find too) and one after output is `failed`. Direct runs keep cross-spawn for PATHEXT and `.cmd` shims.
+
 ## [0.7.0] — 2026-11-20
 
 Minor release (added behaviour → minor +1, `VERSIONING.md`). Needs `agentchatme` 1.5.0 or later. Fallback manual 2.4.0 (sha256 7439b4eb…).

@@ -1,4 +1,4 @@
-import type { ChildProcess } from 'node:child_process'
+import { spawn as nodeSpawn, type ChildProcess } from 'node:child_process'
 import { spawnCommand, spawnCommandSync } from '../util/spawn.js'
 import type { RunOutcome } from './runner.js'
 import { log } from '../util/log.js'
@@ -370,7 +370,16 @@ function runSpawned(spec: SpawnRunSpec, captureBytes: number): Promise<{ outcome
     }
 
     try {
-      child = spawnCommand(spec.command, [...spec.args], {
+      // A shell run goes to Node's own spawn: with `shell: true` cross-spawn
+      // resolves nothing (the shell does), yet on Windows its hook re-emits
+      // every exit 1 of an unresolved command as `spawn … ENOENT`. `cmd.exe
+      // /c` exits 1 both for a command it cannot find and for a command that
+      // ran and failed with 1, so the hook turned a failed run into "not
+      // found". The exit code is kept, and the rule below tells the two apart
+      // as on every platform: nothing on stdout is not started. Direct runs
+      // keep cross-spawn for its PATHEXT and `.cmd` shim resolution.
+      const spawner = spec.shell === true ? nodeSpawn : spawnCommand
+      child = spawner(spec.command, [...spec.args], {
         cwd: spec.cwd,
         env: spec.env,
         stdio: [spec.stdin === null ? 'ignore' : 'pipe', 'pipe', 'pipe'],
