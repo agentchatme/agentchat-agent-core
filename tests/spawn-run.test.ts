@@ -330,6 +330,34 @@ describe('redactDiagnostic', () => {
 })
 
 
+describe('spawnRun — a command line through the platform shell (shell: true)', () => {
+  // The CLI's `agentchat listen --run "<command>"` runs the owner's command
+  // line this way (`/bin/sh -c`, `cmd.exe /d /s /c`). Its exit code is the
+  // command's, on every platform: a command that got going and exited 1 (a
+  // provider refusal, say) is a FAILED run — never "command not found".
+  const shellRun = (body: string) => {
+    const file = script(body)
+    return spawnRun({ command: `"${process.execPath}" "${file}"`, args: [], shell: true, cwd: dir, env: { ...process.env }, stdin: null, budgetMs: 20_000 })
+  }
+
+  it('exit 1 after some output is FAILED with exit 1 (not not_started, not ENOENT)', async () => {
+    const outcome = await shellRun("process.stdout.write('started'); process.stderr.write('API Error: refused\\n'); process.exit(1)")
+    expect(outcome).toMatchObject({ state: 'failed', exitCode: 1 })
+    expect(outcome.detail ?? '').not.toMatch(/ENOENT/)
+  }, 30_000)
+
+  it('exit 0 is ok; exit 2 after some output is failed with exit 2', async () => {
+    expect(await shellRun("process.stdout.write('ok'); process.exit(0)")).toMatchObject({ state: 'ok', exitCode: 0 })
+    expect(await shellRun("process.stdout.write('started'); process.exit(2)")).toMatchObject({ state: 'failed', exitCode: 2 })
+  }, 30_000)
+
+  it('a command the shell cannot find is NOT STARTED (sh: 127, cmd.exe: 9009, nothing on stdout)', async () => {
+    const outcome = await spawnRun({ command: `agentchat-no-such-command-${process.pid}`, args: [], shell: true, cwd: dir, env: { ...process.env }, stdin: null, budgetMs: 20_000 })
+    expect(outcome.state).toBe('not_started')
+    expect(outcome.exitCode).toBe(process.platform === 'win32' ? 9009 : 127)
+  }, 30_000)
+})
+
 describe('spawnRun — onStarted', () => {
   it('fires once the process has spawned, before it ends', async () => {
     const events: string[] = []
