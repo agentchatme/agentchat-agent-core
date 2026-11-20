@@ -16,6 +16,18 @@ import * as path from 'node:path'
 //   FAKE_RUNTIME_PROBE_HANG=version|auth   that probe hangs, with a child holding its output pipe
 //   FAKE_RUNTIME_PROBE_PIDS=<file> where the hung probe writes its pid and its child's
 //   FAKE_MCP_LIST_RECORD=<file>    where `mcp list` appends its argv, cwd and env
+//   FAKE_RUNTIME_RUN_MODE=fail|silent|hang|error_exit0|text
+//                                  how a headless run (or a runtime check)
+//                                  ends instead of answering: exit 1 after
+//                                  some output (with `--output-format json`, a
+//                                  result with `is_error: true`), exit 0 with
+//                                  no output, never (its pid to
+//                                  FAKE_RUNTIME_RUN_PIDS), exit 0 with an
+//                                  `is_error: true` result, or exit 0 with
+//                                  plain text where JSON was asked for
+//
+// With `--output-format json` a run answers one result object, shaped as
+// Claude Code's (`type`, `subtype`, `is_error`, `result`).
 //
 // A run's record also says what its `--mcp-config` file held at that moment:
 // the server names and the file mode (never its contents — it carries a key).
@@ -108,7 +120,14 @@ function install(root: string, name: string, version: string, authArgs: [string,
       "  if (sp >= 0) { try { appendedSystemPrompt = fs.readFileSync(args[sp + 1], 'utf8') } catch { appendedSystemPrompt = 'unreadable' } }",
       '  const record = { argv: args, stdin, cwd: process.cwd(), env, mcpConfig, appendedSystemPrompt }',
       "  if (process.env.FAKE_RUNTIME_RECORD) fs.appendFileSync(process.env.FAKE_RUNTIME_RECORD, JSON.stringify(record) + '\\n')",
-      "  process.stdout.write('model output that must be discarded\\n')",
+      "  const runMode = process.env.FAKE_RUNTIME_RUN_MODE",
+      "  if (runMode === 'silent') process.exit(0)",
+      "  if (runMode === 'hang') { if (process.env.FAKE_RUNTIME_RUN_PIDS) fs.writeFileSync(process.env.FAKE_RUNTIME_RUN_PIDS, JSON.stringify([process.pid])); setTimeout(() => {}, 600000); throw 'hang' }",
+      "  const json = args[args.indexOf('--output-format') + 1] === 'json' && args.includes('--output-format')",
+      "  const result = (isError) => JSON.stringify({ type: 'result', subtype: 'success', is_error: isError, result: 'model output that must be discarded', ...(isError ? { api_error_status: 400, terminal_reason: 'api_error' } : { terminal_reason: 'completed' }) }) + '\\n'",
+      "  if (runMode === 'text' || !json) process.stdout.write('model output that must be discarded\\n')",
+      "  else process.stdout.write(result(runMode === 'fail' || runMode === 'error_exit0'))",
+      "  if (runMode === 'fail') { console.error('API Error: the provider refused this request'); process.exit(1) }",
       '  process.exit(0)',
       '}',
       `console.error('unsupported fake ${name} command: ' + args.join(' '))`,

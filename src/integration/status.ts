@@ -4,14 +4,16 @@ import { z } from 'zod'
 import { atomicWriteFile, readJsonFile } from '../util/fsutil.js'
 import { log } from '../util/log.js'
 import { describeRunProfile, workdirExposesHome } from './profile.js'
+import { couldNotProcessPath } from './could-not-process.js'
 
 // ─── Integration status, for `status` and `doctor` ──────────────────────────
 //
 // The resident daemon writes one small JSON file into the identity home on
 // every change (and periodically), so a CLI command can answer "is the
 // integration up, did a wake arrive, did a run start?" without a socket to
-// the daemon. Counters only — no handles of peers, no conversation ids, no
-// content.
+// the daemon. Counters, and the ids of the conversations a status line has to
+// name (the last run's, the ones paused for this agent) — no handles of
+// peers, no content.
 //
 // The file was `doorbell.status.json` with `knocks` counters before the
 // rename. Readers accept both spellings — an older daemon may still be
@@ -45,7 +47,16 @@ export interface TextsStatus {
 }
 
 export interface IntegrationLastRun {
+  /**
+   * `invite`: a run for the pending invites; `wake` otherwise — a conversation
+   * run included, so a reader from before conversation runs still reads the
+   * file. `run_kind` says which.
+   */
   kind: 'wake' | 'invite'
+  /** What the run was for: `conversation`, `invite`, or `wake` (one run for the tray). Absent in a file an older daemon wrote. */
+  run_kind?: 'wake' | 'invite' | 'conversation' | null
+  /** A `conversation` run's conversation; null otherwise (absent in a file an older daemon wrote). */
+  conversation_id?: string | null
   started_at: string
   ended_at: string
   state: 'ok' | 'failed' | 'timed_out' | 'not_started'
@@ -109,6 +120,57 @@ export interface IntegrationStatus {
   unservable?: IntegrationUnservable | null
   /** Lock renewals that failed (the lock folder gone, a full disk, permissions), and the last message; null or absent when none did. */
   lease_errors?: { readonly count: number; readonly last: string | null } | null
+  /**
+   * Runs in a row that did not get done (failed, timed out, did not start)
+   * since the last one that did; 0 after a good run. With conversation runs a
+   * cycle only starts runs, so this, not the cycles, says when every run
+   * fails. Null or absent from an older daemon.
+   */
+  failed_runs_in_a_row?: number | null
+  /** When the last run that got done ended; null before one, or absent from an older daemon. */
+  last_ok_run_at?: string | null
+  /** Could not process: the kit's reports and the server's answers, and the conversations paused for this agent. Null or absent from an older daemon. */
+  could_not_process?: IntegrationCouldNotProcess | null
+}
+
+/** A conversation paused for this agent (the server's 24 h mute, source `could_not_process`). */
+export interface IntegrationPausedConversation {
+  readonly conversation_id: string
+  /** When the pause ends, as the server answered. */
+  readonly paused_until: string
+  /** When the server answered `paused`. */
+  readonly at: string
+}
+
+/**
+ * Could not process (the SDK kit's `status().processingFailures`, since the
+ * daemon started, and the paused conversations this machine was told about).
+ */
+export interface IntegrationCouldNotProcess {
+  /**
+   * Whether the runtime has its own check (`RunRunner.checkRuntime`: a
+   * minimal model call). Without one, a failed conversation run is reported
+   * only after another run completes.
+   */
+  readonly runtime_check: boolean
+  /** Reports the server answered, and its answers. */
+  readonly reported: number
+  readonly retry: number
+  readonly hidden: number
+  readonly paused: number
+  readonly none: number
+  /** Reports that failed (network, server); nothing more was done for them. */
+  readonly report_errors: number
+  /** Runs started again on a `retry` or `hidden` answer. */
+  readonly reruns: number
+  readonly reruns_capped: number
+  /** Failures waiting for another run to complete (the evidence a report needs), now. */
+  readonly awaiting_evidence: number
+  readonly runtime_checks_ok: number
+  readonly runtime_checks_failed: number
+  readonly last_runtime_check: { readonly at: string; readonly ok: boolean; readonly detail: string | null } | null
+  /** Conversations paused for this agent now, newest first. */
+  readonly paused_conversations: IntegrationPausedConversation[]
 }
 
 export interface IntegrationUnservable {
@@ -180,8 +242,13 @@ export const REPEATED_FAILED_CYCLES = 3
 
 // What is accepted on read: the current shape (version 2, `wakes`) and the
 // one before it (version 1, `knocks`, `last_run.kind: 'knock'`, `ack_negotiated`).
+// `kind` and `run_kind` are any string, so a run kind a newer daemon adds does
+// not make the whole file unreadable here (`kind` reads as `wake`, an unknown
+// `run_kind` as none).
 const LastRunSchema = z.object({
-  kind: z.enum(['wake', 'invite', 'knock']),
+  kind: z.string(),
+  run_kind: z.string().nullable().optional(),
+  conversation_id: z.string().nullable().optional(),
   started_at: z.string(),
   ended_at: z.string(),
   state: z.enum(['ok', 'failed', 'timed_out', 'not_started']),
@@ -196,6 +263,25 @@ const TextsStatusSchema = z.object({
   version: z.string().nullable(),
   manual_version: z.string().nullable(),
 })
+
+const CouldNotProcessSchema = z.object({
+  runtime_check: z.boolean(),
+  reported: z.number(),
+  retry: z.number(),
+  hidden: z.number(),
+  paused: z.number(),
+  none: z.number(),
+  report_errors: z.number(),
+  reruns: z.number(),
+  reruns_capped: z.number(),
+  awaiting_evidence: z.number(),
+  runtime_checks_ok: z.number(),
+  runtime_checks_failed: z.number(),
+  last_runtime_check: z.object({ at: z.string(), ok: z.boolean(), detail: z.string().nullable() }).nullable(),
+  paused_conversations: z.array(z.object({ conversation_id: z.string(), paused_until: z.string(), at: z.string() })),
+})
+
+const RUN_KINDS: ReadonlySet<string> = new Set(['wake', 'invite', 'conversation'])
 
 const StatusSchema = z
   .object({
@@ -234,12 +320,29 @@ const StatusSchema = z
       .nullable()
       .optional(),
     intake_paused: z.boolean().nullable().optional(),
+    failed_runs_in_a_row: z.number().nullable().optional(),
+    last_ok_run_at: z.string().nullable().optional(),
+    could_not_process: CouldNotProcessSchema.nullable().optional(),
   })
   .passthrough()
 
 function normalize(raw: z.infer<typeof StatusSchema>): IntegrationStatus {
   const lastRun: IntegrationLastRun | null =
-    raw.last_run === null ? null : { ...raw.last_run, kind: raw.last_run.kind === 'knock' ? 'wake' : raw.last_run.kind }
+    raw.last_run === null
+      ? null
+      : {
+          ...raw.last_run,
+          kind: raw.last_run.kind === 'invite' ? 'invite' : 'wake',
+          run_kind:
+            typeof raw.last_run.run_kind === 'string' && RUN_KINDS.has(raw.last_run.run_kind)
+              ? (raw.last_run.run_kind as NonNullable<IntegrationLastRun['run_kind']>)
+              : raw.last_run.kind === 'invite' || raw.last_run.kind === 'conversation'
+                ? raw.last_run.kind
+                : raw.last_run.kind === 'knock' || raw.last_run.kind === 'wake'
+                  ? 'wake'
+                  : null,
+          conversation_id: raw.last_run.conversation_id ?? null,
+        }
   return {
     version: 2,
     updated_at: raw.updated_at,
@@ -271,6 +374,9 @@ function normalize(raw: z.infer<typeof StatusSchema>): IntegrationStatus {
     runs_failing: raw.runs_failing ?? null,
     unservable: raw.unservable ?? null,
     lease_errors: raw.lease_errors ?? null,
+    failed_runs_in_a_row: raw.failed_runs_in_a_row ?? null,
+    last_ok_run_at: raw.last_ok_run_at ?? null,
+    could_not_process: raw.could_not_process ?? null,
   }
 }
 
@@ -302,9 +408,14 @@ export function readIntegrationStatus(home: string): IntegrationStatus | null {
   return null
 }
 
-/** Remove both spellings: a stale legacy file must not outlive the daemon that wrote it. */
+/**
+ * Remove what the daemon keeps for `status` in the identity home: both
+ * spellings of the status file (a stale legacy file must not outlive the
+ * daemon that wrote it) and the could-not-process ledger
+ * (`could-not-process.json`). For uninstall: nothing of it is left behind.
+ */
 export function clearIntegrationStatus(home: string): void {
-  for (const file of [integrationStatusPath(home), legacyStatusPath(home)]) {
+  for (const file of [integrationStatusPath(home), legacyStatusPath(home), couldNotProcessPath(home)]) {
     try {
       fs.rmSync(file, { force: true })
     } catch {
@@ -326,6 +437,80 @@ function ago(ms: number): string {
   if (ms < 45 * 60_000) return `${Math.round(ms / 60_000)} minutes ago`
   if (ms < 36 * 3_600_000) return `${Math.round(ms / 3_600_000)} hour(s) ago`
   return `${Math.round(ms / 86_400_000)} day(s) ago`
+}
+
+/** `ms` from now, in words: when a pause ends. */
+function fromNow(ms: number): string {
+  if (ms < 90_000) return 'in about a minute'
+  if (ms < 45 * 60_000) return `in ${Math.round(ms / 60_000)} minutes`
+  if (ms < 36 * 3_600_000) return `in ${Math.round(ms / 3_600_000)} hour(s)`
+  return `in ${Math.round(ms / 86_400_000)} day(s)`
+}
+
+/** How many paused conversations a line names; the rest are counted. */
+const PAUSED_NAMED = 5
+
+/**
+ * The conversations paused for this agent, in one plain line (no indent), or
+ * null when none is paused now: which ones, until when, and why.
+ */
+export function describePausedConversations(paused: readonly IntegrationPausedConversation[], now = Date.now()): string | null {
+  const current = paused.filter((p) => Date.parse(p.paused_until) > now)
+  if (current.length === 0) return null
+  const when = (p: IntegrationPausedConversation): string => `${p.paused_until} (${fromNow(Date.parse(p.paused_until) - now)})`
+  const why =
+    "this agent's AI kept failing on messages there, so they are hidden from this agent (it sees a note in their place) and no run starts there until the pause ends; it ends on its own"
+  if (current.length === 1) {
+    const only = current[0]!
+    return `could not process: 1 conversation paused until ${when(only)} — ${only.conversation_id}: ${why}`
+  }
+  const named = current.slice(0, PAUSED_NAMED).map((p) => `${p.conversation_id} until ${when(p)}`)
+  const more = current.length > PAUSED_NAMED ? `, and ${current.length - PAUSED_NAMED} more` : ''
+  return `could not process: ${current.length} conversations paused — ${named.join(', ')}${more}: ${why}`
+}
+
+/**
+ * The could-not-process counts in one plain line (no indent), or null when
+ * nothing has happened: what was reported and answered, what waits, and the
+ * runtime check.
+ */
+export function describeCouldNotProcessCounts(c: IntegrationCouldNotProcess, now = Date.now()): string | null {
+  const checks = c.runtime_checks_ok + c.runtime_checks_failed
+  if (c.reported + c.report_errors + c.awaiting_evidence + checks === 0) return null
+  const parts = [`${c.reported} report(s) answered (${c.retry} retry, ${c.hidden} hidden, ${c.paused} paused, ${c.none} nothing to do)`]
+  if (c.report_errors > 0) parts.push(`${c.report_errors} report(s) failed`)
+  if (c.reruns > 0) parts.push(`${c.reruns} run(s) started again`)
+  if (c.reruns_capped > 0) parts.push(`${c.reruns_capped} not started again (already re-run 3 times in that cycle)`)
+  if (c.awaiting_evidence > 0) parts.push(`${c.awaiting_evidence} failed run(s) waiting for another run to complete before they are reported`)
+  const last = c.last_runtime_check
+  if (checks > 0) {
+    parts.push(
+      `runtime check ${c.runtime_checks_ok} ok, ${c.runtime_checks_failed} failed${
+        last !== null ? ` (last: ${last.ok ? 'ok' : 'failed'}${last.detail ? ` — ${last.detail}` : ''}, ${ago(Math.max(0, now - Date.parse(last.at)))})` : ''
+      }`,
+    )
+  }
+  if (!c.runtime_check) parts.push("no runtime check for this runtime: a failed run is reported only after another conversation's run completes")
+  return `could not process: ${parts.join('; ')} — since the daemon started`
+}
+
+/**
+ * Whether the last runtime check failed and nothing has got done since: a run
+ * that completed after the check says the runtime works again, and the failed
+ * check is history (the counts say it).
+ */
+export function runtimeCheckFailingNow(status: Pick<IntegrationStatus, 'could_not_process' | 'last_ok_run_at'> | null): boolean {
+  const last = status?.could_not_process?.last_runtime_check ?? null
+  if (last === null || last.ok) return false
+  const okAt = Date.parse(status?.last_ok_run_at ?? '')
+  return !(Number.isFinite(okAt) && okAt > Date.parse(last.at))
+}
+
+/** Runs in a row that did not get done, when that is a pattern (`REPEATED_FAILED_CYCLES` or more) and no runtime reason explains it; null otherwise. */
+export function repeatedFailedRuns(status: Pick<IntegrationStatus, 'failed_runs_in_a_row' | 'runs_failing' | 'unservable'> | null): number | null {
+  const count = status?.failed_runs_in_a_row ?? 0
+  if (count < REPEATED_FAILED_CYCLES || (status?.runs_failing ?? null) !== null || (status?.unservable ?? null) !== null) return null
+  return count
 }
 
 function textsLine(texts: TextsStatus | null, now: number): string {
@@ -401,10 +586,21 @@ export function formatIntegrationStatus(status: IntegrationStatus | null, now = 
   if (status.last_run) {
     const r = status.last_run
     lines.push(
-      `  last run: ${r.kind}, ${r.state}${r.exit_code !== null ? ` (exit ${r.exit_code})` : ''}, ${Math.round(r.duration_ms / 1000)} s, ended ${ago(Math.max(0, now - Date.parse(r.ended_at)))}${r.detail ? ` — ${r.detail}` : ''}`,
+      `  last run: ${r.run_kind ?? r.kind}${r.conversation_id ? ` ${r.conversation_id}` : ''}, ${r.state}${r.exit_code !== null ? ` (exit ${r.exit_code})` : ''}, ${Math.round(r.duration_ms / 1000)} s, ended ${ago(Math.max(0, now - Date.parse(r.ended_at)))}${r.detail ? ` — ${r.detail}` : ''}`,
     )
   } else {
     lines.push('  last run: none yet')
+  }
+  const failedRuns = repeatedFailedRuns(status)
+  if (failedRuns !== null) {
+    lines.push(`  WARNING: the last ${failedRuns} runs did not get done${status.last_run ? ` (latest: ${status.last_run.state}${status.last_run.detail ? ` — ${status.last_run.detail}` : ''})` : ''}; the cards stay on the tray`)
+  }
+  const cnp = status.could_not_process ?? null
+  if (cnp !== null) {
+    const paused = describePausedConversations(cnp.paused_conversations, now)
+    if (paused !== null) lines.push(`  ${paused}`)
+    const counts = describeCouldNotProcessCounts(cnp, now)
+    if (counts !== null) lines.push(`  ${counts}`)
   }
   if (status.intake_paused === true) {
     lines.push('  WARNING: the socket is refusing new messages (backpressure: earlier ones are still being handled); they stay on the server and arrive when it catches up')

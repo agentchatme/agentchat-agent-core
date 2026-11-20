@@ -27,7 +27,11 @@ import { textsFor } from './served-texts.js'
 //   * GET /v1/inbox?limit=N        → a tray with `waiting` cards (and a
 //                                    `deferred` count the cards exclude)
 //   * GET /v1/groups/invites       → the configured pending invites
-//   * GET /v1/texts?runtime=R      → the served texts for R (or `textsStatus`)
+//   * GET /v1/texts?runtime=R      → the served texts for R (or `textsStatus`),
+//                                    with `conversation_run_template` when set
+//   * POST /v1/conversations/{id}/processing-failures
+//                                  → recorded; answered from a scripted queue
+//                                    (default `none`)
 // and, with `manual`, the manual the texts announce, at `<apiBase>/skill.md`
 // (plain HTTP to loopback, which the manual download accepts for a local
 // development server).
@@ -58,6 +62,23 @@ export interface ServerDoubleOptions {
   textsStatus?: number
   /** Announce this manual in the texts (url `<apiBase>/skill.md`) and serve `body` there. */
   manual?: ServedManualDouble
+  /** Serve `conversation_run_template` in the texts (conversation runs); absent: an older server. */
+  conversationRunTemplate?: string
+}
+
+/** One `POST /v1/conversations/{id}/processing-failures` the double received. */
+export interface ProcessingFailurePost {
+  conversationId: string
+  body: { through_message_id?: unknown; outcome?: unknown; evidence?: unknown }
+  idempotencyKey: string | undefined
+}
+
+/** What the double answers a processing-failure report with. */
+export interface ProcessingFailureAnswer {
+  action: 'retry' | 'hidden' | 'paused' | 'none'
+  attempts: number
+  hidden_message_ids: string[]
+  paused_until: string | null
 }
 
 export interface ServedManualDouble {
@@ -93,6 +114,10 @@ export interface ServerDouble {
   readonly manualAuth: Array<string | undefined>
   /** Invite ids dismissed through `POST /v1/groups/invites/{id}/dismiss`, in order (each leaves the tray). */
   readonly dismissed: string[]
+  /** Every processing-failure report, in order. */
+  readonly processingFailures: ProcessingFailurePost[]
+  /** Answer the next reports with these, in order (then `none`). */
+  answerProcessingFailures(...answers: ProcessingFailureAnswer[]): void
   /** Push a frame to the most recent live socket. */
   send(frame: unknown): void
   /** From now on, refuse a hello with this key (close 1008 'Invalid token'), as for a key rotated elsewhere. */
@@ -114,6 +139,9 @@ export async function startServerDouble(options: ServerDoubleOptions = {}): Prom
   let manual = options.manual ?? null
   const manualAuth: Array<string | undefined> = []
   const dismissed: string[] = []
+  const processingFailures: ProcessingFailurePost[] = []
+  const failureAnswers: ProcessingFailureAnswer[] = []
+  const conversationRunTemplate = options.conversationRunTemplate
   const served: Served[] = []
   const requests: string[] = []
   const refusedKeys = new Set<string>()
@@ -122,6 +150,25 @@ export async function startServerDouble(options: ServerDoubleOptions = {}): Prom
     const url = new URL(req.url ?? '/', 'http://127.0.0.1')
     requests.push(`${url.pathname}${url.search}`)
     res.setHeader('content-type', 'application/json')
+    const failure = /^\/v1\/conversations\/([^/]+)\/processing-failures$/.exec(url.pathname)
+    if (failure !== null && req.method === 'POST') {
+      let raw = ''
+      req.on('data', (chunk: Buffer) => {
+        raw += chunk.toString('utf-8')
+      })
+      req.on('end', () => {
+        let body: ProcessingFailurePost['body'] = {}
+        try {
+          body = JSON.parse(raw) as ProcessingFailurePost['body']
+        } catch {
+          /* recorded as empty */
+        }
+        const key = req.headers['idempotency-key']
+        processingFailures.push({ conversationId: decodeURIComponent(failure[1] ?? ''), body, idempotencyKey: Array.isArray(key) ? key[0] : key })
+        res.end(JSON.stringify(failureAnswers.shift() ?? { action: 'none', attempts: 1, hidden_message_ids: [], paused_until: null }))
+      })
+      return
+    }
     if (url.pathname === '/v1/inbox') {
       const limit = Number(url.searchParams.get('limit') ?? '20')
       const cards = Array.from({ length: Math.min(tray.waiting, limit) }, (_, i) => ({
@@ -183,6 +230,7 @@ export async function startServerDouble(options: ServerDoubleOptions = {}): Prom
         return
       }
       const texts = textsFor('me', url.searchParams.get('runtime') ?? 'generic')
+      if (conversationRunTemplate !== undefined) texts.conversation_run_template = conversationRunTemplate
       if (manual !== null) texts.manual = { url: `${double.apiBase}/skill.md`, version: manual.version }
       res.end(JSON.stringify({ runtime: url.searchParams.get('runtime'), ...texts }))
       return
@@ -218,6 +266,10 @@ export async function startServerDouble(options: ServerDoubleOptions = {}): Prom
     },
     manualAuth,
     dismissed,
+    processingFailures,
+    answerProcessingFailures: (...answers) => {
+      failureAnswers.push(...answers)
+    },
     refuseKey: (apiKey) => {
       refusedKeys.add(apiKey)
     },

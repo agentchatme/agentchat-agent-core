@@ -5,8 +5,16 @@ import type { DaemonConfig } from '../daemon/config.js'
 import { beat, idle } from '../daemon/health.js'
 import { clientIdentityOf, type IntegrationClient } from '../client-identity.js'
 import type { RunProfile } from './profile.js'
-import type { RunKind, RunOutcome, RunRunner, RunWake } from './runner.js'
-import { writeIntegrationStatus, type IntegrationLastRun, type IntegrationRunsFailing, type IntegrationStatus, type SocketState } from './status.js'
+import type { RunKind, RunOutcome, RunPreflight, RunRunner, RunWake } from './runner.js'
+import {
+  writeIntegrationStatus,
+  type IntegrationCouldNotProcess,
+  type IntegrationLastRun,
+  type IntegrationRunsFailing,
+  type IntegrationStatus,
+  type SocketState,
+} from './status.js'
+import { PausedConversations } from './could-not-process.js'
 import { blockedDetail, socketStateOf } from './socket-state.js'
 import { textsCachePath } from './texts.js'
 import { MANUAL } from '../skill/manual.js'
@@ -23,12 +31,24 @@ import { describeManualSync, type ManualFetch } from '../skill/served-manual.js'
 //     frame (a reminder, or the server re-waking unanswered cards), a group
 //     invite, every accepted hello — coalesced into one cycle per burst, one
 //     cycle at a time (`WakeCoalescer`);
-//   * the cycle in SINGLE-RUN mode (`ReceiveLoop`): read the tray; nothing
-//     owed (no cards, only muted ones, no pending invite) starts nothing; a
-//     tray that cannot be read is not an empty tray, and the run starts
-//     anyway; otherwise ONE run with the served wake instruction (and the
-//     invite prompt when invites wait). The run reads the tray and records its
-//     own verdicts; nothing is recorded on its behalf;
+//   * the cycle in single-run mode (`ReceiveLoop`): read the tray; nothing
+//     owed (no cards, only muted ones, no pending invite) starts nothing.
+//     With served texts that carry `conversation_run_template` (every
+//     current server): CONVERSATION RUNS — one run per conversation that owes
+//     a reply, prompted for that one conversation, one at a time, and one
+//     run for the pending invites; a live exchange stays in its run (the
+//     scoped `agentchat_wait` for that conversation). One conversation's
+//     content never sits in front of the model while it answers another, and
+//     one the AI cannot process never blocks the rest. From an older server
+//     (no template): ONE run for the whole tray with the served wake
+//     instruction, as before; a tray that cannot be read starts it anyway.
+//     A run records its own verdicts; nothing is recorded on its behalf;
+//   * could not process — a conversation's run that failed or timed out
+//     while the runtime otherwise works (another conversation's run completed
+//     since, or — for a run that failed, not one that timed out — the
+//     runner's `checkRuntime`, a minimal model call, passes) is reported; the
+//     server answers retry, hidden (the span is shown to this agent as a
+//     note), paused (a 24 h mute) or none, and the kit follows it once;
 //   * the served texts (`TextsCache`, the last good copy kept in the identity
 //     home) and the manual they announce (`ManualSync`).
 //
@@ -64,6 +84,13 @@ export const RUNTIME_RECHECK_MS = 5 * 60_000
 
 /** A runner's `preflight()` (a `--version`, an auth probe) past this counts as not ok. */
 export const PREFLIGHT_DEADLINE_MS = 60_000
+
+/**
+ * A runner's `checkRuntime()` (a minimal model call) past this counts as not
+ * ok, and its probe is stopped (killed with its tree). The kit's own bound is
+ * the same 60 s.
+ */
+export const RUNTIME_CHECK_DEADLINE_MS = 60_000
 
 export interface IntegrationOptions {
   readonly cfg: DaemonConfig
@@ -107,7 +134,36 @@ export interface IntegrationOptions {
    * false, and no invite is ever dismissed on the agent's behalf.
    */
   readonly dismissIgnoredInvites?: boolean
+  /**
+   * Conversation runs (default true): whenever the served texts carry
+   * `conversation_run_template`, one run per conversation that owes a reply
+   * instead of one run for the whole tray. False keeps one run for the tray:
+   * right when a "run" does not start the agent on that one conversation (the
+   * `agentchat forward` mode hands each run to a receiver that reads the
+   * whole tray itself).
+   */
+  readonly conversationRuns?: boolean
+  /** Injectable for tests; `RUNTIME_CHECK_DEADLINE_MS`. */
+  readonly runtimeCheckDeadlineMs?: number
 }
+
+type ProcessingFailureCounts = ReturnType<kit.ReceiveLoop['status']>['processingFailures']
+
+/** The kit's could-not-process counts when it keeps none (a kit from before could not process). */
+const NO_PROCESSING_FAILURES: ProcessingFailureCounts = {
+  reported: 0,
+  retry: 0,
+  hidden: 0,
+  paused: 0,
+  none: 0,
+  reportErrors: 0,
+  reruns: 0,
+  rerunsCapped: 0,
+  awaitingEvidence: 0,
+  runtimeChecksOk: 0,
+  runtimeChecksFailed: 0,
+  lastRuntimeCheck: null,
+} as ProcessingFailureCounts
 
 /** Most of a failure line: enough to diagnose, bounded for the status file. */
 const CYCLE_FAILURE_CHARS = 240
@@ -188,14 +244,21 @@ export class Integration {
   private runsNotStarted = 0
   private runsSkippedEmpty = 0
   private lastRun: IntegrationLastRun | null = null
+  /** When the last run that got done ended (`last_ok_run_at`). */
+  private lastOkRunAt: string | null = null
   /** The newest wake since the last run started (for `RunRequest.wake`). */
   private pendingWake: RunWake | null = null
   /** The rung of the newest `unanswered` wake frame (the kit's wake event does not carry it). */
   private lastUnansweredStep: number | null = null
+  /** The conversations the server paused for this agent, as it answered (kept in the identity home). */
+  private readonly paused: PausedConversations
+  /** The runner's runtime check in flight: concurrent asks share it. */
+  private runtimeCheckInFlight: Promise<RunPreflight> | null = null
 
   constructor(private readonly options: IntegrationOptions) {
     const { cfg, client } = options
     const identity = clientIdentityOf(client)
+    this.paused = new PausedConversations(cfg.home, cfg.handle)
     this.api =
       options.api ??
       new AgentChatClient({ apiKey: cfg.apiKey, baseUrl: cfg.apiBase, clientIdentity: identity, timeoutMs: HTTP_TIMEOUT_MS, retry: { maxRetries: 0, baseDelayMs: 0, maxDelayMs: 0 } })
@@ -267,6 +330,12 @@ export class Integration {
       client: this.api,
       // The kit's own switch: off, no invite is dismissed on the agent's behalf.
       ...(options.dismissIgnoredInvites === false ? { dismissIgnoredInvites: false } : {}),
+      // One run per conversation whenever the served texts carry the template.
+      ...(options.conversationRuns === false ? { conversationRuns: false } : {}),
+      // The evidence a could-not-process report needs when no other run has
+      // completed since: the runtime's own minimal model call. Without one, a
+      // failure waits for another run to complete.
+      ...(options.runner.checkRuntime !== undefined ? { checkRuntime: () => this.checkRuntime() } : {}),
       texts: this.texts,
       mode: 'singleRun',
       socket: this.realtime,
@@ -380,6 +449,9 @@ export class Integration {
       runs_not_started: this.runsNotStarted,
       runs_skipped_empty: this.runsSkippedEmpty,
       last_run: this.lastRun,
+      failed_runs_in_a_row: this.failingRuns,
+      last_ok_run_at: this.lastOkRunAt,
+      could_not_process: this.couldNotProcess(status),
       // No local retry ladder (the server re-wakes, D3); kept for older readers.
       retry_rung: 0,
       retry_due_at: null,
@@ -402,11 +474,15 @@ export class Integration {
     }
   }
 
-  // ─── the one run ────────────────────────────────────────────────────────
+  // ─── a run ──────────────────────────────────────────────────────────────
 
   private async startRun(request: kit.RunRequest): Promise<kit.RunEnd> {
-    // Invites alone: the served invite prompt. Anything else: a wake run.
-    const kind: RunKind = request.cards === 0 && (request.invites ?? 0) > 0 ? 'invite' : 'wake'
+    // What the run is for, as the kit says: one conversation (conversation
+    // runs), the pending invites, or the whole tray (texts from an older
+    // server). A conversation run without its id is not one the kit makes;
+    // it would run as a tray run.
+    const conversationId = request.kind === 'conversation' && typeof request.conversationId === 'string' && request.conversationId.length > 0 ? request.conversationId : undefined
+    const kind: RunKind = conversationId !== undefined ? 'conversation' : request.kind === 'invite' ? 'invite' : 'wake'
     // What woke it: the newest named wake since the previous run; a connect
     // (or a follow-on) names none, and the tray says what it found.
     const wake: RunWake = this.pendingWake ?? { reason: kind === 'invite' ? 'invite' : 'messages' }
@@ -415,9 +491,15 @@ export class Integration {
     const startedAt = Date.now()
     const budgetMs = this.options.budgetMs
     const slackMs = this.options.runnerDeadlineSlackMs ?? RUNNER_DEADLINE_SLACK_MS
+    // Ids only, never content: the conversation a run is for, and the run's own.
+    const subject = `kind=${kind}${conversationId !== undefined ? ` conv=${conversationId}` : ''} id=${runId}`
     this.runsStarted += 1
     this.writeStatus()
-    log.info(`run start kind=${kind} id=${runId} budget=${Math.round(budgetMs / 1000)}s (tray: ${request.cards ?? '?'} card(s), ${request.invites ?? '?'} invite(s))`)
+    log.info(
+      `run start ${subject} budget=${Math.round(budgetMs / 1000)}s${
+        kind === 'conversation' ? '' : ` (tray: ${request.cards ?? '?'} card(s), ${request.invites ?? '?'} invite(s))`
+      }`,
+    )
 
     // The run's own stop signal: the loop stopping, or the deadline below.
     const controller = new AbortController()
@@ -430,6 +512,7 @@ export class Integration {
       outcome = await withDeadline(
         this.options.runner.start({
           kind,
+          ...(conversationId !== undefined ? { conversationId } : {}),
           wake,
           // No pointer, no trailing blank lines.
           prompt: this.options.manualPointer.trim().length > 0 ? `${request.prompt}\n\n${this.options.manualPointer}` : request.prompt,
@@ -457,7 +540,10 @@ export class Integration {
     }
 
     this.lastRun = {
-      kind,
+      // Readers from before conversation runs know only `wake` and `invite`.
+      kind: kind === 'invite' ? 'invite' : 'wake',
+      run_kind: kind,
+      conversation_id: conversationId ?? null,
       started_at: new Date(startedAt).toISOString(),
       ended_at: new Date().toISOString(),
       state: outcome.state,
@@ -468,7 +554,10 @@ export class Integration {
     switch (outcome.state) {
       case 'ok':
         this.runsOk += 1
-        log.info(`run ok kind=${kind} id=${runId} ${Math.round(outcome.durationMs / 1000)}s (output discarded; any send was the agent's own hosted-tool call)`)
+        this.lastOkRunAt = this.lastRun.ended_at
+        log.info(`run ok ${subject} ${Math.round(outcome.durationMs / 1000)}s (output discarded; any send was the agent's own hosted-tool call)`)
+        // A conversation that ran is not paused (any more).
+        if (conversationId !== undefined) this.paused.clear(conversationId)
         break
       case 'failed':
         this.runsFailed += 1
@@ -481,13 +570,83 @@ export class Integration {
         break
     }
     if (outcome.state !== 'ok') {
-      log.warn(`run ${outcome.state} kind=${kind} id=${runId}${outcome.detail ? `: ${outcome.detail}` : ''} — the cards stay on the tray; the next wake (or the server's re-wake) finds them`)
+      log.warn(
+        `run ${outcome.state} ${subject}${outcome.detail ? `: ${outcome.detail}` : ''} — ${
+          kind === 'conversation'
+            ? 'its card stays on the tray; if the runtime otherwise works, the failure is reported (could not process) and the server decides what follows'
+            : 'the cards stay on the tray; the next wake (or the server\'s re-wake) finds them'
+        }`,
+      )
     }
     this.noteRunHealth(outcome, this.lastRun.ended_at)
     this.writeStatus()
-    return outcome.state === 'ok'
-      ? { status: 'completed' }
-      : { status: outcome.state === 'not_started' ? 'not_started' : 'failed', ...(outcome.detail !== undefined ? { detail: outcome.detail } : {}) }
+    if (outcome.state === 'ok') return { status: 'completed' }
+    if (outcome.state === 'not_started') return { status: 'not_started', ...(outcome.detail !== undefined ? { detail: outcome.detail } : {}) }
+    // A run past its budget (killed, or abandoned by the deadline above) is a
+    // timed-out failure: a could-not-process report then says `timed_out`.
+    return { status: 'failed', ...(outcome.state === 'timed_out' ? { timedOut: true } : {}), ...(outcome.detail !== undefined ? { detail: outcome.detail } : {}) }
+  }
+
+  /**
+   * The runner's runtime check (a minimal model call, no peer content, no
+   * AgentChat tools), bounded by `RUNTIME_CHECK_DEADLINE_MS` and stopped with
+   * the integration; concurrent asks share one check. Its output is the
+   * runner's to discard: only whether it answered, and a bounded diagnostic,
+   * come back.
+   */
+  private checkRuntime(): Promise<RunPreflight> {
+    this.runtimeCheckInFlight ??= this.runRuntimeCheck().finally(() => {
+      this.runtimeCheckInFlight = null
+      // The kit counts the answer once it has it: the status file follows
+      // right after (a check that fails reports nothing, so no event would).
+      setTimeout(() => this.writeStatus(), 0).unref?.()
+    })
+    return this.runtimeCheckInFlight
+  }
+
+  private async runRuntimeCheck(): Promise<RunPreflight> {
+    const check = this.options.runner.checkRuntime
+    if (check === undefined) return { ok: false, detail: 'this runtime has no runtime check' }
+    if (this.stopping) return { ok: false, detail: 'the integration is stopping' }
+    const deadlineMs = this.options.runtimeCheckDeadlineMs ?? RUNTIME_CHECK_DEADLINE_MS
+    const controller = new AbortController()
+    const onStop = (): void => controller.abort()
+    this.recheckAbort.signal.addEventListener('abort', onStop, { once: true })
+    const startedAt = Date.now()
+    try {
+      const answer = await withDeadline(check.call(this.options.runner, { signal: controller.signal }), deadlineMs, () => {
+        controller.abort()
+        return { ok: false, detail: `the runtime check did not answer within ${Math.round(deadlineMs / 1000)} s (stopped)` }
+      }).catch((err: unknown) => ({ ok: false, detail: `the runtime check threw: ${err instanceof Error ? err.message : String(err)}` }))
+      const took = `${Math.round((Date.now() - startedAt) / 1000)} s`
+      if (answer.ok) log.info(`runtime check ok (${this.options.runner.name}: the model answered, ${took}; output discarded)`)
+      else if (!this.stopping) log.warn(`runtime check failed (${this.options.runner.name}, ${took}): ${answer.detail ?? 'no detail'} — a failed run is not reported as this conversation's`)
+      return answer.ok ? { ok: true } : { ok: false, ...(answer.detail !== undefined ? { detail: answer.detail } : {}) }
+    } finally {
+      this.recheckAbort.signal.removeEventListener('abort', onStop)
+    }
+  }
+
+  /** The kit's could-not-process counts and the paused conversations, as the status file keeps them. */
+  private couldNotProcess(status: ReturnType<kit.ReceiveLoop['status']>): IntegrationCouldNotProcess {
+    // A kit from before could not process has no such block: zero, never a throw (the status write runs at start).
+    const f = (status as { processingFailures?: ProcessingFailureCounts }).processingFailures ?? NO_PROCESSING_FAILURES
+    return {
+      runtime_check: this.options.runner.checkRuntime !== undefined,
+      reported: f.reported,
+      retry: f.retry,
+      hidden: f.hidden,
+      paused: f.paused,
+      none: f.none,
+      report_errors: f.reportErrors,
+      reruns: f.reruns,
+      reruns_capped: f.rerunsCapped,
+      awaiting_evidence: f.awaitingEvidence,
+      runtime_checks_ok: f.runtimeChecksOk,
+      runtime_checks_failed: f.runtimeChecksFailed,
+      last_runtime_check: f.lastRuntimeCheck === null ? null : { at: f.lastRuntimeCheck.at, ok: f.lastRuntimeCheck.ok, detail: f.lastRuntimeCheck.detail?.slice(0, CYCLE_FAILURE_CHARS) ?? null },
+      paused_conversations: this.paused.list(),
+    }
   }
 
   /**
@@ -573,25 +732,76 @@ export class Integration {
         log.debug(`own echo${event.conversationId ? ` in ${event.conversationId}` : ''} — not a wake`)
         break
       case 'cycle': {
-        const { outcome, cards, invites } = event.summary
-        if (outcome === 'empty' || outcome === 'nothing_owed') {
+        const { outcome, cards, invites, heldByTurns, paced } = event.summary
+        if (outcome === 'nothing_owed' && (heldByTurns > 0 || paced > 0)) {
+          // Conversation runs: everything owed is running, waiting for its
+          // turn, or paced after a run that just looked. Not an empty tray.
+          log.info(
+            `wake: nothing new to start — ${heldByTurns} conversation(s) already running or waiting${paced > 0 ? `, ${paced} paced after a recent run` : ''} (${cards} card(s), ${invites} invite(s))`,
+          )
+        } else if (outcome === 'empty' || outcome === 'nothing_owed') {
           this.runsSkippedEmpty += 1
-          log.info(`wake: ${outcome === 'empty' ? 'the tray is empty' : 'nothing owed (muted cards only)'} — no run (${cards} card(s), ${invites} invite(s))`)
+          log.info(`wake: ${outcome === 'empty' ? 'the tray is empty' : 'nothing owed (muted or notices-only cards)'} — no run (${cards} card(s), ${invites} invite(s))`)
         } else if (outcome === 'abandoned') {
           log.warn(`wake cycle abandoned by the watchdog: ${event.summary.failure ?? 'it ran past its deadline'} — the next wake starts a new one`)
         } else if (outcome === 'texts_missing') {
           this.runsNotStarted += 1
           log.warn('no served texts in hand: GET /v1/texts has not answered yet and nothing is cached in the identity home — no run this time')
+        } else if (outcome === 'runs_started') {
+          const { turnsStarted, turnsQueued } = event.summary
+          log.info(
+            `wake: ${turnsStarted + turnsQueued} run(s) for ${cards} card(s), ${invites} invite(s) — ${turnsStarted} started, ${turnsQueued} queued (one at a time)${
+              heldByTurns > 0 ? `; ${heldByTurns} conversation(s) already running or waiting` : ''
+            }${paced > 0 ? `; ${paced} paced` : ''}`,
+          )
         }
         this.writeStatus()
         break
       }
+      case 'processing_failure':
+        this.onProcessingFailure(event)
+        break
       case 'error':
         if (!this.stopping) log.warn(`receive loop: ${event.error.message}`)
         break
       default:
         break
     }
+  }
+
+  /**
+   * One could-not-process report and the server's answer: said in the log
+   * (ids and counts only), and a `paused` answer kept for `status` until the
+   * pause ends; any other answer for that conversation ends what was kept.
+   */
+  private onProcessingFailure(event: Extract<kit.ReceiveLoopEvent, { type: 'processing_failure' }>): void {
+    const what = `conv=${event.conversationId} (${event.source} ${event.outcome}, evidence ${event.evidence === 'runtime_check' ? 'runtime check passed' : 'another run completed'})`
+    const result = event.result
+    if (result === null) {
+      log.warn(`could not process: ${what} — the report failed (${event.error ?? 'no detail'}); nothing more is done for it now: its card stays on the tray and the server re-wakes it`)
+    } else {
+      const hidden = result.hidden_message_ids.length
+      const answered =
+        result.action === 'retry'
+          ? 'retry (the first failure for these messages)'
+          : result.action === 'hidden'
+            ? `hidden (${hidden} message(s) are now a note for this agent, still unread)`
+            : result.action === 'paused'
+              ? `paused until ${result.paused_until ?? '?'}${hidden > 0 ? ` (${hidden} more message(s) hidden)` : ''} — no run starts there until then`
+              : 'none (nothing left to act on)'
+      const next =
+        event.next === 'rerun'
+          ? 'it runs again after the others'
+          : event.next === 'running'
+            ? 'its next run is under way already'
+            : event.next === 'rerun_capped'
+              ? 'not run again in this cycle (3 re-runs already); the server re-wakes it'
+              : 'nothing more for it'
+      ;(result.action === 'paused' ? log.warn : log.info)(`could not process: ${what} → server: ${answered}; ${next}`)
+      if (result.action === 'paused' && result.paused_until !== null) this.paused.record(event.conversationId, result.paused_until)
+      else this.paused.clear(event.conversationId)
+    }
+    this.writeStatus()
   }
 
   private writeStatus(): void {

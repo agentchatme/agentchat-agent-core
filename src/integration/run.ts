@@ -98,6 +98,8 @@ export interface RunIntegrationOpts {
   credentialsFromHomeOnly?: boolean
   /** See `IntegrationOptions.dismissIgnoredInvites` (default true). */
   dismissIgnoredInvites?: boolean
+  /** See `IntegrationOptions.conversationRuns` (default true: one run per conversation whenever the served texts allow it). */
+  conversationRuns?: boolean
   /** Test seam: while serving, how often to look again (5 s; the backoff after failed starts grows from it). */
   pollMs?: number
   /** Test seam: the loop's own tick, how soon it notices a nudge (250 ms). */
@@ -494,6 +496,7 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
           profile,
           budgetMs,
           ...(opts.dismissIgnoredInvites !== undefined ? { dismissIgnoredInvites: opts.dismissIgnoredInvites } : {}),
+          ...(opts.conversationRuns !== undefined ? { conversationRuns: opts.conversationRuns } : {}),
           ...(opts.runtimeRecheckMs !== undefined ? { runtimeRecheckMs: opts.runtimeRecheckMs } : {}),
           ...(opts.quietMs !== undefined ? { quietMs: opts.quietMs } : {}),
           ...(opts.maxMs !== undefined ? { maxMs: opts.maxMs } : {}),

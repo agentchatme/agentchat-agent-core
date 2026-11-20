@@ -170,6 +170,12 @@ export {
   type IntegrationStandby,
   type IntegrationRunsFailing,
   type IntegrationUnservable,
+  type IntegrationCouldNotProcess,
+  type IntegrationPausedConversation,
+  describePausedConversations,
+  describeCouldNotProcessCounts,
+  repeatedFailedRuns,
+  runtimeCheckFailingNow,
   FAILED_CYCLE_OUTCOMES,
   REPEATED_FAILED_CYCLES,
   failedCyclesInARow,
@@ -195,6 +201,10 @@ export type {
   RunWake,
 } from './integration/runner.js'
 export { isRunnerFactory } from './integration/runner.js'
+// A run's context for a command the owner configured (`AGENTCHAT_CONVERSATION_ID` and the rest).
+export { RUN_CONTEXT_ENV, runContextEnv } from './integration/run-context.js'
+// Could not process: the conversations paused for this agent, as the server answered.
+export { COULD_NOT_PROCESS_FILE, couldNotProcessPath, PausedConversations, type PausedConversation } from './integration/could-not-process.js'
 
 // The identity command set. An integration describes itself once (HostProfile)
 // and gets register/login/recover/status/logout/doctor back.

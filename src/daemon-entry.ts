@@ -13,7 +13,7 @@
 // genuinely differs per host, so each integration implements `RunRunner` itself.
 
 export { runIntegration, type RunIntegrationOpts } from './integration/run.js'
-export { Integration, RUNNER_DEADLINE_SLACK_MS, PREFLIGHT_DEADLINE_MS, type IntegrationOptions } from './integration/integration.js'
+export { Integration, RUNNER_DEADLINE_SLACK_MS, PREFLIGHT_DEADLINE_MS, RUNTIME_CHECK_DEADLINE_MS, type IntegrationOptions } from './integration/integration.js'
 export { socketStateOf, blockedDetail } from './integration/socket-state.js'
 export { spawnRun, redactDiagnostic, sweepWindowsDescendants, describeWindowsSweep, WINDOWS_SWEEP_TIMEOUT_MS, type SpawnRunSpec, type WindowsSweep } from './integration/spawn-run.js'
 export type {

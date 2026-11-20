@@ -64,6 +64,28 @@ describe('spawnRun', () => {
     expect(outcome.detail).toContain('[redacted')
   })
 
+  it('non-zero exit with nothing on stdout AFTER it ran a while is FAILED (a crash partway), not "did not start"', async () => {
+    const outcome = await run(script("setTimeout(() => { process.stderr.write('fatal: out of memory\\n'); process.exit(134) }, 600)"), { notStartedWithinMs: 300 })
+    expect(outcome).toMatchObject({ state: 'failed', exitCode: 134 })
+    expect(outcome.detail).toMatch(/^exit 134 after \d+ s with nothing on stdout \(it ran, then ended\): fatal: out of memory$/)
+  })
+
+  it('killed from outside partway (SIGKILL, an OOM killer) with nothing on stdout yet is FAILED, not "did not start"', async () => {
+    const pidFile = path.join(dir, 'self.pid')
+    const pending = run(script(`require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); setInterval(() => {}, 1000)`), { notStartedWithinMs: 300 })
+    await until(() => fs.existsSync(pidFile) && fs.readFileSync(pidFile, 'utf-8').length > 0)
+    await new Promise((r) => setTimeout(r, 500))
+    process.kill(Number(fs.readFileSync(pidFile, 'utf-8')), 'SIGKILL')
+    const outcome = await pending
+    expect(outcome.state).toBe('failed')
+    expect(outcome.detail).toMatch(/with nothing on stdout \(it ran, then ended\)/)
+  }, 10_000)
+
+  it('the default window: a CLI that quits at once (well inside 5 s) is still NOT STARTED', async () => {
+    const outcome = await run(script("process.stderr.write('unknown option --x\\n'); process.exit(2)"))
+    expect(outcome).toMatchObject({ state: 'not_started', exitCode: 2 })
+  })
+
   it('a missing binary is NOT STARTED', async () => {
     const outcome = await spawnRun({
       command: path.join(dir, 'no-such-runtime'),

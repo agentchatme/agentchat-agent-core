@@ -13,10 +13,14 @@ import { log } from '../util/log.js'
 // failure diagnostic, because "exited 1" alone has cost days of debugging.
 //
 // Classification: `ok` on exit 0; `timed_out` when the budget killed it;
-// `failed` when it was interrupted or exited non-zero after writing to stdout;
-// `not_started` when it exited non-zero with NOTHING ON STDOUT — a signed-out
-// CLI, a bad flag, a missing config all print their complaint on stderr and
-// quit, and they are "the runtime did not get going", stderr or not. The
+// `failed` when it was interrupted, exited non-zero after writing to stdout,
+// or exited non-zero with nothing on stdout after it had run a while
+// (`NOT_STARTED_WITHIN_MS`: a crash, an out-of-memory kill, a SIGKILL partway
+// through — a runtime that prints its answer only at the end has said
+// nothing yet); `not_started` when it could not be spawned, or exited
+// non-zero with NOTHING ON STDOUT within that window — a signed-out CLI, a
+// bad flag, a missing config all print their complaint on stderr and quit at
+// once, and they are "the runtime did not get going", stderr or not. The
 // stderr tail rides along in the detail either way.
 //
 // The run is spawned as its own process group (detached) so the whole tree
@@ -46,6 +50,12 @@ import { log } from '../util/log.js'
 //     budget or the interrupt said — the worker moves on.
 
 const DEFAULT_GRACE_MS = 5_000
+/**
+ * A run that exits non-zero with nothing on stdout counts as `not_started`
+ * only within this long of its spawn (a refused flag, a signed-out CLI: they
+ * quit at once). Past it, it ran and then died: `failed`.
+ */
+export const NOT_STARTED_WITHIN_MS = 5_000
 /** After the run's process exited: how long its pipes get to close before the run is detached from them. */
 const DEFAULT_DRAIN_MS = 2_000
 /** After the SIGKILL: how long before a run that still has not ended is abandoned. */
@@ -80,6 +90,14 @@ export interface SpawnRunSpec {
   readonly signal?: AbortSignal
   /** Called once when the child process has been spawned (`RunRequest.onStarted`). */
   readonly onStarted?: () => void
+  /**
+   * An exit 0 with nothing on stdout is `failed`, not `ok`: for a probe whose
+   * answer must be there (a model call that printed nothing did not answer).
+   * Still counted, never kept.
+   */
+  readonly requireStdout?: boolean
+  /** Test seam: `NOT_STARTED_WITHIN_MS`. */
+  readonly notStartedWithinMs?: number
 }
 
 /** Strip anything key-shaped or terminal-styled from a diagnostic, and bound it. */
@@ -249,15 +267,33 @@ export function describeWindowsSweep(sweep: WindowsSweep): string {
   return `windows leftover sweep: exit ${sweep.exitCode ?? (sweep.timedOut ? 'timed out' : 'none')}; window ${sweep.window ?? '?'}; children seen ${sweep.candidates.length > 0 ? sweep.candidates.join(', ') : 'none'}; killed ${killed}${sweep.stderr ? `; stderr: ${sweep.stderr}` : ''}`
 }
 
-/** Start the command, wait for it, classify. Never throws, and always resolves. */
+/** Start the command, wait for it, classify. Never throws, and always resolves. The output is counted, never kept. */
 export function spawnRun(spec: SpawnRunSpec): Promise<RunOutcome> {
+  return runSpawned(spec, 0).then((result) => result.outcome)
+}
+
+/**
+ * `spawnRun`, keeping the first `maxBytes` of stdout. ONLY for a probe whose
+ * input is a fixed text of ours (a runtime check: no peer content) and whose
+ * answer must be read to be judged; a run started for a peer's message never
+ * goes through here. The caller reads it and drops it; it is never logged.
+ */
+export function spawnRunCapturing(spec: SpawnRunSpec, maxBytes: number): Promise<{ outcome: RunOutcome; stdout: string }> {
+  return runSpawned(spec, Math.max(0, Math.floor(maxBytes)))
+}
+
+function runSpawned(spec: SpawnRunSpec, captureBytes: number): Promise<{ outcome: RunOutcome; stdout: string }> {
   const started = Date.now()
   const graceMs = spec.graceMs ?? DEFAULT_GRACE_MS
   const drainMs = spec.drainMs ?? DEFAULT_DRAIN_MS
   const abandonMs = spec.abandonMs ?? DEFAULT_ABANDON_MS
-  return new Promise<RunOutcome>((resolve) => {
+  const notStartedWithinMs = spec.notStartedWithinMs ?? NOT_STARTED_WITHIN_MS
+  return new Promise<{ outcome: RunOutcome; stdout: string }>((resolve) => {
     let settled = false
     let stdoutBytes = 0
+    let captured = ''
+    /** When the process was spawned; null until it was (a spawn error never sets it). */
+    let spawnedAt: number | null = null
     let stderrTail = ''
     let timedOut = false
     let interrupted = false
@@ -281,7 +317,7 @@ export function spawnRun(spec: SpawnRunSpec): Promise<RunOutcome> {
       for (const timer of timers) clearTimeout(timer)
       timers.clear()
       if (onAbort) spec.signal?.removeEventListener('abort', onAbort)
-      resolve({ ...outcome, durationMs: Date.now() - started })
+      resolve({ outcome: { ...outcome, durationMs: Date.now() - started }, stdout: captured })
     }
 
     /** Stop waiting on the child's pipes and let the event loop forget it. */
@@ -311,11 +347,20 @@ export function spawnRun(spec: SpawnRunSpec): Promise<RunOutcome> {
       if (interrupted) {
         return { state: 'failed', exitCode: code, detail: `interrupted — the integration was stopping; the tray stays unread for the next run${extra}` }
       }
+      if (code === 0 && spec.requireStdout === true && stdoutBytes === 0) return { state: 'failed', exitCode: 0, detail: `exit 0 with nothing on stdout${extra}` }
       if (code === 0) return note ? { state: 'ok', exitCode: 0, detail: note } : { state: 'ok', exitCode: 0 }
       const exit = code === null ? `signal ${signal ?? 'unknown'}` : `exit ${code}`
-      // Nothing on stdout: the runtime did not get going (missing, refused
-      // to start, auth gate). Whatever it complained about is in the tail.
-      if (stdoutBytes === 0) return { state: 'not_started', exitCode: code, detail: `${exit} with nothing on stdout${extra}` }
+      if (stdoutBytes === 0) {
+        // It ran a while and then died (a crash, an OOM kill, a SIGKILL
+        // partway through) before printing anything: a failed run.
+        const ranMs = spawnedAt === null ? 0 : Date.now() - spawnedAt
+        if (spawnedAt !== null && ranMs >= notStartedWithinMs) {
+          return { state: 'failed', exitCode: code, detail: `${exit} after ${Math.round(ranMs / 1000)} s with nothing on stdout (it ran, then ended)${extra}` }
+        }
+        // It quit at once: the runtime did not get going (refused to start,
+        // a bad flag, an auth gate). Whatever it complained about is in the tail.
+        return { state: 'not_started', exitCode: code, detail: `${exit} with nothing on stdout${extra}` }
+      }
       return { state: 'failed', exitCode: code, detail: `${exit}${extra}` }
     }
 
@@ -338,6 +383,9 @@ export function spawnRun(spec: SpawnRunSpec): Promise<RunOutcome> {
       return
     }
     const proc: ChildProcess = child
+    proc.once('spawn', () => {
+      spawnedAt = Date.now()
+    })
 
     if (spec.onStarted) {
       const onStarted = spec.onStarted
@@ -351,7 +399,8 @@ export function spawnRun(spec: SpawnRunSpec): Promise<RunOutcome> {
     }
 
     proc.stdout?.on('data', (chunk: Buffer | string) => {
-      stdoutBytes += chunk.length // counted, never kept
+      stdoutBytes += chunk.length // counted; kept only for a probe that asked (`spawnRunCapturing`), bounded
+      if (captured.length < captureBytes) captured = (captured + String(chunk)).slice(0, captureBytes)
     })
     proc.stderr?.on('data', (chunk: Buffer | string) => {
       stderrTail = (stderrTail + String(chunk)).slice(-4 * STDERR_TAIL_CHARS)
