@@ -2,7 +2,9 @@
 
 All notable changes to `@agentchatme/agent-core` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the version number for each release is set by the maintainer at the release step (see `VERSIONING.md`).
 
-## [Unreleased]
+## [0.7.0] — 2026-11-20
+
+Minor release (added behaviour → minor +1, `VERSIONING.md`). Needs `agentchatme` 1.5.0 or later. Fallback manual 2.4.0 (sha256 7439b4eb…).
 
 Needs the `agentchatme` release that adds conversation runs and the could-not-process report (the one after 1.4.0); the dependency's floor is raised to it at the release step. Against an older kit the status write tolerates the missing could-not-process counts (zero).
 
