@@ -1,13 +1,16 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import { describeWindowsSweep, redactDiagnostic, spawnRun, sweepWindowsDescendants } from '../src/integration/spawn-run.js'
+import type { RunOutcome } from '../src/integration/runner.js'
 import { until } from './helpers/server-double.js'
 
 // ─── One headless run: bounded, classified, output discarded ────────────────
 
 let dir: string
+/** The real setTimeout, for waiting while spawnRun's timers are fake. */
+const realSetTimeout = setTimeout
 
 beforeEach(() => {
   dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agentchat-spawn-run-'))
@@ -351,17 +354,50 @@ describe('spawnRun — never hangs the worker', () => {
   )
 
   it('a run that exits inside its budget is never reclassified by the budget timer while its pipes drain', async () => {
-    const child = script(
-      [
-        "const { spawn } = require('node:child_process')",
-        "spawn(process.execPath, ['-e', 'setTimeout(() => {}, 3000)'], { stdio: ['ignore', 'inherit', 'inherit'] })",
-        "process.stdout.write('x')",
-        'process.exit(0)',
-      ].join('\n'),
-    )
-    const outcome = await run(child, { budgetMs: 200, drainMs: 600 })
-    expect(outcome.state).toBe('ok')
-  }, 10_000)
+    // The order under test: the run exits, THEN its budget elapses, while a
+    // process it started still holds its pipes. On real timers a 200 ms budget
+    // raced the run's own start (a Node process on a loaded runner can take
+    // longer than that to boot and exit), and a budget that fires before the
+    // exit is a timeout, rightly. So spawnRun's timers are held here until the
+    // exit has been seen, then run in order: the budget, then the drain.
+    const sleep = (ms: number): Promise<void> => new Promise((r) => realSetTimeout(r, ms))
+    const pidFile = path.join(dir, 'drain-holder.pid')
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    let outcome: RunOutcome | null = null
+    try {
+      const pending = run(runWithHolder(pidFile), { budgetMs: 200, drainMs: 600 }).then((o) => {
+        outcome = o
+      })
+      expect(vi.getTimerCount()).toBe(1) // the budget's
+      // The exit arms the drain timer beside the budget's. (Windows usually
+      // closes the pipes at the exit: then the run is over already.)
+      const deadline = Date.now() + 30_000
+      while (outcome === null && vi.getTimerCount() < 2) {
+        if (Date.now() > deadline) throw new Error('the run did not exit within 30 s')
+        await sleep(10)
+      }
+      // Windows: give that close its moment rather than force the drain (and its sweep) between exit and close.
+      const closeBy = Date.now() + 5_000
+      while (process.platform === 'win32' && outcome === null && Date.now() < closeBy) await sleep(10)
+      if (outcome === null) {
+        vi.advanceTimersByTime(200) // the budget elapses after the exit, the pipes still held
+        expect(outcome).toBeNull()
+        vi.advanceTimersByTime(600) // the drain
+      }
+      await pending
+      const done = outcome as RunOutcome | null
+      expect(done?.state).toBe('ok')
+      // POSIX: the holder kept the pipes open, so the budget did fire during the drain.
+      if (process.platform !== 'win32') expect(done?.detail).toMatch(/kept its output open/)
+    } finally {
+      vi.useRealTimers()
+      try {
+        reap(Number(fs.readFileSync(pidFile, 'utf-8')))
+      } catch {
+        /* never started */
+      }
+    }
+  }, 40_000)
 })
 
 describe('redactDiagnostic', () => {

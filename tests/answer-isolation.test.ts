@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { spawnSync } from 'node:child_process'
 import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
@@ -179,20 +180,49 @@ describe('Claude Code answer: the AgentChat server only (--strict-mcp-config wit
   }, 20_000)
 })
 
-/** Whether a process is alive (signal 0 tests existence on POSIX and Windows). */
+/**
+ * Whether a process is alive. Signal 0 tests existence (POSIX and Windows),
+ * but on POSIX a killed process stays visible until it is reaped, and the hung
+ * listing's child, orphaned once the listing itself died, is reaped by init in
+ * its own time: a loaded runner can leave it a zombie past this check. A
+ * zombie, or a process already exiting, counts as gone (the answer came only
+ * once every pipe of the listing's tree had closed, so such a process is past
+ * its pipes); one still running does not.
+ */
 function alive(pid: number): boolean {
   try {
     process.kill(pid, 0)
-    return true
   } catch (err) {
     return (err as NodeJS.ErrnoException).code === 'EPERM'
   }
+  return process.platform === 'win32' || !exitingOrZombie(pid)
+}
+
+/** POSIX: the process is a zombie, or past the point of no return in its exit (or reaped since). */
+function exitingOrZombie(pid: number): boolean {
+  if (process.platform === 'linux') {
+    let stat: string
+    try {
+      stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf-8')
+    } catch {
+      return true // reaped since
+    }
+    // `pid (comm) state ppid pgrp session tty_nr tpgid flags …`; comm may hold spaces and parentheses.
+    const fields = stat.slice(stat.lastIndexOf(')') + 2).split(' ')
+    const PF_EXITING = 0x4
+    return fields[0] === 'Z' || fields[0] === 'X' || (Number(fields[6]) & PF_EXITING) !== 0
+  }
+  // BSD ps (macOS): state Z is a zombie, flag E "trying to exit".
+  const ps = spawnSync('ps', ['-o', 'stat=', '-p', String(pid)], { encoding: 'utf-8' })
+  if (ps.status !== 0) return true // reaped since
+  return /[ZE]/.test(ps.stdout.trim())
 }
 
 /** Every pid a hung fake listing wrote is gone. */
 function expectGone(pidsFile: string): void {
   const pids = JSON.parse(fs.readFileSync(pidsFile, 'utf-8')) as number[]
   expect(pids).toHaveLength(2)
+  expect(alive(process.pid), 'the check sees a running process as alive').toBe(true)
   for (const pid of pids) expect(alive(pid), `pid ${pid} still alive`).toBe(false)
   fs.rmSync(pidsFile, { force: true })
 }
