@@ -108,16 +108,20 @@ import { withoutInheritedKey, withoutParentSession, type Preset, type PresetCont
 //                                   as an `answer` run: no web search, no local
 //                                   memory, no plugin-bundled servers or skills,
 //                                   no ChatGPT connectors.
-//   --disable hooks                 none of the user's hooks fire on a health
-//                                   check (`hooks` is the feature key of
-//                                   Feature::CodexHooks, stable and on by
-//                                   default in 0.154.0, `codex features list`;
-//                                   it sets HooksConfig.feature_enabled,
-//                                   core/src/session/mod.rs:4726).
 //   -c mcp_servers.agentchat.url=<the runs' URL>, -c mcp_servers.agentchat.enabled=false
 //                                   the hosted AgentChat server switched off
 //                                   (with the URL the table is valid whether or
 //                                   not a config layer defines one).
+//
+// The user's hooks stay ON in the check (no `--disable hooks`), as in the runs.
+// A hook that breaks every real run must fail the check too: otherwise the
+// check passes, the lone conversation whose run failed is reported, and an
+// innocent conversation gets hidden. Claude Code's check keeps hooks off and
+// leans on the silent rule instead: its runs print text only at the end, so a
+// run that dies early says nothing (`RunOutcome.silent`, counted as a timeout,
+// never reported on the check alone). Codex runs print `--json` events from
+// the start, so a broken Codex run is never silent, and only the check can
+// catch it.
 //
 // No reasoning effort is set: the check asks with the effort the runs use (the
 // user's `model_reasoning_effort`, else the model's default). Codex sends a
@@ -144,9 +148,9 @@ import { withoutInheritedKey, withoutParentSession, type Preset, type PresetCont
 // against a stand-in provider: these flags parse with and without an
 // `agentchat` table in config.toml; the model is offered no agentchat tool and
 // no web search; a provider error exits 1 and an answer exits 0. Rechecked for
-// 0.7.1 (stand-in provider): `--disable hooks` parses, the request carries no
-// effort of ours, and an answer prints `item.completed` (`agent_message`,
-// "OK") then `turn.completed`; a refusal prints `turn.failed` and exits 1.
+// 0.7.1 (stand-in provider): the request carries no effort of ours, and an
+// answer prints `item.completed` (`agent_message`, "OK") then
+// `turn.completed`; a refusal prints `turn.failed` and exits 1.
 
 export const CODEX_PRESET = 'codex'
 
@@ -256,16 +260,17 @@ export function codexProfileArgs(profile: RunProfile): string[] {
 }
 
 /**
- * The features a runtime check turns off: as an `answer` run does (memories,
- * plugins, apps), and the user's hooks (names at the 0.154.0 floor, `codex
- * features list`).
+ * The features a runtime check turns off, as an `answer` run does (names at
+ * the 0.154.0 floor, `codex features list`). Not `hooks`: a user's hook that
+ * breaks every run must fail the check too (see the header).
  */
-export const CODEX_RUNTIME_CHECK_DISABLED_FEATURES = ['memories', 'plugins', 'apps', 'hooks'] as const
+export const CODEX_RUNTIME_CHECK_DISABLED_FEATURES = ['memories', 'plugins', 'apps'] as const
 
 /**
  * The argv of a runtime check: `codex exec` in `dir` (an empty folder), the
- * read-only sandbox, no session files, no web search, memories, plugins,
- * connectors or hooks, and the hosted AgentChat server switched off for it;
+ * read-only sandbox, no session files, no web search, memories, plugins or
+ * connectors (the user's hooks stay on, as in the runs), and the hosted
+ * AgentChat server switched off for it;
  * the prompt on stdin, as for a run. The model and its reasoning effort are
  * the runs' (see the header). `agentchatUrl` is the URL the runs pin (with
  * it, the `agentchat` table stays valid whether or not a config layer defines
@@ -827,11 +832,11 @@ export class CodexRunner implements RunRunner {
   /**
    * Does the model answer right now, through this runner's binary, sign-in,
    * CODEX_HOME and environment? One `codex exec` with a fixed prompt in its
-   * own empty folder, read-only, with the hosted AgentChat server and the
-   * user's hooks switched off (`codexRuntimeCheckArgs`) and no key in its
-   * environment; ok only on exit 0 with a completed turn that holds an agent
-   * message (`codexRuntimeCheckJudge`). Its output is read for that alone and
-   * never logged. Never throws.
+   * own empty folder, read-only, with the hosted AgentChat server switched
+   * off and the user's hooks on, as in the runs (`codexRuntimeCheckArgs`),
+   * and no key in its environment; ok only on exit 0 with a completed turn
+   * that holds an agent message (`codexRuntimeCheckJudge`). Its output is
+   * read for that alone and never logged. Never throws.
    */
   async checkRuntime(options: RunPreflightOptions = {}): Promise<RunPreflight> {
     if (this.options.refuse !== undefined) return { ok: false, detail: this.options.refuse }

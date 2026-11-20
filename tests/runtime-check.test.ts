@@ -99,6 +99,7 @@ describe('Claude Code: one `claude -p` with no tool of any kind', () => {
       disableAllHooks: true,
       verbose: false,
       viewMode: 'default',
+      language: 'english',
     })
     expect(claudeRuntimeCheckArgs()).not.toContain('--verbose')
     expect(claudeRuntimeCheckArgs()).not.toContain('--mcp-config')
@@ -154,14 +155,12 @@ describe('Claude Code: one `claude -p` with no tool of any kind', () => {
     for (const r of [errored, text]) expect(r.detail).not.toContain('must be discarded')
   }, 20_000)
 
-  it('the judge: a result object — success, no error, a turn, and an answer that says OK — as Claude Code 2.1.328 prints it', () => {
+  it('the judge: a result object — success, no error, a turn, output — as Claude Code 2.1.328 prints it', () => {
     // Shapes as seen against a stand-in provider (texts shortened): an answer, and an API error, which is
     // `subtype: "success"` with `is_error: true` — so the subtype alone says nothing.
-    const answer = JSON.stringify({ type: 'result', subtype: 'success', is_error: false, api_error_status: null, terminal_reason: 'completed', num_turns: 1, result: 'OK', session_id: 's' })
+    const answer = JSON.stringify({ type: 'result', subtype: 'success', is_error: false, api_error_status: null, terminal_reason: 'completed', num_turns: 1, result: 'OK', usage: { input_tokens: 10, output_tokens: 1 }, session_id: 's' })
     const apiError = JSON.stringify({ type: 'result', subtype: 'success', is_error: true, num_turns: 1, api_error_status: 401, api_error_type: 'authentication_error', terminal_reason: 'api_error', result: 'Invalid API key · Fix external API key' })
     expect(claudeRuntimeCheckJudge(`${answer}\n`)).toBeNull()
-    expect(claudeRuntimeCheckJudge(JSON.stringify({ ...JSON.parse(answer), result: 'OK.' }))).toBeNull()
-    expect(claudeRuntimeCheckJudge(JSON.stringify({ ...JSON.parse(answer), result: 'ok' }))).toBeNull()
     expect(claudeRuntimeCheckJudge(apiError)).toBe('the result is not a success (type result, subtype success, is_error true, api_error_status 401, terminal_reason api_error)')
     expect(claudeRuntimeCheckJudge(JSON.stringify({ type: 'result', subtype: 'error_during_execution', is_error: true }))).toBe('the result is not a success (type result, subtype error_during_execution, is_error true)')
     expect(claudeRuntimeCheckJudge(JSON.stringify({ type: 'result', subtype: 'success' }))).toBe('the result is not a success (type result, subtype success, is_error ?)')
@@ -171,17 +170,23 @@ describe('Claude Code: one `claude -p` with no tool of any kind', () => {
     expect(claudeRuntimeCheckJudge(apiError)).not.toContain('Invalid API key')
   })
 
-  it('the judge: no turn (num_turns 0 or missing) is not an answer, and neither is a success whose text is not OK; the text is never in the reason', () => {
-    const base = { type: 'result', subtype: 'success', is_error: false, terminal_reason: 'completed', num_turns: 1, result: 'OK' }
+  it('the judge reads the shape, never the words: "Okay" or an answer in another language passes; no turn or no output does not', () => {
+    const base = { type: 'result', subtype: 'success', is_error: false, terminal_reason: 'completed', num_turns: 1, result: 'OK', usage: { input_tokens: 10, output_tokens: 1 } }
+    // Any answer is an answer: the model may say it its own way, or in the user's language.
+    for (const text of ['Okay', 'OK.', 'ok', '好的', 'D\u2019accord']) expect(claudeRuntimeCheckJudge(JSON.stringify({ ...base, result: text })), text).toBeNull()
+    // A result with no `usage` (an older or leaner print) is judged on the rest.
+    const { usage: _usage, ...noUsage } = base
+    expect(claudeRuntimeCheckJudge(JSON.stringify(noUsage))).toBeNull()
+    // No turn (a run stopped before the model: a hook that blocked the prompt) is no answer.
     expect(claudeRuntimeCheckJudge(JSON.stringify({ ...base, num_turns: 0 }))).toBe('the result has no turn (num_turns 0)')
     const { num_turns: _turns, ...noTurns } = base
     expect(claudeRuntimeCheckJudge(JSON.stringify(noTurns))).toBe('the result has no turn (num_turns ?)')
-    for (const text of ["I can't help with that. PEER-LIKE TEXT", 'Okay', 'token', '', 'Credit balance is too low']) {
-      const reason = claudeRuntimeCheckJudge(JSON.stringify({ ...base, result: text }))
-      expect(reason, text).toBe('the result does not answer OK')
-    }
-    expect(claudeRuntimeCheckJudge(JSON.stringify({ ...base, result: null }))).toBe('the result does not answer OK')
-    expect(claudeRuntimeCheckJudge(JSON.stringify({ ...base, result: "I can't help with that. PEER-LIKE TEXT" }))).not.toContain('PEER-LIKE')
+    // Usage that shows no output is no answer either.
+    expect(claudeRuntimeCheckJudge(JSON.stringify({ ...base, usage: { input_tokens: 10, output_tokens: 0 } }))).toBe('the result has no output (usage.output_tokens 0)')
+    expect(claudeRuntimeCheckJudge(JSON.stringify({ ...base, usage: { input_tokens: 10 } }))).toBe('the result has no output (usage.output_tokens ?)')
+    expect(claudeRuntimeCheckJudge(JSON.stringify({ ...base, usage: 'x' }))).toBe('the result has no output (usage.output_tokens ?)')
+    // The text never reaches a reason.
+    expect(claudeRuntimeCheckJudge(JSON.stringify({ ...base, num_turns: 0, result: 'PEER-LIKE TEXT' }))).not.toContain('PEER-LIKE')
   })
 
   it('the judge: verbose output (a JSON array of every message) is judged on its last result, as Claude Code 2.1.328 prints it', () => {
@@ -195,7 +200,8 @@ describe('Claude Code: one `claude -p` with no tool of any kind', () => {
     expect(claudeRuntimeCheckJudge(`${JSON.stringify([init, assistant, ok])}\n`)).toBeNull()
     expect(claudeRuntimeCheckJudge(JSON.stringify([init, apiError]))).toBe('the result is not a success (type result, subtype success, is_error true, api_error_status 400, terminal_reason api_error)')
     expect(claudeRuntimeCheckJudge(JSON.stringify([init, { ...ok, num_turns: 0 }]))).toBe('the result has no turn (num_turns 0)')
-    expect(claudeRuntimeCheckJudge(JSON.stringify([init, assistant, { ...ok, result: 'Not that' }]))).toBe('the result does not answer OK')
+    expect(claudeRuntimeCheckJudge(JSON.stringify([init, assistant, { ...ok, result: 'Okay' }]))).toBeNull()
+    expect(claudeRuntimeCheckJudge(JSON.stringify([init, assistant, { ...ok, usage: { output_tokens: 0 } }]))).toBe('the result has no output (usage.output_tokens 0)')
     // The last result counts: an earlier good one does not cover a later error.
     expect(claudeRuntimeCheckJudge(JSON.stringify([init, ok, apiError]))).toMatch(/^the result is not a success/)
     // No result in it, or nothing that is a message.
@@ -206,7 +212,7 @@ describe('Claude Code: one `claude -p` with no tool of any kind', () => {
     expect(claudeRuntimeCheckJudge(JSON.stringify([init, assistant, ok]).slice(0, 80))).toBe('its answer is not a JSON result')
   })
 
-  it('the runner: verbose output (a setting the flags cannot turn off, e.g. a managed one) still passes; a non-OK answer or no turn does not', async () => {
+  it('the runner: verbose output (a setting the flags cannot turn off, e.g. a managed one) still passes, and so does an answer in other words; no turn or no output does not', async () => {
     const fake = installFakeClaude(sandbox)
     const runner = (extra: NodeJS.ProcessEnv): ClaudeRunner =>
       new ClaudeRunner({ configDir: path.join(sandbox, '.claude'), workdir: path.join(sandbox, 'w'), profile: 'own', denyReadPaths: [home], env: withFake(fake, extra) })
@@ -215,10 +221,11 @@ describe('Claude Code: one `claude -p` with no tool of any kind', () => {
       ok: false,
       detail: 'claude runtime check failed: exit 0, but the result is not a success (type result, subtype success, is_error true, api_error_status 400, terminal_reason api_error)',
     })
-    const notOk = await runner({ FAKE_RUNTIME_RUN_MODE: 'not_ok' }).checkRuntime()
-    expect(notOk).toEqual({ ok: false, detail: 'claude runtime check failed: exit 0, but the result does not answer OK' })
-    expect(await runner({ FAKE_RUNTIME_RUN_MODE: 'no_turns' }).checkRuntime()).toEqual({ ok: false, detail: 'claude runtime check failed: exit 0, but the result has no turn (num_turns 0)' })
-    expect(notOk.detail).not.toContain('must be discarded')
+    expect(await runner({ FAKE_RUNTIME_RUN_MODE: 'not_ok' }).checkRuntime()).toEqual({ ok: true })
+    const noTurns = await runner({ FAKE_RUNTIME_RUN_MODE: 'no_turns' }).checkRuntime()
+    expect(noTurns).toEqual({ ok: false, detail: 'claude runtime check failed: exit 0, but the result has no turn (num_turns 0)' })
+    expect(await runner({ FAKE_RUNTIME_RUN_MODE: 'no_output', FAKE_RUNTIME_VERBOSE: '1' }).checkRuntime()).toEqual({ ok: false, detail: 'claude runtime check failed: exit 0, but the result has no output (usage.output_tokens 0)' })
+    expect(noTurns.detail).not.toContain('must be discarded')
   }, 20_000)
 
   it('a check that hangs is stopped when its signal aborts: the process is killed and the answer is not ok', async () => {
@@ -260,7 +267,7 @@ describe('Codex: one `codex exec` in an empty folder, read-only, with the AgentC
       'exec', '--json', '--skip-git-repo-check', '--ephemeral', '-C', '/c/check',
       '--sandbox', 'read-only',
       '-c', 'web_search="disabled"',
-      '--disable', 'memories', '--disable', 'plugins', '--disable', 'apps', '--disable', 'hooks',
+      '--disable', 'memories', '--disable', 'plugins', '--disable', 'apps',
       '-c', 'mcp_servers.agentchat.url="https://api.example/mcp"',
       '-c', 'mcp_servers.agentchat.enabled=false',
       '-',
@@ -269,12 +276,14 @@ describe('Codex: one `codex exec` in an empty folder, read-only, with the AgentC
     expect(codexRuntimeCheckArgs('/c/check')).toEqual([
       'exec', '--json', '--skip-git-repo-check', '--ephemeral', '-C', '/c/check', '--sandbox', 'read-only',
       '-c', 'web_search="disabled"',
-      '--disable', 'memories', '--disable', 'plugins', '--disable', 'apps', '--disable', 'hooks',
+      '--disable', 'memories', '--disable', 'plugins', '--disable', 'apps',
       '-c', 'mcp_servers.agentchat.enabled=false', '-',
     ])
-    // The features an answer run turns off, and the user's hooks (`hooks`, Feature::CodexHooks at the 0.154.0 floor).
-    expect(CODEX_RUNTIME_CHECK_DISABLED_FEATURES).toEqual(['memories', 'plugins', 'apps', 'hooks'])
-    for (const feature of ['memories', 'plugins', 'apps']) expect(CODEX_ANSWER_DISABLED_FEATURES).toContain(feature)
+    // The same features an answer run turns off, at the 0.154.0 floor. Not `hooks`: a user's hook that breaks
+    // every run must fail the check too (a Codex run prints `--json` events, so it is never silent).
+    expect(CODEX_RUNTIME_CHECK_DISABLED_FEATURES).toEqual(['memories', 'plugins', 'apps'])
+    for (const feature of CODEX_RUNTIME_CHECK_DISABLED_FEATURES) expect(CODEX_ANSWER_DISABLED_FEATURES).toContain(feature)
+    expect(codexRuntimeCheckArgs('/c/check')).not.toContain('hooks')
     // No reasoning effort of ours: a model that does not take `low` would refuse every check. The runs' effort applies.
     expect(codexRuntimeCheckArgs('/c/check').join(' ')).not.toContain('reasoning')
   })

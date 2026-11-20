@@ -27,7 +27,7 @@ import {
   failedCyclesInARow,
   formatIntegrationStatus,
   integrationStatusFresh,
-  integrationStatusWritten,
+  integrationStatusStaleFor,
   readIntegrationStatus,
   repeatedFailedRuns,
   runtimeCheckFailingNow,
@@ -1109,7 +1109,8 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
     // the server's, with its own end, whether or not the daemon runs), and a
     // runtime check that fails (then no failure is reported as a
     // conversation's: a broken runtime is not its fault) — said only while
-    // the daemon runs: a check from before it stopped says nothing about now.
+    // the status file is fresh: a check from before the daemon went quiet
+    // says nothing about now.
     const cnp = integration?.could_not_process ?? null
     if (cnp !== null) {
       const paused = describePausedConversations(cnp.paused_conversations)
@@ -1128,7 +1129,7 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
             : {
                 name: 'could-not-process',
                 verdict: 'WARN',
-                detail: `the daemon is not running: its status was last written ${integrationStatusWritten(integration)} (a running daemon rewrites it every 30 s), so no run starts and no runtime check is made; the runtime check that failed before it stopped (${lastCheck.at}) says nothing about now`,
+                detail: `the daemon has not written its status for ${integrationStatusStaleFor(integration)} — it may be down (a running daemon rewrites it every 30 s); the runtime check that failed at ${lastCheck.at} says nothing about now`,
               },
         )
       } else if (counts !== null) {

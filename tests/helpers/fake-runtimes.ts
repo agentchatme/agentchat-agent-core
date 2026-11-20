@@ -16,7 +16,7 @@ import * as path from 'node:path'
 //   FAKE_RUNTIME_PROBE_HANG=version|auth   that probe hangs, with a child holding its output pipe
 //   FAKE_RUNTIME_PROBE_PIDS=<file> where the hung probe writes its pid and its child's
 //   FAKE_MCP_LIST_RECORD=<file>    where `mcp list` appends its argv, cwd and env
-//   FAKE_RUNTIME_RUN_MODE=fail|silent|hang|error_exit0|text|not_ok|no_turns|no_message|no_turn
+//   FAKE_RUNTIME_RUN_MODE=fail|silent|hang|error_exit0|text|not_ok|no_turns|no_output|no_message|no_turn
 //                                  how a headless run (or a runtime check)
 //                                  ends instead of answering: exit 1 after
 //                                  some output (with JSON asked for, a result
@@ -25,15 +25,17 @@ import * as path from 'node:path'
 //                                  FAKE_RUNTIME_RUN_PIDS), exit 0 with an
 //                                  `is_error: true` result / a `turn.failed`,
 //                                  exit 0 with plain text where JSON was asked
-//                                  for, an answer that is not OK, a Claude
-//                                  result with `num_turns: 0`, a Codex turn
+//                                  for, an answer in other words than OK, a
+//                                  Claude result with `num_turns: 0` or with
+//                                  `usage.output_tokens: 0`, a Codex turn
 //                                  with no agent message, or a Codex agent
 //                                  message with no `turn.completed`
 //   FAKE_RUNTIME_VERBOSE=1         Claude Code's verbose output whatever the
 //                                  flags say (a user or managed setting)
 //
 // With `--output-format json` a Claude run answers one result object, shaped
-// as Claude Code's (`type`, `subtype`, `is_error`, `num_turns`, `result`), or
+// as Claude Code's (`type`, `subtype`, `is_error`, `num_turns`, `result`,
+// `usage`), or
 // with `--verbose` (FAKE_RUNTIME_VERBOSE=1) the array of every message, the
 // result last. With `exec --json` a Codex run prints Codex's events, one per
 // line (`thread.started`, `turn.started`, `item.completed` with an
@@ -140,7 +142,7 @@ function install(root: string, name: string, version: string, authArgs: [string,
       "  if (runMode === 'text' || (!claudeJson && !codexJson)) process.stdout.write(SECRET + '\\n')",
       '  else if (claudeJson) {',
       // Claude Code's result object; with verbose on (`--verbose`, or the user's setting: FAKE_RUNTIME_VERBOSE=1) the array of every message, the result last.
-      "    const result = { type: 'result', subtype: 'success', is_error: isError, num_turns: runMode === 'no_turns' ? 0 : 1, result: isError || runMode === 'not_ok' ? SECRET : 'OK', ...(isError ? { api_error_status: 400, terminal_reason: 'api_error' } : { terminal_reason: 'completed' }) }",
+      "    const result = { type: 'result', subtype: 'success', is_error: isError, num_turns: runMode === 'no_turns' ? 0 : 1, result: isError || runMode === 'not_ok' ? SECRET : 'OK', usage: { input_tokens: 10, output_tokens: runMode === 'no_output' ? 0 : 1 }, ...(isError ? { api_error_status: 400, terminal_reason: 'api_error' } : { terminal_reason: 'completed' }) }",
       "    const verbose = args.includes('--verbose') || process.env.FAKE_RUNTIME_VERBOSE === '1'",
       "    process.stdout.write(JSON.stringify(verbose ? [{ type: 'system', subtype: 'init', tools: [], mcp_servers: [] }, { type: 'assistant', message: { content: [{ type: 'text', text: result.result }] } }, result] : result) + '\\n')",
       '  } else {',

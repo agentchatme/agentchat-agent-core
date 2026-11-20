@@ -13,7 +13,7 @@ import {
   formatIntegrationStatus,
   INTEGRATION_STATUS_STALE_MS,
   integrationStatusFresh,
-  integrationStatusWritten,
+  integrationStatusStaleFor,
   readIntegrationStatus,
   repeatedFailedRuns,
   writeIntegrationStatus,
@@ -639,13 +639,16 @@ describe('doctor says it too', () => {
     expect(before).toContain('WARN could-not-process: the runtime check failed')
   })
 
-  it('the failed check is said only while the daemon runs: from a status file nobody has written for minutes, doctor says the daemon is not running instead', async () => {
+  it('the failed check is said only while the status file is fresh: from one nobody has written for minutes, doctor says the daemon may be down instead', async () => {
     const failing = block({ runtime_checks_failed: 1, last_runtime_check: { at: '2026-11-19T10:00:00.000Z', ok: false, detail: 'claude runtime check failed: exit 1' } })
     const stale = await doctor(sample({ updated_at: new Date(Date.now() - 2 * 3_600_000).toISOString(), could_not_process: failing }))
     expect(stale).toContain(
-      'WARN could-not-process: the daemon is not running: its status was last written 2 hour(s) ago (a running daemon rewrites it every 30 s), so no run starts and no runtime check is made; the runtime check that failed before it stopped (2026-11-19T10:00:00.000Z) says nothing about now',
+      'WARN could-not-process: the daemon has not written its status for 2 hour(s) — it may be down (a running daemon rewrites it every 30 s); the runtime check that failed at 2026-11-19T10:00:00.000Z says nothing about now',
     )
     expect(stale).not.toContain('could-not-process: the runtime check failed')
+    expect(stale).not.toContain('not running')
+    // The same words `status` uses for a status file this old.
+    expect(formatIntegrationStatus(sample({ updated_at: new Date(Date.now() - 2 * 3_600_000).toISOString() })).join('\n')).toContain('— the daemon may be down')
     vi.restoreAllMocks()
     // Just inside the window (written 2 min ago): still the daemon's word.
     const fresh = await doctor(sample({ updated_at: new Date(Date.now() - 2 * 60_000).toISOString(), could_not_process: failing }))
@@ -668,8 +671,10 @@ describe('doctor says it too', () => {
     expect(integrationStatusFresh(at(180_001), now)).toBe(false)
     expect(integrationStatusFresh(sample({ updated_at: 'not a time' }), now)).toBe(false)
     expect(integrationStatusFresh(null, now)).toBe(false)
-    expect(integrationStatusWritten(at(2 * 3_600_000), now)).toBe('2 hour(s) ago')
-    expect(integrationStatusWritten(sample({ updated_at: 'not a time' }), now)).toBe('at a time that cannot be read')
+    expect(integrationStatusStaleFor(at(2 * 3_600_000), now)).toBe('2 hour(s)')
+    expect(integrationStatusStaleFor(at(12 * 60_000), now)).toBe('12 minutes')
+    expect(integrationStatusStaleFor(at(3 * 86_400_000), now)).toBe('3 day(s)')
+    expect(integrationStatusStaleFor(sample({ updated_at: 'not a time' }), now)).toBe('an unknown time')
   })
 
   it('a failed check followed by a run that got done is history: PASS with the counts', async () => {

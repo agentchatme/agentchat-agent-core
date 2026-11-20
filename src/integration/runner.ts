@@ -96,13 +96,12 @@ export interface RunOutcome {
   readonly detail?: string
   /**
    * A `failed` run that ran past `NOT_STARTED_WITHIN_MS` and then exited
-   * non-zero with NOTHING on stdout: a crash, a kill, or something the run
-   * loads that the runtime check does not (a user's hook, MCP server or
-   * instruction file) ending it. As ambiguous as a timeout, so the engine
-   * hands it to the kit as one (`RunEnd.timedOut`): it is reported as a
-   * conversation's only once another conversation's run completed, never on
-   * the runtime check alone. A provider's refusal prints its error on stdout
-   * (`API Error: …`), so it is a plain `failed`, not this.
+   * non-zero with NOTHING on stdout: a crash with no output, a kill. As
+   * ambiguous as a timeout, so the engine hands it to the kit as one
+   * (`RunEnd.timedOut`): it is reported as a conversation's only once another
+   * conversation's run completed, never on the runtime check alone. A
+   * provider's refusal is not this: it prints `API Error: …` on stdout, and a
+   * run whose stderr says `API Error` is not marked silent either.
    */
   readonly silent?: boolean
 }

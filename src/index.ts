@@ -165,7 +165,7 @@ export {
   integrationStatusAge,
   INTEGRATION_STATUS_STALE_MS,
   integrationStatusFresh,
-  integrationStatusWritten,
+  integrationStatusStaleFor,
   formatIntegrationStatus,
   type IntegrationStatus,
   type IntegrationLastRun,

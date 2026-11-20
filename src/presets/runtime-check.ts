@@ -28,14 +28,6 @@ import { spawnRunCapturing } from '../integration/spawn-run.js'
 /** The fixed prompt: nothing from any peer, nothing to act on. */
 export const RUNTIME_CHECK_PROMPT = 'Reply with the single word OK.'
 
-/**
- * The answer the fixed prompt asks for, as a word anywhere in the reply
- * (`OK`, `OK.`, `ok`). A runtime whose result carries the model's text is
- * judged on it too: an error a runtime prints as its result (a usage limit, an
- * expired sign-in) is no answer. Reading it is safe: the prompt is ours, so
- * the reply holds no peer content.
- */
-export const RUNTIME_CHECK_ANSWER = /\bok\b/i
 
 /**
  * The check's own budget. Past it the probe is SIGTERMed, SIGKILLed 5 s later

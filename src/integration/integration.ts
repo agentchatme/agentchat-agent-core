@@ -587,10 +587,10 @@ export class Integration {
     // A run past its budget (killed, or abandoned by the deadline above) is a
     // timed-out failure: a could-not-process report then says `timed_out`.
     // So is a silent failure (`RunOutcome.silent`: it ran, then exited
-    // non-zero with nothing on stdout): as ambiguous as a timeout — a broken
-    // hook, MCP server or instruction file of the user's ends a run that way,
-    // and the runtime check, which loads none of them, would pass. The kit
-    // reports either only once another conversation's run completed.
+    // non-zero with nothing on stdout): as ambiguous as a timeout — a crash
+    // with no output says nothing about why, and the runtime check could
+    // pass. The kit reports either only once another conversation's run
+    // completed.
     const timedOut = outcome.state === 'timed_out' || (outcome.state === 'failed' && outcome.silent === true)
     return { status: 'failed', ...(timedOut ? { timedOut: true } : {}), ...(outcome.detail !== undefined ? { detail: outcome.detail } : {}) }
   }

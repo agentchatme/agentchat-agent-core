@@ -25,12 +25,15 @@ import { log } from '../util/log.js'
 // either way.
 //
 // The silent failure past the window is `failed` with `silent: true`
-// (`RunOutcome.silent`): it says nothing about why. A provider's refusal
-// prints its `API Error: …` on stdout, so it is a plain `failed`; a run that
-// a broken hook, MCP server or instruction file ends prints nothing, and the
-// runtime check, which loads none of those, would pass. So the engine counts
-// a silent failure like a timeout (`RunEnd.timedOut`): it is reported as a
-// conversation's only once another conversation's run completed.
+// (`RunOutcome.silent`): a crash with no output says nothing about why, and
+// the runtime check (which loads no hook, MCP server or instruction file of
+// the user's) could pass. So the engine counts a silent failure like a
+// timeout (`RunEnd.timedOut`): it is reported as a conversation's only once
+// another conversation's run completed. A provider's refusal is not silent:
+// Claude Code prints its `API Error: …` on stdout, and a run whose stderr
+// tail says `API Error` is not marked silent either (should a runtime move
+// the refusal to stderr, it stays a plain `failed`, for which the runtime
+// check is evidence).
 //
 // The run is spawned as its own process group (detached) so the whole tree
 // can be signalled at once: on the budget, and when the integration is stopping
@@ -367,12 +370,15 @@ function runSpawned(spec: SpawnRunSpec, captureBytes: number): Promise<{ outcome
       const exit = code === null ? `signal ${signal ?? 'unknown'}` : `exit ${code}`
       if (stdoutBytes === 0) {
         // It ran a while and then died (a crash, an OOM kill, a SIGKILL
-        // partway through, a hook or MCP server the run loads) before printing
-        // anything: a failed run, and a silent one — as ambiguous as a
-        // timeout (`RunOutcome.silent`). Measured to the exit, not to now.
+        // partway through) before printing anything: a failed run, and a
+        // silent one — as ambiguous as a timeout (`RunOutcome.silent`).
+        // Measured to the exit, not to now.
         const ranMs = spawnedAt === null ? 0 : Math.max(0, exitedAt - spawnedAt)
         if (spawnedAt !== null && ranMs >= notStartedWithinMs) {
-          return { state: 'failed', silent: true, exitCode: code, detail: `${exit} after ${Math.round(ranMs / 1000)} s with nothing on stdout (it ran, then ended)${extra}` }
+          // A refusal said on stderr (`API Error: …`) is the provider's answer,
+          // not silence: a plain failure.
+          const refused = tail.includes('API Error')
+          return { state: 'failed', ...(refused ? {} : { silent: true }), exitCode: code, detail: `${exit} after ${Math.round(ranMs / 1000)} s with nothing on stdout (it ran, then ended)${extra}` }
         }
         // It quit at once: the runtime did not get going (refused to start,
         // a bad flag, an auth gate). Whatever it complained about is in the tail.

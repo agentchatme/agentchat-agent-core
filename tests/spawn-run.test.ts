@@ -79,6 +79,13 @@ describe('spawnRun', () => {
     expect((await run(script('process.exit(0)'))).silent).toBeUndefined()
   })
 
+  it('a run past the window whose stderr says `API Error` is a plain FAILED, not silent: a refusal moved to stderr is still the provider\'s answer', async () => {
+    const outcome = await run(script("setTimeout(() => { process.stderr.write('API Error: 400 refused\\n'); process.exit(1) }, 600)"), { notStartedWithinMs: 300 })
+    expect(outcome).toMatchObject({ state: 'failed', exitCode: 1 })
+    expect(outcome.silent).toBeUndefined()
+    expect(outcome.detail).toMatch(/^exit 1 after \d+ s with nothing on stdout \(it ran, then ended\): API Error: 400 refused$/)
+  })
+
   it('the window is measured to the process\'s EXIT, not to when the run is classified: a quick quit whose pipes a leftover holds past the window is still NOT STARTED', async () => {
     // The run exits at once with nothing on stdout; a process it started keeps
     // its pipes open, so `close` does not come and the drain classifies it
@@ -387,6 +394,13 @@ describe('spawnRun — a command line through the platform shell (shell: true)',
   it('exit 0 is ok; exit 2 after some output is failed with exit 2', async () => {
     expect(await shellRun("process.stdout.write('ok'); process.exit(0)")).toMatchObject({ state: 'ok', exitCode: 0 })
     expect(await shellRun("process.stdout.write('started'); process.exit(2)")).toMatchObject({ state: 'failed', exitCode: 2 })
+  }, 30_000)
+
+  it('exit non-zero with nothing on stdout PAST the window is FAILED and SILENT, as for a direct run', async () => {
+    const file = script("setTimeout(() => { process.stderr.write('crashed\\n'); process.exit(3) }, 700)")
+    const outcome = await spawnRun({ command: `"${process.execPath}" "${file}"`, args: [], shell: true, cwd: dir, env: { ...process.env }, stdin: null, budgetMs: 20_000, notStartedWithinMs: 300 })
+    expect(outcome).toMatchObject({ state: 'failed', silent: true, exitCode: 3 })
+    expect(outcome.detail).toMatch(/with nothing on stdout \(it ran, then ended\): crashed$/)
   }, 30_000)
 
   it('a command the shell cannot find is NOT STARTED: nothing on stdout (sh exits 127; cmd.exe /c exits 1, the same code as a command that ran and failed)', async () => {

@@ -14,7 +14,6 @@ export { withoutParentSession, isParentSessionEnv, CLAUDE_CODE_ENV_KEPT, CLAUDE_
 export { semverAtLeast } from './semver.js'
 export {
   RUNTIME_CHECK_PROMPT,
-  RUNTIME_CHECK_ANSWER,
   RUNTIME_CHECK_BUDGET_MS,
   RUNTIME_CHECK_DIR,
   RUNTIME_CHECK_KEY_ENV,

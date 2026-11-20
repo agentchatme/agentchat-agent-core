@@ -434,21 +434,32 @@ export function integrationStatusAge(status: IntegrationStatus | null, now = Dat
 /**
  * Past this age the status file is not the daemon's current word: a running
  * integration rewrites it every 30 s, connected or not (the heartbeat file
- * beats only while connected), so a file this old means the daemon is not
- * running.
+ * beats only while connected), so the daemon may be down.
  */
 export const INTEGRATION_STATUS_STALE_MS = 3 * 60_000
 
-/** Whether the status file was written within `INTEGRATION_STATUS_STALE_MS`: the daemon that wrote it is running. */
+/** Whether the status file was written within `INTEGRATION_STATUS_STALE_MS`: the daemon that wrote it is taken to be running. */
 export function integrationStatusFresh(status: IntegrationStatus | null, now = Date.now()): boolean {
   const age = integrationStatusAge(status, now)
   return age !== null && age <= INTEGRATION_STATUS_STALE_MS
 }
 
-/** When the status file was written, in words (`3 hour(s) ago`), for a line that says the daemon is not running. */
-export function integrationStatusWritten(status: IntegrationStatus | null, now = Date.now()): string {
+/**
+ * How long the status file has gone unwritten, in words (`2 hour(s)`, `12
+ * minutes`), for a line that says the daemon may be down; `an unknown time`
+ * when its time cannot be read.
+ */
+export function integrationStatusStaleFor(status: IntegrationStatus | null, now = Date.now()): string {
   const age = integrationStatusAge(status, now)
-  return age === null ? 'at a time that cannot be read' : ago(age)
+  return age === null ? 'an unknown time' : forWhile(age)
+}
+
+/** `ms`, in words: how long something has lasted. */
+function forWhile(ms: number): string {
+  if (ms < 90_000) return 'about a minute'
+  if (ms < 45 * 60_000) return `${Math.round(ms / 60_000)} minutes`
+  if (ms < 36 * 3_600_000) return `${Math.round(ms / 3_600_000)} hour(s)`
+  return `${Math.round(ms / 86_400_000)} day(s)`
 }
 
 function ago(ms: number): string {
@@ -518,9 +529,9 @@ export function describeCouldNotProcessCounts(c: IntegrationCouldNotProcess, now
  * Whether the last runtime check failed and nothing has got done since: a run
  * that completed after the check says the runtime works again, and the failed
  * check is history (the counts say it). It does not look at the file's age:
- * a caller that warns about it does so only while the daemon runs
- * (`integrationStatusFresh`), since a check from before the daemon stopped
- * says nothing about now.
+ * a caller that warns about it does so only while the status file is fresh
+ * (`integrationStatusFresh`), since a check from before the daemon went
+ * quiet says nothing about now.
  */
 export function runtimeCheckFailingNow(status: Pick<IntegrationStatus, 'could_not_process' | 'last_ok_run_at'> | null): boolean {
   const last = status?.could_not_process?.last_runtime_check ?? null

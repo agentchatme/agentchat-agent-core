@@ -11,7 +11,7 @@ import { log } from '../util/log.js'
 import { runProbe } from '../util/probe.js'
 import { VERSION } from '../version.js'
 import { semverAtLeast } from './semver.js'
-import { RUNTIME_CHECK_ANSWER, RUNTIME_CHECK_DIR, runRuntimeCheck } from './runtime-check.js'
+import { RUNTIME_CHECK_DIR, runRuntimeCheck } from './runtime-check.js'
 import { withoutInheritedKey, withoutParentSession, type Preset, type PresetContext, type PresetInspection } from './types.js'
 
 // ─── Claude Code: one headless run (`claude -p`) ────────────────────────────
@@ -94,8 +94,10 @@ import { withoutInheritedKey, withoutParentSession, type Preset, type PresetCont
 //                               `subtype`, `is_error`, `result`, …). The check
 //                               is ok only on exit 0 with `type: "result"`,
 //                               `subtype: "success"`, `is_error: false`,
-//                               `num_turns` 1 or more and a `result` that
-//                               answers OK (`claudeRuntimeCheckJudge`). Seen
+//                               `num_turns` 1 or more and, when `usage` is
+//                               there, `usage.output_tokens` 1 or more
+//                               (`claudeRuntimeCheckJudge`; judged by its
+//                               shape, never by its words). Seen
 //                               on 2.1.328 against a stand-in provider: an API
 //                               error (a refusal, an invalid key, a low credit
 //                               balance) is `subtype: "success"` with
@@ -113,10 +115,11 @@ import { withoutInheritedKey, withoutParentSession, type Preset, type PresetCont
 //                               check (managed hooks still run), no
 //                               instruction file or memory, re-asserted the way
 //                               `ANSWER_SETTINGS` does (a settings file's `env`
-//                               would override the process environment), and
+//                               would override the process environment),
 //                               verbose output off (`verbose: false`,
 //                               `viewMode: "default"`), so the answer is the one
-//                               result object.
+//                               result object, and `language: "english"` over
+//                               the user's `language`.
 //   CLAUDE_CODE_DISABLE_CLAUDE_MDS=1, CLAUDE_CODE_DISABLE_AUTO_MEMORY=1
 //                               the same two, in the environment.
 //   --disallowedTools <the key-store deny rules>  as on every run.
@@ -465,15 +468,20 @@ export interface ClaudeRunArgOptions {
  *       force, hooks off included). Managed settings outrank `--settings`, so
  *       the judge reads the array too (`claudeRuntimeCheckJudge`).
  *
+ *   language: "english"  the user's `language` setting is an instruction to
+ *       answer in that language; the fixed prompt is English, and the check
+ *       is answered as written (`--settings` outranks the user's value).
+ *
  * Verified on 2.1.328 against a stand-in provider: with the user's `verbose:
  * true`, `viewMode: "verbose"` or the `~/.claude.json` `verbose`, settings
- * without these two keys printed an array; with them, one result object.
+ * without the two verbose keys printed an array; with them, one result object.
  */
 export const RUNTIME_CHECK_SETTINGS = JSON.stringify({
   env: { CLAUDE_CODE_DISABLE_CLAUDE_MDS: '1', CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1' },
   disableAllHooks: true,
   verbose: false,
   viewMode: 'default',
+  language: 'english',
 })
 
 /** The result message in verbose output (a JSON array of messages): the last one with `type: "result"`. */
@@ -488,15 +496,17 @@ function lastResultMessage(messages: readonly unknown[]): unknown {
 /**
  * Whether a runtime check's stdout (`--output-format json`) is a good answer:
  * null when its result has `type: "result"`, `subtype: "success"`,
- * `is_error: false`, at least one turn (`num_turns >= 1`) and a `result` text
- * that answers OK (`RUNTIME_CHECK_ANSWER`); otherwise why not, in ids and
- * flags only (`is_error`, `api_error_status`, `terminal_reason`,
- * `num_turns`), never the result text. The result is the one object Claude
- * Code prints, or, with verbose output on (the `--verbose` flag, the `verbose`
- * or `viewMode` setting), the last `type: "result"` element of the JSON array
- * it prints instead. A false pass is the dangerous direction (an outage
- * reported as one conversation's failure hides its messages), so anything
- * short of all of that is not ok.
+ * `is_error: false`, at least one turn (`num_turns >= 1`: a run a hook
+ * blocked before the model has none) and, when it carries `usage`, at least
+ * one output token (`usage.output_tokens >= 1`); otherwise why not, in ids,
+ * flags and counts only (`is_error`, `api_error_status`, `terminal_reason`,
+ * `num_turns`, `output_tokens`), never the result text. It is judged by its
+ * shape, never by its words: a model may answer "Okay", or in the user's
+ * language. The result is the one object Claude Code prints, or, with verbose
+ * output on (the `--verbose` flag, the `verbose` or `viewMode` setting), the
+ * last `type: "result"` element of the JSON array it prints instead. A false
+ * pass is the dangerous direction (an outage reported as one conversation's
+ * failure hides its messages), so anything short of all of that is not ok.
  */
 export function claudeRuntimeCheckJudge(stdout: string): string | null {
   const text = stdout.trim()
@@ -518,7 +528,11 @@ export function claudeRuntimeCheckJudge(stdout: string): string | null {
   if (r['type'] === 'result' && r['subtype'] === 'success' && r['is_error'] === false) {
     const turns = r['num_turns']
     if (typeof turns !== 'number' || !(turns >= 1)) return `the result has no turn (num_turns ${typeof turns === 'number' ? turns : '?'})`
-    if (typeof r['result'] !== 'string' || !RUNTIME_CHECK_ANSWER.test(r['result'])) return 'the result does not answer OK'
+    const usage = r['usage']
+    if (usage !== undefined && usage !== null) {
+      const tokens = typeof usage === 'object' && !Array.isArray(usage) ? (usage as Record<string, unknown>)['output_tokens'] : undefined
+      if (typeof tokens !== 'number' || !(tokens >= 1)) return `the result has no output (usage.output_tokens ${typeof tokens === 'number' ? tokens : '?'})`
+    }
     return null
   }
   const facts = [
