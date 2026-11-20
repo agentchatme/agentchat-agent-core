@@ -88,6 +88,7 @@ export {
   codexClientHeadersToml,
   codexRunArgs,
   codexRuntimeCheckArgs,
+  codexRuntimeCheckJudge,
   codexRuntimeCheckWorkdir,
   CODEX_RUNTIME_CHECK_DISABLED_FEATURES,
   agentchatTableKeys,

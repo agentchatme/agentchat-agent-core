@@ -11,6 +11,9 @@ import {
   describeCouldNotProcessCounts,
   describePausedConversations,
   formatIntegrationStatus,
+  INTEGRATION_STATUS_STALE_MS,
+  integrationStatusFresh,
+  integrationStatusStaleFor,
   readIntegrationStatus,
   repeatedFailedRuns,
   writeIntegrationStatus,
@@ -43,7 +46,7 @@ const KEY = 'ac_' + 'k'.repeat(32)
 const TEMPLATE = 'SERVED CONVERSATION RUN for <conversation_id> (generic): only this one.'
 const promptFor = (id: string): string => `SERVED CONVERSATION RUN for ${id} (generic): only this one.\n\n${POINTER}`
 
-type Ending = 'ok' | 'failed' | 'timed_out' | 'not_started' | 'never' | 'hold'
+type Ending = 'ok' | 'failed' | 'silent' | 'timed_out' | 'not_started' | 'never' | 'hold'
 type Check = 'ok' | 'fail' | 'hang'
 
 /** A runner whose runs end as scripted per conversation (default `ok`), with an optional runtime check. */
@@ -72,6 +75,8 @@ class ScriptedRunner implements RunRunner {
     if (ending === 'ok') return { state: 'ok', exitCode: 0, durationMs: 1 }
     if (ending === 'timed_out') return { state: 'timed_out', exitCode: null, durationMs: 1, detail: 'run exceeded its 1 s budget and was killed' }
     if (ending === 'not_started') return { state: 'not_started', exitCode: 127, durationMs: 1, detail: 'exit 127 with nothing on stdout' }
+    // What spawnRun says of a run that ran past the not-started window and then exited non-zero with nothing on stdout.
+    if (ending === 'silent') return { state: 'failed', silent: true, exitCode: 1, durationMs: 6_000, detail: 'exit 1 after 6 s with nothing on stdout (it ran, then ended)' }
     return { state: 'failed', exitCode: 1, durationMs: 1, detail: 'exit 1: API Error: refused' }
   }
   private async runCheck(options: RunPreflightOptions = {}): Promise<RunPreflight> {
@@ -222,6 +227,41 @@ describe('a failed conversation run is reported with the outcome the runner saw'
     expect(i.snapshot()).toMatchObject({ runs_timed_out: 1, runs_ok: 1 })
   }, 10_000)
 
+  // A silent failure (it ran, then exited non-zero with nothing on stdout) is
+  // as ambiguous as a timeout: a broken hook, MCP server or instruction file
+  // ends a run that way, and the runtime check loads none of them.
+  it('a silent failure → `RunEnd.timedOut`: never reported on the runtime check alone, reported as `timed_out` once another conversation\'s run completed', async () => {
+    const warn = vi.spyOn(log, 'warn')
+    await serve({ tray: { waiting: 1 } })
+    const runner = new ScriptedRunner('ok')
+    runner.endings.set('conv_0', 'silent')
+    const i = await integration(runner)
+    await until(() => i.snapshot().runs_failed === 1, 5_000)
+    await pause(500)
+    // The check would pass (the runtime answers), but that is no evidence for a silent failure.
+    expect(reports()).toHaveLength(0)
+    // Counted as a failed run (status), with its detail as spawnRun wrote it; the log says why it waits.
+    expect(i.snapshot()).toMatchObject({ runs_failed: 1, runs_timed_out: 0 })
+    expect(i.snapshot().last_run).toMatchObject({ state: 'failed', detail: 'exit 1 after 6 s with nothing on stdout (it ran, then ended)' })
+    expect(warn.mock.calls.some(([line]) => /^run failed kind=conversation conv=conv_0 id=\S+: exit 1 after 6 s with nothing on stdout \(it ran, then ended\) — its card stays on the tray; a silent failure counts as a timeout: it is reported \(could not process\) only once another conversation's run completes/.test(String(line)))).toBe(true)
+    // Another conversation's run completes: the evidence.
+    double!.setTray({ waiting: 2 })
+    runner.endings.set('conv_0', 'ok')
+    i.wake()
+    await until(() => reports().length === 1, 5_000)
+    expect(reports()[0]).toMatchObject({ conversationId: 'conv_0', body: { through_message_id: 'msg_0', outcome: 'timed_out', evidence: 'other_run_completed' } })
+  }, 15_000)
+
+  it('a silent failure next to a run that completed → reported as `timed_out` with that evidence', async () => {
+    await serve({ tray: { waiting: 2 } })
+    const runner = new ScriptedRunner(null)
+    runner.endings.set('conv_0', 'silent')
+    const i = await integration(runner)
+    await until(() => reports().length === 1, 5_000)
+    expect(reports()[0]).toMatchObject({ conversationId: 'conv_0', body: { through_message_id: 'msg_0', outcome: 'timed_out', evidence: 'other_run_completed' } })
+    expect(i.snapshot()).toMatchObject({ runs_failed: 1, runs_ok: 1 })
+  }, 10_000)
+
   it('a runner that never returns is abandoned at its deadline and counts as timed out (`timed_out` in the report)', async () => {
     await serve({ tray: { waiting: 2 } })
     const runner = new ScriptedRunner(null)
@@ -285,6 +325,46 @@ describe('a failed conversation run is reported with the outcome the runner saw'
     expect(runner.checks).toHaveLength(0)
     await until(() => (i.snapshot().could_not_process?.reruns ?? 0) === 1, 3_000)
   }, 10_000)
+})
+
+describe('the server\'s answer, in the log: ids and counts only', () => {
+  const ids = (n: number): string[] => Array.from({ length: n }, (_, k) => `msg_h${k}`)
+
+  it('`hidden` says how many messages were hidden from `hidden_count`, not the capped id list', async () => {
+    const info = vi.spyOn(log, 'info')
+    await serve({ tray: { waiting: 1 } })
+    double!.answerProcessingFailures({ action: 'hidden', attempts: 2, hidden_message_ids: ids(200), hidden_count: 250, paused_until: null })
+    const runner = new ScriptedRunner('ok')
+    runner.endings.set('conv_0', 'failed')
+    await integration(runner)
+    await until(() => info.mock.calls.some(([line]) => String(line).startsWith('could not process: conv=conv_0')), 5_000)
+    const line = info.mock.calls.map(([l]) => String(l)).find((l) => l.startsWith('could not process: conv=conv_0'))
+    expect(line).toContain('→ server: hidden (250 message(s) are now a note for this agent, still unread)')
+    expect(line).not.toContain('msg_h')
+  }, 10_000)
+
+  it('`paused` with more hidden says `hidden_count` too; a server without `hidden_count` falls back to the list', async () => {
+    const warn = vi.spyOn(log, 'warn')
+    const info = vi.spyOn(log, 'info')
+    await serve({ tray: { waiting: 1 } })
+    const pausedUntil = new Date(Date.now() + 24 * 3_600_000).toISOString()
+    double!.answerProcessingFailures({ action: 'paused', attempts: 3, hidden_message_ids: ids(200), hidden_count: 321, paused_until: pausedUntil })
+    const runner = new ScriptedRunner('ok')
+    runner.endings.set('conv_0', 'failed')
+    const i = await integration(runner)
+    await until(() => warn.mock.calls.some(([line]) => String(line).startsWith('could not process: conv=conv_0')), 5_000)
+    expect(warn.mock.calls.map(([l]) => String(l)).find((l) => l.startsWith('could not process: conv=conv_0'))).toContain(`paused until ${pausedUntil} (321 more message(s) hidden)`)
+    await i.stopAndWait(5_000)
+
+    // An older server: no `hidden_count`, so the list is all there is.
+    double!.setTray({ waiting: 1 })
+    double!.answerProcessingFailures({ action: 'hidden', attempts: 2, hidden_message_ids: ids(3), paused_until: null })
+    const again = new ScriptedRunner('ok')
+    again.endings.set('conv_0', 'failed')
+    await integration(again)
+    await until(() => info.mock.calls.some(([line]) => String(line).includes('→ server: hidden (')), 5_000)
+    expect(info.mock.calls.map(([l]) => String(l)).find((l) => l.includes('→ server: hidden ('))).toContain('hidden (3 message(s) are now a note for this agent, still unread)')
+  }, 15_000)
 })
 
 describe('checkRuntime: the runner\'s minimal model call is the evidence, bounded', () => {
@@ -557,6 +637,44 @@ describe('doctor says it too', () => {
     // A run that got done before the check does not clear it.
     const before = await doctor(sample({ last_ok_run_at: '2026-11-19T09:59:00.000Z', could_not_process: block({ runtime_checks_failed: 1, last_runtime_check: { at: '2026-11-19T10:00:00.000Z', ok: false, detail: 'x' } }) }))
     expect(before).toContain('WARN could-not-process: the runtime check failed')
+  })
+
+  it('the failed check is said only while the status file is fresh: from one nobody has written for minutes, doctor says the daemon may be down instead', async () => {
+    const failing = block({ runtime_checks_failed: 1, last_runtime_check: { at: '2026-11-19T10:00:00.000Z', ok: false, detail: 'claude runtime check failed: exit 1' } })
+    const stale = await doctor(sample({ updated_at: new Date(Date.now() - 2 * 3_600_000).toISOString(), could_not_process: failing }))
+    expect(stale).toContain(
+      'WARN could-not-process: the daemon has not written its status for 2 hour(s) — it may be down (a running daemon rewrites it every 30 s); the runtime check that failed at 2026-11-19T10:00:00.000Z says nothing about now',
+    )
+    expect(stale).not.toContain('could-not-process: the runtime check failed')
+    expect(stale).not.toContain('not running')
+    // The same words `status` uses for a status file this old.
+    expect(formatIntegrationStatus(sample({ updated_at: new Date(Date.now() - 2 * 3_600_000).toISOString() })).join('\n')).toContain('— the daemon may be down')
+    vi.restoreAllMocks()
+    // Just inside the window (written 2 min ago): still the daemon's word.
+    const fresh = await doctor(sample({ updated_at: new Date(Date.now() - 2 * 60_000).toISOString(), could_not_process: failing }))
+    expect(fresh).toContain('WARN could-not-process: the runtime check failed (claude runtime check failed: exit 1; 2026-11-19T10:00:00.000Z)')
+    vi.restoreAllMocks()
+    // A pause is the server's, with its own end: said whether or not the daemon runs.
+    const pausedUntil = new Date(Date.now() + 3 * 3_600_000).toISOString()
+    const paused = await doctor(
+      sample({ updated_at: new Date(Date.now() - 2 * 3_600_000).toISOString(), could_not_process: block({ ...failing, paused: 1, paused_conversations: [{ conversation_id: 'conv_p', paused_until: pausedUntil, at: new Date().toISOString() }] }) }),
+    )
+    expect(paused).toContain(`WARN could-not-process: 1 conversation paused until ${pausedUntil}`)
+  })
+
+  it('freshness: written within 3 minutes is the running daemon\'s word; older, or an unreadable time, is not', () => {
+    const now = Date.parse('2026-11-19T12:00:00.000Z')
+    const at = (ms: number): IntegrationStatus => sample({ updated_at: new Date(now - ms).toISOString() })
+    expect(INTEGRATION_STATUS_STALE_MS).toBe(180_000)
+    expect(integrationStatusFresh(at(0), now)).toBe(true)
+    expect(integrationStatusFresh(at(180_000), now)).toBe(true)
+    expect(integrationStatusFresh(at(180_001), now)).toBe(false)
+    expect(integrationStatusFresh(sample({ updated_at: 'not a time' }), now)).toBe(false)
+    expect(integrationStatusFresh(null, now)).toBe(false)
+    expect(integrationStatusStaleFor(at(2 * 3_600_000), now)).toBe('2 hour(s)')
+    expect(integrationStatusStaleFor(at(12 * 60_000), now)).toBe('12 minutes')
+    expect(integrationStatusStaleFor(at(3 * 86_400_000), now)).toBe('3 day(s)')
+    expect(integrationStatusStaleFor(sample({ updated_at: 'not a time' }), now)).toBe('an unknown time')
   })
 
   it('a failed check followed by a run that got done is history: PASS with the counts', async () => {

@@ -18,7 +18,7 @@ import { spawnRunCapturing } from '../integration/spawn-run.js'
 // of its own. Exit 0 with some text is not enough (a usage limit, a low
 // credit balance or an expired sign-in can print a sentence and still be no
 // answer): a runtime whose result says what happened is judged on it
-// (`judge`, e.g. Claude Code's JSON result). For that, the first
+// (`judge`: Claude Code's JSON result, Codex's `--json` events). For that, the first
 // `RUNTIME_CHECK_OUTPUT_BYTES` of its stdout are kept for the check alone —
 // the prompt is ours, so it holds no peer content — read, and dropped; never
 // logged. Only "it answered" and a bounded, redacted diagnostic come back. It
@@ -27,6 +27,7 @@ import { spawnRunCapturing } from '../integration/spawn-run.js'
 
 /** The fixed prompt: nothing from any peer, nothing to act on. */
 export const RUNTIME_CHECK_PROMPT = 'Reply with the single word OK.'
+
 
 /**
  * The check's own budget. Past it the probe is SIGTERMed, SIGKILLed 5 s later

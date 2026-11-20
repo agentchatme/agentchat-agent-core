@@ -78,6 +78,8 @@ export interface ProcessingFailureAnswer {
   action: 'retry' | 'hidden' | 'paused' | 'none'
   attempts: number
   hidden_message_ids: string[]
+  /** How many messages the report hid (the list names at most 200); absent, as from a server that predates it. */
+  hidden_count?: number
   paused_until: string | null
 }
 

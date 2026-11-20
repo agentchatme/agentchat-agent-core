@@ -26,6 +26,8 @@ import {
   describePausedConversations,
   failedCyclesInARow,
   formatIntegrationStatus,
+  integrationStatusFresh,
+  integrationStatusStaleFor,
   readIntegrationStatus,
   repeatedFailedRuns,
   runtimeCheckFailingNow,
@@ -1103,9 +1105,12 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
         detail: `the last ${failedRuns} runs did not get done${lastRun !== null ? ` (latest: ${lastRun.state}${lastRun.detail ? ` — ${lastRun.detail}` : ''})` : ''}; the cards stay on the tray`,
       })
     }
-    // Could not process: the conversations paused for this agent, and a
+    // Could not process: the conversations paused for this agent (a pause is
+    // the server's, with its own end, whether or not the daemon runs), and a
     // runtime check that fails (then no failure is reported as a
-    // conversation's: a broken runtime is not its fault).
+    // conversation's: a broken runtime is not its fault) — said only while
+    // the status file is fresh: a check from before the daemon went quiet
+    // says nothing about now.
     const cnp = integration?.could_not_process ?? null
     if (cnp !== null) {
       const paused = describePausedConversations(cnp.paused_conversations)
@@ -1114,11 +1119,19 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
       if (paused !== null) {
         checks.push({ name: 'could-not-process', verdict: 'WARN', detail: paused.replace(/^could not process: /, '') })
       } else if (lastCheck !== null && runtimeCheckFailingNow(integration)) {
-        checks.push({
-          name: 'could-not-process',
-          verdict: 'WARN',
-          detail: `the runtime check failed (${lastCheck.detail ?? 'no detail'}; ${lastCheck.at}): while it fails, a conversation whose run fails is not reported, its card stays on the tray and the server wakes the agent again`,
-        })
+        checks.push(
+          integrationStatusFresh(integration)
+            ? {
+                name: 'could-not-process',
+                verdict: 'WARN',
+                detail: `the runtime check failed (${lastCheck.detail ?? 'no detail'}; ${lastCheck.at}): while it fails, a conversation whose run fails is not reported, its card stays on the tray and the server wakes the agent again`,
+              }
+            : {
+                name: 'could-not-process',
+                verdict: 'WARN',
+                detail: `the daemon has not written its status for ${integrationStatusStaleFor(integration)} — it may be down (a running daemon rewrites it every 30 s); the runtime check that failed at ${lastCheck.at} says nothing about now`,
+              },
+        )
       } else if (counts !== null) {
         checks.push({ name: 'could-not-process', verdict: 'PASS', detail: counts.replace(/^could not process: /, '') })
       }

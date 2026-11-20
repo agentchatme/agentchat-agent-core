@@ -64,11 +64,55 @@ describe('spawnRun', () => {
     expect(outcome.detail).toContain('[redacted')
   })
 
-  it('non-zero exit with nothing on stdout AFTER it ran a while is FAILED (a crash partway), not "did not start"', async () => {
+  it('non-zero exit with nothing on stdout AFTER it ran a while is FAILED (a crash partway), not "did not start" — and SILENT, as ambiguous as a timeout', async () => {
     const outcome = await run(script("setTimeout(() => { process.stderr.write('fatal: out of memory\\n'); process.exit(134) }, 600)"), { notStartedWithinMs: 300 })
-    expect(outcome).toMatchObject({ state: 'failed', exitCode: 134 })
+    expect(outcome).toMatchObject({ state: 'failed', silent: true, exitCode: 134 })
     expect(outcome.detail).toMatch(/^exit 134 after \d+ s with nothing on stdout \(it ran, then ended\): fatal: out of memory$/)
   })
+
+  it('a failure that printed something is not silent: a refusal says `API Error: …` on stdout, so the runtime check can stand as evidence', async () => {
+    const outcome = await run(script("setTimeout(() => { process.stdout.write('API Error: 400 refused\\n'); process.exit(1) }, 600)"), { notStartedWithinMs: 300 })
+    expect(outcome).toMatchObject({ state: 'failed', exitCode: 1 })
+    expect(outcome.silent).toBeUndefined()
+    // Nor is a quick quit (not started), an exit 0, or a timeout.
+    expect((await run(script('process.exit(3)'))).silent).toBeUndefined()
+    expect((await run(script('process.exit(0)'))).silent).toBeUndefined()
+  })
+
+  it('a run past the window whose stderr says `API Error` is a plain FAILED, not silent: a refusal moved to stderr is still the provider\'s answer', async () => {
+    const outcome = await run(script("setTimeout(() => { process.stderr.write('API Error: 400 refused\\n'); process.exit(1) }, 600)"), { notStartedWithinMs: 300 })
+    expect(outcome).toMatchObject({ state: 'failed', exitCode: 1 })
+    expect(outcome.silent).toBeUndefined()
+    expect(outcome.detail).toMatch(/^exit 1 after \d+ s with nothing on stdout \(it ran, then ended\): API Error: 400 refused$/)
+  })
+
+  it('the window is measured to the process\'s EXIT, not to when the run is classified: a quick quit whose pipes a leftover holds past the window is still NOT STARTED', async () => {
+    // The run exits at once with nothing on stdout; a process it started keeps
+    // its pipes open, so `close` does not come and the drain classifies it
+    // long after the window. It never ran: not_started, not a silent failure.
+    const pidFile = path.join(dir, 'quick-holder.pid')
+    const quick = script(
+      [
+        "const { spawn } = require('node:child_process')",
+        "const g = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: ['ignore', 'inherit', 'inherit'] })",
+        `require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(g.pid))`,
+        'process.exit(2)',
+      ].join('\n'),
+    )
+    const outcome = await run(quick, { notStartedWithinMs: 1_500, drainMs: 2_500 })
+    const holder = Number(fs.readFileSync(pidFile, 'utf-8'))
+    try {
+      expect(outcome).toMatchObject({ state: 'not_started', exitCode: 2 })
+      expect(outcome.silent).toBeUndefined()
+      if (process.platform !== 'win32') expect(outcome.durationMs).toBeGreaterThanOrEqual(1_500)
+    } finally {
+      try {
+        process.kill(holder, 'SIGKILL')
+      } catch {
+        /* gone */
+      }
+    }
+  }, 15_000)
 
   it('killed from outside partway (SIGKILL, an OOM killer) with nothing on stdout yet is FAILED, not "did not start"', async () => {
     const pidFile = path.join(dir, 'self.pid')
@@ -78,6 +122,7 @@ describe('spawnRun', () => {
     process.kill(Number(fs.readFileSync(pidFile, 'utf-8')), 'SIGKILL')
     const outcome = await pending
     expect(outcome.state).toBe('failed')
+    expect(outcome.silent).toBe(true)
     expect(outcome.detail).toMatch(/with nothing on stdout \(it ran, then ended\)/)
   }, 10_000)
 
@@ -329,6 +374,42 @@ describe('redactDiagnostic', () => {
   })
 })
 
+
+describe('spawnRun — a command line through the platform shell (shell: true)', () => {
+  // The CLI's `agentchat listen --run "<command>"` runs the owner's command
+  // line this way (`/bin/sh -c`, `cmd.exe /d /s /c`). Its exit code is the
+  // command's, on every platform: a command that got going and exited 1 (a
+  // provider refusal, say) is a FAILED run — never "command not found".
+  const shellRun = (body: string) => {
+    const file = script(body)
+    return spawnRun({ command: `"${process.execPath}" "${file}"`, args: [], shell: true, cwd: dir, env: { ...process.env }, stdin: null, budgetMs: 20_000 })
+  }
+
+  it('exit 1 after some output is FAILED with exit 1 (not not_started, not ENOENT)', async () => {
+    const outcome = await shellRun("process.stdout.write('started'); process.stderr.write('API Error: refused\\n'); process.exit(1)")
+    expect(outcome).toMatchObject({ state: 'failed', exitCode: 1 })
+    expect(outcome.detail ?? '').not.toMatch(/ENOENT/)
+  }, 30_000)
+
+  it('exit 0 is ok; exit 2 after some output is failed with exit 2', async () => {
+    expect(await shellRun("process.stdout.write('ok'); process.exit(0)")).toMatchObject({ state: 'ok', exitCode: 0 })
+    expect(await shellRun("process.stdout.write('started'); process.exit(2)")).toMatchObject({ state: 'failed', exitCode: 2 })
+  }, 30_000)
+
+  it('exit non-zero with nothing on stdout PAST the window is FAILED and SILENT, as for a direct run', async () => {
+    const file = script("setTimeout(() => { process.stderr.write('crashed\\n'); process.exit(3) }, 700)")
+    const outcome = await spawnRun({ command: `"${process.execPath}" "${file}"`, args: [], shell: true, cwd: dir, env: { ...process.env }, stdin: null, budgetMs: 20_000, notStartedWithinMs: 300 })
+    expect(outcome).toMatchObject({ state: 'failed', silent: true, exitCode: 3 })
+    expect(outcome.detail).toMatch(/with nothing on stdout \(it ran, then ended\): crashed$/)
+  }, 30_000)
+
+  it('a command the shell cannot find is NOT STARTED: nothing on stdout (sh exits 127; cmd.exe /c exits 1, the same code as a command that ran and failed)', async () => {
+    const outcome = await spawnRun({ command: `agentchat-no-such-command-${process.pid}`, args: [], shell: true, cwd: dir, env: { ...process.env }, stdin: null, budgetMs: 20_000 })
+    expect(outcome.state).toBe('not_started')
+    expect(outcome.exitCode).toBe(process.platform === 'win32' ? 1 : 127)
+    expect(outcome.detail ?? '').toMatch(/nothing on stdout/)
+  }, 30_000)
+})
 
 describe('spawnRun — onStarted', () => {
   it('fires once the process has spawned, before it ends', async () => {
