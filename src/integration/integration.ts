@@ -284,6 +284,8 @@ export class Integration {
   private runtimeCheckInFlight: Promise<RunPreflight> | null = null
   /** What the identity block's last follow did (status `identity_line`); null without `anchorPath`, or before the first texts. */
   private identityLine: IntegrationIdentityLine | null = null
+  /** The follows of the identity line, one after another (each texts change queues one; a stop waits for the one in flight). */
+  private follows: Promise<void> = Promise.resolve()
 
   constructor(private readonly options: IntegrationOptions) {
     const { cfg, client } = options
@@ -301,7 +303,8 @@ export class Integration {
     })
     this.texts.onChange((texts, source) => {
       log.info(`texts ${source === 'server' ? 'fetched' : 'read from the cache'} for ${client.runtime} (texts v${texts.version}, manual ${texts.manual.version})`)
-      this.followIdentityLine(texts)
+      // In order, one at a time: a follow reads and writes the file, and the newer texts must land last.
+      this.follows = this.follows.then(() => this.followIdentityLine(texts))
       this.writeStatus()
     })
     this.manual =
@@ -395,6 +398,8 @@ export class Integration {
     // The texts are in before the socket opens, so the first wake has the
     // freshest text; a failure is logged and the cached copy (if any) serves.
     await this.texts.start()
+    // The block follows the texts in hand before the first wake can start a run.
+    await this.follows
     if (this.stopping) return
     // The skill file follows the announced manual from now on; a download
     // never holds up the socket.
@@ -420,7 +425,7 @@ export class Integration {
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer)
     if (this.statusTimer) clearInterval(this.statusTimer)
     this.recheckAbort.abort()
-    this.stopped = Promise.all([this.loop.stop(), this.recheckInFlight ?? Promise.resolve()]).then(() => undefined)
+    this.stopped = Promise.all([this.loop.stop(), this.recheckInFlight ?? Promise.resolve(), this.follows]).then(() => undefined)
     this.texts.stop()
     this.manual?.stop()
     this.socket = 'closed'
@@ -862,15 +867,21 @@ export class Integration {
    * to the line served now (`followIdentityAnchor`, under its rules). Said in
    * the log and the status file (`identity_line`); never throws.
    */
-  private followIdentityLine(texts: Texts): void {
+  private async followIdentityLine(texts: Texts): Promise<void> {
     const filePath = this.options.anchorPath
     if (filePath === undefined || this.stopping) return
-    const result = followIdentityAnchor({
-      filePath,
-      handle: this.options.cfg.handle,
-      identityLine: texts.identity_line,
-      template: texts.identity_line_template,
-    })
+    let result: Awaited<ReturnType<typeof followIdentityAnchor>>
+    try {
+      result = await followIdentityAnchor({
+        filePath,
+        handle: this.options.cfg.handle,
+        identityLine: texts.identity_line,
+        template: texts.identity_line_template,
+      })
+    } catch (err) {
+      // The kit's follow never throws; a chain that broke here would stop every later follow.
+      result = { outcome: 'failed', path: filePath, claimed: null, detail: `could not follow the identity line in ${filePath}: ${err instanceof Error ? err.message : String(err)}` }
+    }
     let notLoaded: string | null = null
     try {
       notLoaded = this.options.anchorNotLoaded?.(this.options.cfg.handle) ?? null
@@ -880,6 +891,7 @@ export class Integration {
     const detail = notLoaded === null ? result.detail : `${result.detail}; ${notLoaded}`
     this.identityLine = { outcome: result.outcome, path: result.path, at: new Date().toISOString(), texts_version: texts.version, detail, not_loaded: notLoaded }
     const line = `identity line: ${result.outcome} — ${detail}`
+    this.writeStatus()
     // The runtime does not read the file: whatever happened to the block, the agent does not see it.
     if (notLoaded !== null && result.outcome !== 'other_agent') {
       log.warn(line)

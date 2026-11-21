@@ -152,28 +152,29 @@ export function anchorIsCurrentAt(filePath: string, identityLine: string, handle
 }
 
 /**
- * The handle a file's block currently CLAIMS, or null when there is no block
- * or it names no handle that can be read (the wizard's offer, most
- * hand-edited blocks). Lets an integration catch a block that disagrees with
- * its own credential — an agent told it is @a while authenticating as @b
- * hands peers an address that reaches someone else — so a WRONG handle is
- * read back, not treated as "no anchor".
+ * The handle a file's block is AgentChat's for, or null when there is no
+ * block or it is not AgentChat's (the wizard's offer, a block edited by
+ * hand). The kit's strict reading (`integration.anchor.owner`): the handle of
+ * its handle line, or — with none — the handle its whole text is EXACTLY a
+ * served text for (the served template filled in, or an identity line served
+ * before). A sentence of the user's that says "I am @<handle>" names no
+ * owner: the kit's loose `find` reading is display only. Lets an integration
+ * catch a block that disagrees with its own credential — an agent told it is
+ * @a while authenticating as @b hands peers an address that reaches someone
+ * else — so a WRONG handle is read back, not treated as "no anchor".
+ * (`identityBlockState` says the whole verdict in one sentence.)
  *
  * `template` is the served `identity_line_template` (null when no texts are
- * in hand): it recognises an unmarked block in whatever words the server
- * serves today; without it, the handle line and the two wordings earlier
- * releases wrote are still read. A hand-edited block whose words happen to
- * follow one of those (`I am happy … on AgentChat`) reads as claiming that
- * word: the kit's wording match does not require the `@`. Throws as
- * `hasAnchorAt` does.
+ * in hand). Throws as `hasAnchorAt` does.
  */
-export function readAnchorHandleAt(filePath: string, template: string | null): string | null {
+export function readAnchorHandleAt(filePath: string, template: string | null = null): string | null {
   const file = readInstructionFile(filePath)
   return file === null ? null : readAnchorHandleFrom(file.text, template)
 }
 
-export function readAnchorHandleFrom(text: string, template: string | null): string | null {
-  return kit.anchor.find(text.replace(/^\uFEFF/, ''), { template })?.handle ?? null
+export function readAnchorHandleFrom(text: string, template: string | null = null): string | null {
+  const found = kit.anchor.find(text.replace(/^\uFEFF/, ''), { template })
+  return found === null ? null : kit.anchor.owner(found, { template })
 }
 
 /** `existing` with `block` in place of the first block (current or legacy) and every other block removed; `kit.anchor.replace`. */
@@ -281,18 +282,7 @@ function stillWritable(file: string): boolean {
  * (`.<name>.<12 hex>.tmp`) beside the user's file; the user's file itself is
  * whole either way.
  */
-export interface WriteInstructionFileOptions {
-  /** Refuse (ENOENT, nothing created) when the file does not exist: for a write that may only replace a file. */
-  readonly mustExist?: boolean
-  /**
-   * Called at the last moment before the file is replaced: once the new text
-   * is written and flushed beside it, before each rename attempt (and before
-   * an in-place write). A throw aborts the write with the file as it was.
-   */
-  readonly beforeReplace?: () => void
-}
-
-export function writeInstructionFile(filePath: string, data: string, options: WriteInstructionFileOptions = {}): void {
+export function writeInstructionFile(filePath: string, data: string): void {
   const target = resolveWriteTarget(filePath)
   let existing: fs.Stats | null = null
   try {
@@ -303,18 +293,14 @@ export function writeInstructionFile(filePath: string, data: string, options: Wr
   if (existing !== null) {
     if (!existing.isFile()) throw new Error(`${filePath} is not a regular file`)
     fs.accessSync(target, fs.constants.W_OK)
-  } else if (options.mustExist === true) {
-    throw Object.assign(new Error(`${filePath} does not exist; nothing was created`), { code: 'ENOENT' })
   } else {
     fs.mkdirSync(path.dirname(target), { recursive: true })
   }
-  const beforeReplace = options.beforeReplace
   try {
-    atomicWriteFile(target, data, existing === null ? undefined : existing.mode & 0o7777, beforeReplace !== undefined ? { beforeRename: beforeReplace } : {})
+    atomicWriteFile(target, data, existing === null ? undefined : existing.mode & 0o7777)
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code
     if (existing !== null && code !== undefined && IN_PLACE_FALLBACK_CODES.has(code) && stillWritable(target)) {
-      beforeReplace?.()
       fs.writeFileSync(target, data, 'utf-8')
       return
     }

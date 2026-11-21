@@ -77,7 +77,7 @@ describe('the identity line', () => {
     expect(() => renderAnchorBlock(textsFor('agent-b').identity_line, 'agent-a')).toThrow(/names @agent-a/)
   })
 
-  it('still reads the block releases before the integration wrote, so doctor can refresh it', () => {
-    expect(readAnchorHandleFrom(`${ANCHOR_START}\nYou are **@old-agent** on AgentChat.\n${ANCHOR_END}`)).toBe('old-agent')
+  it('a block an early release wrote in its own words names no owner (strict): doctor --fix still replaces it, nothing unattended does', () => {
+    expect(readAnchorHandleFrom(`${ANCHOR_START}\nYou are **@old-agent** on AgentChat.\n${ANCHOR_END}`)).toBeNull()
   })
 })

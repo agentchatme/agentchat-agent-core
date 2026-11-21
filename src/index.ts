@@ -143,7 +143,6 @@ export {
   followIdentityAnchor,
   identityBlockState,
   describeIdentityBlock,
-  EARLIER_IDENTITY_LINES,
   IDENTITY_ANCHOR_ATTEMPTS,
   type IdentityAnchorOutcome,
   type IdentityAnchorResult,

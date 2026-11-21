@@ -149,7 +149,8 @@ describe('the identity block follows the served texts (anchorPath)', () => {
     const next = 'I am @me on AgentChat (api.agentchat.me). The line served from today.'
     double.setIdentityLine(next)
     await until(() => fs.readFileSync(anchor, 'utf-8') === placed(next), 5_000)
-    expect(i.snapshot().identity_line).toMatchObject({ outcome: 'updated' })
+    // The follow is the kit's (async): its outcome is recorded once the write is read back.
+    await until(() => i.snapshot().identity_line?.outcome === 'updated', 5_000)
     // The cache keeps the new copy right after it is placed; let that write land before the home goes.
     await until(() => fs.readFileSync(path.join(home, 'texts.json'), 'utf-8').includes(next), 5_000)
   }, 10_000)

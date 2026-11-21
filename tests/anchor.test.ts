@@ -141,12 +141,18 @@ describe('reading the claimed handle', () => {
     expect(hasAnchorAt(path.join(dir, 'absent.md'))).toBe(false)
   })
 
-  it('reads a WRONG handle back rather than pretending there is none', () => {
+  it('reads a WRONG handle back from a block AgentChat wrote, rather than pretending there is none', () => {
     // The detection path for machines corrupted by older releases: the block
     // says @other while the credential says something else. It must surface
     // as "claims @other", not as "no anchor".
-    expect(readAnchorHandleFrom(`${ANCHOR_START}\nYou are **@other-agent** on AgentChat.\n${ANCHOR_END}\n`)).toBe('other-agent')
     expect(readAnchorHandleFrom(`${ANCHOR_START}\n${servedLine('other-agent')}\n${ANCHOR_END}\n`)).toBe('other-agent')
+    expect(readAnchorHandleFrom(renderAnchorBlock(servedLine('other-agent'), 'other-agent'))).toBe('other-agent')
+  })
+
+  it('is strict (the kit\'s owner): words a person wrote name no owner, whatever handle they mention', () => {
+    // No handle line, and not a text AgentChat served: the user's block.
+    expect(readAnchorHandleFrom(`${ANCHOR_START}\nYou are **@other-agent** on AgentChat.\n${ANCHOR_END}\n`)).toBeNull()
+    expect(readAnchorHandleFrom(`${ANCHOR_START}\nMy rules: I am @${HANDLE} there; answer briefly.\n${ANCHOR_END}\n`, SERVED_TEMPLATE)).toBeNull()
   })
 
   it('recognises an unmarked block in whatever words the server serves, through the served template', () => {
@@ -190,14 +196,16 @@ describe('anchorIsCurrentAt', () => {
 })
 
 describe('every block an earlier release wrote', () => {
+  /** The blocks whose text was a served identity line (the rest a release's own renderer wrote): only these name an owner without a handle line. */
+  const servedEra = (old: (typeof OLD_BLOCKS)[number]): boolean => old.name.startsWith('agent-core 0.1.0') || old.name.startsWith('agent-core 0.2.0')
   const next = renderAnchorBlock(servedLine(), HANDLE)
 
   for (const old of OLD_BLOCKS) {
     describe(old.name, () => {
-      it('is found, and its handle is read (with and without the served template)', () => {
+      it('is found; its handle is read only when its text is exactly one AgentChat served (with and without the served template)', () => {
         const text = `${USER_BEFORE}\n\n${old.block}\n\n${USER_AFTER}\n`
-        expect(readAnchorHandleFrom(text, SERVED_TEMPLATE)).toBe(old.handle)
-        expect(readAnchorHandleFrom(text)).toBe(old.handle)
+        expect(readAnchorHandleFrom(text, SERVED_TEMPLATE)).toBe(servedEra(old) ? old.handle : null)
+        expect(readAnchorHandleFrom(text)).toBe(servedEra(old) ? old.handle : null)
         fs.writeFileSync(fileA(), text)
         expect(hasAnchorAt(fileA())).toBe(true)
         expect(anchorIsCurrentAt(fileA(), servedLine(), HANDLE)).toBe(false)
@@ -216,10 +224,10 @@ describe('every block an earlier release wrote', () => {
         expect(fs.readFileSync(fileA(), 'utf-8')).toBe(`${next}\n\n---\n${USER_AFTER}\n`)
       })
 
-      it('at the end of a file with no final line break', () => {
+      it('at the end of a file with no final line break: replaced in place, and still no final line break', () => {
         fs.writeFileSync(fileA(), `${USER_BEFORE}\n\n${old.block}`)
         writeAnchor(fileA(), next, HANDLE)
-        expect(fs.readFileSync(fileA(), 'utf-8')).toBe(`${USER_BEFORE}\n\n${next}\n`)
+        expect(fs.readFileSync(fileA(), 'utf-8')).toBe(`${USER_BEFORE}\n\n${next}`)
       })
 
       it('a second write changes nothing (idempotent)', () => {
@@ -239,11 +247,11 @@ describe('every block an earlier release wrote', () => {
       it('in a CRLF file: the user’s lines keep their CRLF, no text is lost', () => {
         const crlf = (s: string): string => s.replace(/\n/g, '\r\n')
         fs.writeFileSync(fileA(), crlf(`${USER_BEFORE}\n\n${old.block}\n\n${USER_AFTER}\n`))
-        expect(readAnchorHandleAt(fileA(), SERVED_TEMPLATE)).toBe(old.handle)
+        expect(readAnchorHandleAt(fileA(), SERVED_TEMPLATE)).toBe(servedEra(old) ? old.handle : null)
         writeAnchor(fileA(), next, HANDLE)
         const out = fs.readFileSync(fileA(), 'utf-8')
-        expect(out.startsWith(crlf(USER_BEFORE))).toBe(true)
-        expect(out).toContain(crlf(USER_AFTER))
+        // The whole file stays CRLF, the new block included.
+        expect(out).toBe(crlf(`${USER_BEFORE}\n\n${next}\n\n${USER_AFTER}\n`))
         expect(out.split(ANCHOR_START)).toHaveLength(2)
         expect(readAnchorHandleAt(fileA())).toBe(HANDLE)
       })
@@ -321,8 +329,8 @@ describe('odd files', () => {
     }
   })
 
-  it('an upper-case handle in an old block reads as the canonical lower-case handle', () => {
-    expect(readAnchorHandleFrom(`${ANCHOR_START}\nYou are **@Example-Relay** on AgentChat.\n${ANCHOR_END}\n`)).toBe(HANDLE)
+  it('an upper-case handle line reads as the canonical lower-case handle', () => {
+    expect(readAnchorHandleFrom(`${ANCHOR_START}\n<!-- agentchat:handle Example-Relay -->\nmy words\n${ANCHOR_END}\n`)).toBe(HANDLE)
   })
 
   it('upsertAnchorBlock / stripAnchorBlock are the kit’s replace / remove', () => {
