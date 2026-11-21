@@ -66,6 +66,14 @@ export interface HostProfile {
    * owner's command): no identity line is placed, checked or removed.
    */
   anchorFile?(): string
+  /**
+   * Why the runtime would not load `anchorFile()` right now, in words — a
+   * runtime that reads another file in its place when that one exists —
+   * or null when it does. `status` and `doctor` say it (never a PASS while
+   * it holds), and the daemon's follow of the identity line says it too.
+   * Nothing writes into that other file: it is the user's.
+   */
+  anchorNotLoaded?(handle: string): string | null
   /** Exactly what a user types to reach this integration. */
   invocation(): string
   /**

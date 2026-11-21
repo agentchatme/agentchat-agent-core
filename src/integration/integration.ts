@@ -118,6 +118,13 @@ export interface IntegrationOptions {
    * Absent, the block is left to the CLI's install and `doctor --fix`.
    */
   readonly anchorPath?: string
+  /**
+   * Why the runtime would not load `anchorPath` now, in words (a runtime that
+   * reads another file in its place when that one exists), or null when it
+   * does: said with every follow (the log at warn, the status file's
+   * `identity_line.not_loaded`). Nothing is written into that other file.
+   */
+  readonly anchorNotLoaded?: (handle: string) => string | null
   /** The skill file that follows the served manual (`<skills dir>/agentchat/SKILL.md`); absent, the manual is left to the CLI. */
   readonly manualPath?: string
   /** Injectable for tests; the manual download's `fetch`. */
@@ -864,8 +871,20 @@ export class Integration {
       identityLine: texts.identity_line,
       template: texts.identity_line_template,
     })
-    this.identityLine = { outcome: result.outcome, path: result.path, at: new Date().toISOString(), texts_version: texts.version, detail: result.detail }
-    const line = `identity line: ${result.outcome} — ${result.detail}`
+    let notLoaded: string | null = null
+    try {
+      notLoaded = this.options.anchorNotLoaded?.(this.options.cfg.handle) ?? null
+    } catch {
+      notLoaded = null
+    }
+    const detail = notLoaded === null ? result.detail : `${result.detail}; ${notLoaded}`
+    this.identityLine = { outcome: result.outcome, path: result.path, at: new Date().toISOString(), texts_version: texts.version, detail, not_loaded: notLoaded }
+    const line = `identity line: ${result.outcome} — ${detail}`
+    // The runtime does not read the file: whatever happened to the block, the agent does not see it.
+    if (notLoaded !== null && result.outcome !== 'other_agent') {
+      log.warn(line)
+      return
+    }
     switch (result.outcome) {
       case 'updated':
       case 'absent':

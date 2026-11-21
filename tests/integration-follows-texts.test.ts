@@ -75,14 +75,53 @@ const served = (): string => textsFor('me').identity_line
 const placed = (line: string): string => `${USER_TEXT}\n\n${renderAnchorBlock(line, 'me')}\n`
 
 describe('the identity block follows the served texts (anchorPath)', () => {
-  it('at start, this agent\'s block with an older line is brought to the served one; the status file and status say so', async () => {
+  it('at start, this agent\'s block with an older line is brought to the served one; the status file says so', async () => {
     double = await startServerDouble({ tray: { waiting: 0 } })
     fs.writeFileSync(anchor, placed(OLD_LINE))
     const i = await integration(new FakeRunner(), { anchorPath: anchor })
     expect(fs.readFileSync(anchor, 'utf-8')).toBe(placed(served()))
-    expect(i.snapshot().identity_line).toMatchObject({ outcome: 'updated', path: anchor, texts_version: '1' })
+    expect(i.snapshot().identity_line).toMatchObject({ outcome: 'updated', path: anchor, texts_version: '1', not_loaded: null })
     await until(() => readIntegrationStatus(home)?.identity_line?.outcome === 'updated', 5_000)
-    expect(formatIntegrationStatus(readIntegrationStatus(home)).join('\n')).toMatch(/identity line \(daemon\): updated, .* — the identity line for @me in .* now is the served one/)
+    // What the file now reads as is status's own verdict (one verdict): the daemon's line is only for what the file cannot show.
+    expect(formatIntegrationStatus(readIntegrationStatus(home)).join('\n')).not.toContain('identity line (daemon)')
+  }, 10_000)
+
+  it('a write that fails is the one daemon outcome status prints beside its own reading of the file', async () => {
+    if (process.platform === 'win32' || (typeof process.getuid === 'function' && process.getuid() === 0)) return
+    double = await startServerDouble({ tray: { waiting: 0 } })
+    fs.writeFileSync(anchor, placed(OLD_LINE))
+    fs.chmodSync(anchor, 0o444)
+    try {
+      await integration(new FakeRunner(), { anchorPath: anchor })
+      await until(() => readIntegrationStatus(home)?.identity_line?.outcome === 'failed', 5_000)
+      expect(formatIntegrationStatus(readIntegrationStatus(home)).join('\n')).toMatch(/identity line \(daemon\): failed, .* — could not write the identity line to /)
+      expect(fs.readFileSync(anchor, 'utf-8')).toBe(placed(OLD_LINE))
+    } finally {
+      fs.chmodSync(anchor, 0o644)
+    }
+  }, 10_000)
+
+  it('a file the runtime does not load is said with every follow (log at warn, status file not_loaded); nothing is written for it', async () => {
+    const why = 'Example reads OVERRIDE.md instead of INSTRUCTIONS.md, so it does not load the AgentChat identity line; add the block to OVERRIDE.md or remove that file'
+    const warned: string[] = []
+    vi.spyOn(log, 'warn').mockImplementation((msg: string) => {
+      if (msg.startsWith('identity line: ')) warned.push(msg)
+    })
+    double = await startServerDouble({ tray: { waiting: 0 } })
+    fs.writeFileSync(anchor, placed(served()))
+    const asked: string[] = []
+    const i = await integration(new FakeRunner(), {
+      anchorPath: anchor,
+      anchorNotLoaded: (handle) => {
+        asked.push(handle)
+        return why
+      },
+    })
+    expect(asked).toContain('me')
+    expect(i.snapshot().identity_line).toMatchObject({ outcome: 'unchanged', not_loaded: why })
+    expect(i.snapshot().identity_line?.detail).toContain(why)
+    expect(warned.some((line) => line.startsWith('identity line: unchanged') && line.endsWith(why))).toBe(true)
+    expect(fs.readFileSync(anchor, 'utf-8')).toBe(placed(served()))
   }, 10_000)
 
   it('a texts change re-places it: the copy kept at install (already placed), then the served copy that differs', async () => {

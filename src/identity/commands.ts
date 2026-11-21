@@ -14,7 +14,8 @@ import {
   type PendingSignup,
 } from './credentials.js'
 import { clearOfferDeclined } from './state.js'
-import { writeAnchor, removeAnchorAt, readAnchorHandleAt, hasAnchorAt, anchorIsCurrentAt } from '../anchor/block.js'
+import { writeAnchor, removeAnchorAt, hasAnchorAt } from '../anchor/block.js'
+import { describeIdentityBlock, identityBlockState, type IdentityBlockState } from '../anchor/follow.js'
 import { traySummary } from '../integration/tray.js'
 import { loadTexts, readCachedTexts } from '../integration/texts.js'
 import { identityLineOf } from '../skill/identity-line.js'
@@ -721,20 +722,52 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
     return startSignup('recover', { email, ...(handle !== undefined ? { handle } : {}) }, apiBase)
   }
 
-  /**
-   * The instruction file's block as `status` reports it. A file that exists
-   * but cannot be read (permissions, a symlink loop, not UTF-8) is said as
-   * such — it is neither "missing" nor a reason for status to print nothing.
-   */
-  function anchorView(file: string | null, identityLine: string | null, handle: string | null): { present: boolean | null; current: boolean | null; error: string | null } {
-    if (file === null) return { present: null, current: null, error: null }
+  /** Why the runtime would not load the instruction file now (the host's `anchorNotLoaded`), or null; a host check that throws reads as none. */
+  function notLoadedFor(handle: string): string | null {
     try {
-      const present = hasAnchorAt(file)
-      const current = identityLine === null || handle === null ? null : anchorIsCurrentAt(file, identityLine, handle)
-      return { present, current, error: null }
-    } catch (err) {
-      return { present: null, current: null, error: errorText(err) }
+      return profile.anchorNotLoaded?.(handle) ?? null
+    } catch {
+      return null
     }
+  }
+
+  /**
+   * The instruction file's block, read the way the daemon reads it
+   * (`identityBlockState`): one verdict for `status`, `doctor` and the
+   * daemon's follow. A file that exists but cannot be read (permissions, a
+   * symlink loop, not UTF-8) is said as such — it is neither "missing" nor a
+   * reason for status to print nothing.
+   */
+  function anchorView(
+    file: string | null,
+    texts: StatusContext,
+    handle: string | null,
+  ): { present: boolean | null; current: boolean | null; error: string | null; state: IdentityBlockState | null } {
+    if (file === null) return { present: null, current: null, error: null, state: null }
+    if (handle === null) {
+      try {
+        return { present: hasAnchorAt(file), current: null, error: null, state: null }
+      } catch (err) {
+        return { present: null, current: null, error: errorText(err), state: null }
+      }
+    }
+    const state = identityBlockState(file, { handle, identityLine: texts.identityLine, template: texts.identityLineTemplate, notLoaded: notLoadedFor(handle) })
+    if (state.state === 'unreadable') return { present: null, current: null, error: state.what.replace(/^cannot read [^:]*: /, ''), state }
+    return {
+      present: state.state !== 'missing',
+      current: texts.identityLine === null ? null : state.state === 'current',
+      error: null,
+      state,
+    }
+  }
+
+  /** The status header's words for the block: `current` alone when it is the served one and loaded, else the reading's one sentence. */
+  function anchorWords(file: string, view: ReturnType<typeof anchorView>): string {
+    if (view.error !== null) return `unreadable — ${view.error} (${file})`
+    const state = view.state
+    if (state === null) return `${view.present ? 'present' : 'missing'} (${file})`
+    if (state.verdict === 'PASS') return `current (${file})`
+    return describeIdentityBlock(state, `${invocation()} doctor --fix`)
   }
 
   async function runStatus(opts: { json?: boolean }): Promise<number> {
@@ -791,7 +824,7 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
       const refused = status === 401 || status === 403
       const detail = describeApiError(err)
       if (opts.json) {
-        const offline = anchorView(anchorFile, null, null)
+        const offline = anchorView(anchorFile, NO_TEXTS, null)
         console.log(
           JSON.stringify({
             configured: true,
@@ -812,27 +845,28 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
             ? `AgentChat refused this agent's key (${detail}). Sign in with a current key: \`${invocation()} login\`; lost it? \`${recoverUsage(invocation())}\`.`
             : `Could not reach AgentChat: ${detail}`,
         )
+        // The server did not answer, so no texts fetch either: the block and the
+        // host's checks are read against the identity-home cache (what a fetch
+        // would have fallen back to), or without texts when nothing is cached.
+        const cached = readCachedTexts(home, profile.client.runtime)
+        const context = cached === null ? NO_TEXTS : contextOf(cached.texts)
         console.log(
           [
             `${identity.handle !== null ? `@${identity.handle}` : 'This agent'} — ${refused ? `key refused (HTTP ${status})` : 'AgentChat unreachable'}  (${LABEL})`,
             `Key source: ${identity.source} (${identity.source === 'file' ? credentialsPath(home) : 'AGENTCHAT_API_KEY'})`,
             `API: ${identity.apiBase}`,
+            ...(anchorFile === null ? [] : [`Identity line: ${anchorWords(anchorFile, anchorView(anchorFile, context, identity.handle))}`]),
             ...formatIntegrationStatus(integration),
           ].join('\n'),
         )
-        // The server did not answer, so no texts fetch either: the host checks
-        // what it can against the identity-home cache (what a fetch would
-        // have fallen back to), or without texts when nothing is cached.
-        const cached = readCachedTexts(home, profile.client.runtime)
-        await printExtraStatus(cached === null ? NO_TEXTS : contextOf(cached.texts))
+        await printExtraStatus(context)
       }
       return 1
     }
 
     const tray = await traySummary(client).catch(() => null)
     const texts = await served(identity.apiKey, identity.apiBase)
-    const identityLine = texts.identityLine
-    const anchor = anchorView(anchorFile, identityLine, me.handle)
+    const anchor = anchorView(anchorFile, texts, me.handle)
 
     if (opts.json) {
       console.log(
@@ -850,6 +884,10 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
           anchor_current: anchor.current,
           /** Why the instruction file could not be read, or null. */
           anchor_error: anchor.error,
+          /** The block as the daemon reads it (`identityBlockState`: current, stale, missing, setup_offer, hand_edited, other_agent, several_blocks, unreadable), or null. */
+          anchor_state: anchor.state?.state ?? null,
+          /** Why the runtime does not load the instruction file now, or null. */
+          anchor_not_loaded: anchor.state?.notLoaded ?? null,
           integration,
         }),
       )
@@ -867,7 +905,7 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
           ...(anchorFile === null
             ? []
             : [
-                `Identity line: ${anchor.error !== null ? `unreadable — ${anchor.error}` : anchor.present ? (anchor.current === null ? 'present (served texts unavailable — not checked)' : anchor.current ? 'current' : 'present (older text — `doctor --fix` refreshes it)') : 'missing'} (${anchorFile})`,
+                `Identity line: ${anchorWords(anchorFile, anchor)}`,
               ]),
           ...formatIntegrationStatus(integration),
         ].join('\n'),
@@ -936,14 +974,19 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
     return 0
   }
 
-  /** What the instruction file claims, and whether it is the current block (null: no served line in hand). Throws when the file cannot be read. */
-  function readIdentityLine(anchorFile: string, handle: string, texts: StatusContext): { claimed: string | null; current: boolean | null } {
-    const claimed = readAnchorHandleAt(anchorFile, texts.identityLineTemplate)
-    const current = texts.identityLine === null ? null : anchorIsCurrentAt(anchorFile, texts.identityLine, handle)
-    return { claimed, current }
+  /** The block as the daemon reads it (`identityBlockState`), for this agent. */
+  function readIdentityLine(anchorFile: string, handle: string, texts: StatusContext): IdentityBlockState {
+    return identityBlockState(anchorFile, { handle, identityLine: texts.identityLine, template: texts.identityLineTemplate, notLoaded: notLoadedFor(handle) })
   }
 
-  /** The doctor's identity-line check (and its `--fix`), for a host that has an instruction file. */
+  /**
+   * The doctor's identity-line check (and its `--fix`), for a host that has
+   * an instruction file: the same reading `status` and the daemon use, so the
+   * three say one thing. `--fix` places the served block over whatever block
+   * is there (the user asked for it), but never writes a file the runtime
+   * reads in the instruction file's place: a block it does not load stays a
+   * WARN, with what to do.
+   */
   async function identityLineCheck(
     anchorFile: string,
     creds: { handle: string; api_key: string },
@@ -951,41 +994,24 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
     texts: StatusContext,
     fix: boolean,
   ): Promise<DoctorCheck> {
-    let claimed: string | null
-    let current: boolean | null
-    try {
-      ;({ claimed, current } = readIdentityLine(anchorFile, creds.handle, texts))
-    } catch (err) {
-      return { name: 'identity-line', verdict: 'FAIL', detail: `cannot read ${anchorFile}: ${errorText(err)}` }
-    }
-    if (claimed === creds.handle && current === true) {
-      return { name: 'identity-line', verdict: 'PASS', detail: `@${claimed} in ${anchorFile}` }
-    }
-    if (claimed === creds.handle && current === null) {
-      return { name: 'identity-line', verdict: 'WARN', detail: `@${claimed} in ${anchorFile} (currency not checked: served texts unavailable)` }
-    }
-    const why =
-      claimed === null
-        ? `no identity line in ${anchorFile}`
-        : claimed !== creds.handle
-          ? `${anchorFile} says @${claimed} but this agent is @${creds.handle}`
-          : `${anchorFile} carries an older identity text for @${claimed}`
-    if (fix) {
+    const fixCommand = `${invocation()} doctor --fix`
+    const before = readIdentityLine(anchorFile, creds.handle, texts)
+    if (before.state === 'unreadable') return { name: 'identity-line', verdict: 'FAIL', detail: before.what }
+    // The served block in place: nothing to repair here (a runtime that does not load the file is said, not written around).
+    const inPlace = before.state === 'current'
+    if (fix && !inPlace) {
       const report = await placeIdentity(creds.handle, creds.api_key, apiBase)
       const failed = report.some((l) => l.includes('FAILED') || l.includes('not written'))
       if (failed) return { name: 'identity-line', verdict: 'FAIL', detail: `could not repair: ${report.join('; ')}` }
       // Said repaired only when the file now reads as repaired.
-      try {
-        const after = readIdentityLine(anchorFile, creds.handle, texts)
-        if (after.claimed === creds.handle && after.current !== false) {
-          return { name: 'identity-line', verdict: 'PASS', detail: `repaired → @${creds.handle}` }
-        }
-        return { name: 'identity-line', verdict: 'FAIL', detail: `repair did not take: ${anchorFile} still ${after.claimed === null ? 'has no identity line' : after.claimed !== creds.handle ? `says @${after.claimed}` : 'differs from the served block'}${report.length > 0 ? ` (${report.join('; ').trim()})` : ''}` }
-      } catch (err) {
-        return { name: 'identity-line', verdict: 'FAIL', detail: `cannot read ${anchorFile} after the repair: ${errorText(err)}` }
+      const after = readIdentityLine(anchorFile, creds.handle, texts)
+      if (after.state === 'current') {
+        return { name: 'identity-line', verdict: after.verdict, detail: after.notLoaded === null ? `repaired → @${creds.handle}` : `repaired → @${creds.handle} in ${anchorFile}; ${after.notLoaded}` }
       }
+      if (after.state === 'unreadable') return { name: 'identity-line', verdict: 'FAIL', detail: `${after.what} (after the repair)` }
+      return { name: 'identity-line', verdict: 'FAIL', detail: `repair did not take: ${after.what}${report.length > 0 ? ` (${report.join('; ').trim()})` : ''}` }
     }
-    return { name: 'identity-line', verdict: 'WARN', detail: `${why} — repair with \`${invocation()} doctor --fix\`` }
+    return { name: 'identity-line', verdict: before.verdict, detail: describeIdentityBlock(before, fixCommand) }
   }
 
   async function runDoctor(opts: DoctorOpts = {}): Promise<number> {

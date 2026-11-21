@@ -94,6 +94,8 @@ export interface RunIntegrationOpts {
    * CLI's install and `doctor --fix`.
    */
   anchorPath?: string
+  /** Why the runtime would not load `anchorPath` now, in words, or null when it does (see `IntegrationOptions.anchorNotLoaded`). */
+  anchorNotLoaded?: (handle: string) => string | null
   /** Scratch dir for runs. The integration decides where; this package never derives one. */
   workdir: string
   /** Defaults to `AGENTCHAT_RUN_PROFILE` (`resolveRunProfile`: unset is `own`, a value that names no profile is `answer`). */
@@ -510,6 +512,7 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
           manualPointer: opts.manualPointer,
           ...(opts.manualPath !== undefined ? { manualPath: opts.manualPath } : {}),
           ...(opts.anchorPath !== undefined ? { anchorPath: opts.anchorPath } : {}),
+          ...(opts.anchorNotLoaded !== undefined ? { anchorNotLoaded: opts.anchorNotLoaded } : {}),
           profile,
           budgetMs,
           ...(opts.dismissIgnoredInvites !== undefined ? { dismissIgnoredInvites: opts.dismissIgnoredInvites } : {}),

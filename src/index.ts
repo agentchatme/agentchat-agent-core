@@ -141,10 +141,16 @@ export {
 // The daemon's half: the identity block follows the served identity line.
 export {
   followIdentityAnchor,
+  identityBlockState,
+  describeIdentityBlock,
+  EARLIER_IDENTITY_LINES,
   IDENTITY_ANCHOR_ATTEMPTS,
   type IdentityAnchorOutcome,
   type IdentityAnchorResult,
   type FollowIdentityAnchorOptions,
+  type IdentityBlockState,
+  type IdentityBlockStateName,
+  type IdentityBlockStateOptions,
 } from './anchor/follow.js'
 
 // Run profile and switches.

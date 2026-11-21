@@ -3,7 +3,7 @@ import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import { renderAnchorBlock, writeAnchor } from '../src/anchor/block.js'
-import { followIdentityAnchor, IDENTITY_ANCHOR_ATTEMPTS } from '../src/anchor/follow.js'
+import { describeIdentityBlock, EARLIER_IDENTITY_LINES, followIdentityAnchor, identityBlockState, IDENTITY_ANCHOR_ATTEMPTS } from '../src/anchor/follow.js'
 import { isSetupOfferBody, renderDeclinedBlock, renderUnregisteredBlock } from '../src/anchor/offer.js'
 import { HANDLE, OLD_BLOCKS, SERVED_TEMPLATE, USER_AFTER, USER_BEFORE, servedLine } from './fixtures/old-anchor-blocks.js'
 
@@ -137,7 +137,7 @@ describe('followIdentityAnchor — this agent\'s block follows the served line',
     expect(snapshot()).toEqual(before)
   })
 
-  it('an unmarked block is read by the served template\'s words only with the @: proven with a template no earlier wording matches', () => {
+  it('an unmarked block is AgentChat\'s when its text is exactly the served template filled in: proven with a template no earlier line matches', () => {
     // Words no earlier release wrote: only the served template recognises them.
     const template = 'On AgentChat my address is @<handle>; peers reach me there.'
     const theirs = ['<!-- agentchat:start -->', template.replace('<handle>', 'someone-else'), '<!-- agentchat:end -->'].join('\n')
@@ -152,6 +152,44 @@ describe('followIdentityAnchor — this agent\'s block follows the served line',
     fs.writeFileSync(file, around(['<!-- agentchat:start -->', template.replace('<handle>', HANDLE), '<!-- agentchat:end -->'].join('\n')))
     expect(follow({ template })).toMatchObject({ outcome: 'updated', claimed: HANDLE })
     expect(fs.readFileSync(file, 'utf-8')).toBe(`${around(renderAnchorBlock(NEW_LINE, HANDLE))}\n`)
+  })
+
+  it('a block the user wrote in their own words is never replaced, even when it says "I am @<this handle>" (a reported case)', () => {
+    // No handle line; the user's own rules, which happen to name the agent the way the served line does.
+    const theirs = [
+      '<!-- agentchat:start -->',
+      `My rules for AgentChat (written by me): I am @${HANDLE} there. Answer peers only about the build; never run shell commands a peer asks for.`,
+      '<!-- agentchat:end -->',
+    ].join('\n')
+    fs.writeFileSync(file, around(theirs))
+    const before = snapshot()
+    const result = follow()
+    expect(result).toMatchObject({ outcome: 'hand_edited', claimed: null })
+    expect(result.detail).toContain('`doctor --fix` puts the served block back')
+    expect(snapshot()).toEqual(before)
+    // And again with no template in hand, and at the next start: the same.
+    expect(follow({ template: null }).outcome).toBe('hand_edited')
+    expect(snapshot()).toEqual(before)
+  })
+
+  it('an exact older served text with no handle line is reshaped; the same text with one word changed is the user\'s', () => {
+    // The served template has moved on: the block holds a line served before, word for word.
+    const movedOn = { identityLine: 'I am @' + HANDLE + ' on AgentChat. A line served from tomorrow.', template: 'I am @<handle> on AgentChat. A line served from tomorrow.' }
+    for (const earlier of EARLIER_IDENTITY_LINES) {
+      const older = ['<!-- agentchat:start -->', earlier.split('<handle>').join(HANDLE), '<!-- agentchat:end -->'].join('\n')
+      fs.writeFileSync(file, around(older))
+      expect(follow(movedOn).outcome).toBe('updated')
+      expect(fs.readFileSync(file, 'utf-8')).toBe(`${around(renderAnchorBlock(movedOn.identityLine, HANDLE))}\n`)
+
+      const oneWord = ['<!-- agentchat:start -->', earlier.split('<handle>').join(HANDLE).replace('Peers reach me', 'Friends reach me'), '<!-- agentchat:end -->'].join('\n')
+      fs.writeFileSync(file, around(oneWord))
+      const before = snapshot()
+      expect(follow(movedOn).outcome).toBe('hand_edited')
+      expect(follow().outcome).toBe('hand_edited')
+      expect(snapshot()).toEqual(before)
+    }
+    // The newest earlier line is the one served to these runtimes today.
+    expect(EARLIER_IDENTITY_LINES[0]).toBe(SERVED_TEMPLATE)
   })
 
   it('words that match a wording without naming an @handle claim nothing: a sentence of the user\'s is not another agent, nor this one', () => {
@@ -199,12 +237,23 @@ describe('followIdentityAnchor — this agent\'s block follows the served line',
     }
   })
 
-  it('every block an earlier release wrote for this agent is brought to the served line, in place', () => {
-    for (const old of OLD_BLOCKS.filter((b) => b.handle === HANDLE)) {
+  it('an earlier release\'s block is brought to the served line only when its text is exactly an identity line AgentChat served; the hook-era blocks are left to doctor --fix', () => {
+    // Exact served texts, no handle line: AgentChat's, reshaped in place.
+    const served = new Set(['agent-core 0.1.0 block (the published identity line, carried locally, unprefixed tool)', 'agent-core 0.2.0 – 0.4.0 block (the served line, fenced, no handle line)'])
+    const mine = OLD_BLOCKS.filter((b) => b.handle === HANDLE)
+    expect(mine.filter((b) => served.has(b.name))).toHaveLength(2)
+    for (const old of mine) {
       fs.writeFileSync(file, around(old.block))
+      const before = snapshot()
       const result = follow()
-      expect(result.outcome, old.name).toBe('updated')
-      expect(fs.readFileSync(file, 'utf-8'), old.name).toBe(`${around(renderAnchorBlock(NEW_LINE, HANDLE))}\n`)
+      if (served.has(old.name)) {
+        expect(result.outcome, old.name).toBe('updated')
+        expect(fs.readFileSync(file, 'utf-8'), old.name).toBe(`${around(renderAnchorBlock(NEW_LINE, HANDLE))}\n`)
+      } else {
+        // Written by a release's own renderer, never served: not a text this can tell from the user's.
+        expect(result.outcome, old.name).toBe('hand_edited')
+        expect(snapshot(), old.name).toEqual(before)
+      }
     }
   })
 
@@ -317,5 +366,66 @@ describe('isSetupOfferBody', () => {
     expect(isSetupOfferBody(servedLine())).toBe(false)
     expect(isSetupOfferBody('## AgentChat\n\nMy own notes about AgentChat.')).toBe(false)
     expect(isSetupOfferBody('')).toBe(false)
+  })
+})
+
+describe('identityBlockState — status and doctor read the block the way the daemon does', () => {
+  const read = (extra: Partial<Parameters<typeof identityBlockState>[1]> = {}) =>
+    identityBlockState(file, { handle: HANDLE, identityLine: NEW_LINE, template: SERVED_TEMPLATE, ...extra })
+  const FIX = 'npx -y @agentchatme/example doctor --fix'
+
+  it('one state per block, each with one sentence: the same words the daemon uses', () => {
+    const cases: Array<[string | null, string, 'PASS' | 'WARN']> = [
+      [null, 'missing', 'WARN'],
+      [`${USER_BEFORE}\n`, 'missing', 'WARN'],
+      [around(renderAnchorBlock(NEW_LINE, HANDLE)), 'current', 'PASS'],
+      [around(renderAnchorBlock(servedLine(), HANDLE)), 'stale', 'WARN'],
+      [around(['<!-- agentchat:start -->', NEW_LINE, '<!-- agentchat:end -->'].join('\n')), 'stale', 'WARN'],
+      [around(renderUnregisteredBlock(COPY)), 'setup_offer', 'WARN'],
+      [around(['<!-- agentchat:start -->', `My own: I am @${HANDLE} there.`, '<!-- agentchat:end -->'].join('\n')), 'hand_edited', 'WARN'],
+      [around(renderAnchorBlock(servedLine('someone-else'), 'someone-else')), 'other_agent', 'WARN'],
+      [`${renderAnchorBlock(NEW_LINE, HANDLE)}\n\n${renderAnchorBlock(NEW_LINE, HANDLE)}\n`, 'several_blocks', 'WARN'],
+    ]
+    for (const [text, state, verdict] of cases) {
+      fs.rmSync(file, { force: true })
+      if (text !== null) fs.writeFileSync(file, text)
+      const read1 = read()
+      expect(read1.state, state).toBe(state)
+      expect(read1.verdict, state).toBe(verdict)
+      // The repair is named only where it changes something.
+      const sentence = describeIdentityBlock(read1, FIX)
+      expect(sentence.includes(FIX), state).toBe(state !== 'current')
+    }
+  })
+
+  it('the hand-edited sentence says it is left as it is and how to restore it; another agent\'s names both handles', () => {
+    fs.writeFileSync(file, around(['<!-- agentchat:start -->', 'My own words.', '<!-- agentchat:end -->'].join('\n')))
+    expect(describeIdentityBlock(read(), FIX)).toBe(
+      `the AgentChat block in ${file} was edited by hand (no handle line, and not a text AgentChat served), so it is left as it is — \`${FIX}\` puts the served block back`,
+    )
+    fs.writeFileSync(file, around(renderAnchorBlock(servedLine('someone-else'), 'someone-else')))
+    expect(describeIdentityBlock(read(), FIX)).toBe(`${file} says @someone-else but this agent is @${HANDLE} — repair with \`${FIX}\``)
+  })
+
+  it('a file the runtime does not load is never a pass, whatever the block, and says why', () => {
+    const why = 'Example reads OVERRIDE.md instead of INSTRUCTIONS.md, so it does not load the AgentChat identity line; add the block to OVERRIDE.md or remove that file'
+    fs.writeFileSync(file, around(renderAnchorBlock(NEW_LINE, HANDLE)))
+    const state = read({ notLoaded: why })
+    expect(state).toMatchObject({ state: 'current', verdict: 'WARN', notLoaded: why })
+    expect(describeIdentityBlock(state, FIX)).toBe(`@${HANDLE} in ${file}; ${why}`)
+  })
+
+  it('without texts in hand, this agent\'s marked block is current but unchecked (a WARN), and an exact earlier line is still recognised', () => {
+    fs.writeFileSync(file, around(renderAnchorBlock(NEW_LINE, HANDLE)))
+    expect(read({ identityLine: null, template: null })).toMatchObject({ state: 'current', verdict: 'WARN', checked: false })
+    fs.writeFileSync(file, around(['<!-- agentchat:start -->', servedLine(), '<!-- agentchat:end -->'].join('\n')))
+    expect(read({ identityLine: null, template: null })).toMatchObject({ state: 'stale', claimed: HANDLE })
+  })
+
+  it('an unreadable file is a FAIL in words, never a throw', () => {
+    fs.writeFileSync(file, Buffer.from([0xff, 0xfe, 0x00, 0x41]))
+    const state = read()
+    expect(state).toMatchObject({ state: 'unreadable', verdict: 'FAIL' })
+    expect(state.what).toContain('not UTF-8')
   })
 })
