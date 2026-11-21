@@ -1,5 +1,5 @@
 import * as crypto from 'node:crypto'
-import { AgentChatClient, RealtimeClient, integration as kit } from 'agentchatme'
+import { AgentChatClient, RealtimeClient, integration as kit, type Texts } from 'agentchatme'
 import { log } from '../util/log.js'
 import type { DaemonConfig } from '../daemon/config.js'
 import { beat, idle } from '../daemon/health.js'
@@ -9,6 +9,7 @@ import type { RunKind, RunOutcome, RunPreflight, RunRunner, RunWake } from './ru
 import {
   writeIntegrationStatus,
   type IntegrationCouldNotProcess,
+  type IntegrationIdentityLine,
   type IntegrationLastRun,
   type IntegrationRunsFailing,
   type IntegrationStatus,
@@ -17,8 +18,9 @@ import {
 import { PausedConversations } from './could-not-process.js'
 import { blockedDetail, socketStateOf } from './socket-state.js'
 import { textsCachePath } from './texts.js'
-import { MANUAL } from '../skill/manual.js'
+import { MANUAL, resolveManualPointer, type ManualPointer } from '../skill/manual.js'
 import { describeManualSync, type ManualFetch } from '../skill/served-manual.js'
+import { followIdentityAnchor } from '../anchor/follow.js'
 
 // ─── The integration: the SDK kit's receive loop, and one runtime's runner ──
 //
@@ -51,6 +53,13 @@ import { describeManualSync, type ManualFetch } from '../skill/served-manual.js'
 //     note), paused (a 24 h mute) or none, and the kit follows it once;
 //   * the served texts (`TextsCache`, the last good copy kept in the identity
 //     home) and the manual they announce (`ManualSync`).
+//
+// And what this package adds to the texts: on every change of them (the copy
+// read from the identity home at start, then each served copy that differs),
+// the identity block in the host's always-loaded instruction file follows the
+// served identity line (`anchorPath`, `followIdentityAnchor`: only this
+// agent's own block, never created, never one edited by hand), and each run's
+// pointer line names the manual where the texts in hand say it is.
 //
 // There is no retry ladder here, and no invite ledger: the server re-wakes
 // unanswered cards on its own durable ladder and shows pending invites on the
@@ -97,8 +106,18 @@ export interface IntegrationOptions {
   readonly runner: RunRunner
   /** How this integration names itself to the server (texts runtime + its version). */
   readonly client: IntegrationClient
-  /** The one pointer line a run prompt ends with (`manualPointer(...)`). */
-  readonly manualPointer: string
+  /**
+   * The one pointer line a run prompt ends with: a function of the manual's
+   * address (`(url) => manualPointer(location, url)`), called with the address
+   * the texts in hand announce; a plain string is used as it is.
+   */
+  readonly manualPointer: ManualPointer
+  /**
+   * The host's always-loaded instruction file, whose AgentChat identity block
+   * follows the served identity line from then on (`followIdentityAnchor`).
+   * Absent, the block is left to the CLI's install and `doctor --fix`.
+   */
+  readonly anchorPath?: string
   /** The skill file that follows the served manual (`<skills dir>/agentchat/SKILL.md`); absent, the manual is left to the CLI. */
   readonly manualPath?: string
   /** Injectable for tests; the manual download's `fetch`. */
@@ -145,6 +164,8 @@ export interface IntegrationOptions {
   readonly conversationRuns?: boolean
   /** Injectable for tests; `RUNTIME_CHECK_DEADLINE_MS`. */
   readonly runtimeCheckDeadlineMs?: number
+  /** Injectable for tests: how soon the served texts are fetched again after a fetch (the kit's 24 h). */
+  readonly textsRefreshMs?: number
 }
 
 type ProcessingFailureCounts = ReturnType<kit.ReceiveLoop['status']>['processingFailures']
@@ -254,6 +275,8 @@ export class Integration {
   private readonly paused: PausedConversations
   /** The runner's runtime check in flight: concurrent asks share it. */
   private runtimeCheckInFlight: Promise<RunPreflight> | null = null
+  /** What the identity block's last follow did (status `identity_line`); null without `anchorPath`, or before the first texts. */
+  private identityLine: IntegrationIdentityLine | null = null
 
   constructor(private readonly options: IntegrationOptions) {
     const { cfg, client } = options
@@ -267,9 +290,11 @@ export class Integration {
       runtime: client.runtime,
       filePath: textsCachePath(cfg.home),
       onError: (err) => log.warn(err.message),
+      ...(options.textsRefreshMs !== undefined ? { refreshMs: options.textsRefreshMs } : {}),
     })
     this.texts.onChange((texts, source) => {
       log.info(`texts ${source === 'server' ? 'fetched' : 'read from the cache'} for ${client.runtime} (texts v${texts.version}, manual ${texts.manual.version})`)
+      this.followIdentityLine(texts)
       this.writeStatus()
     })
     this.manual =
@@ -462,6 +487,7 @@ export class Integration {
         version: texts?.version ?? null,
         manual_version: texts?.manual.version ?? null,
       },
+      identity_line: this.identityLine,
       capabilities: status.socket === null ? null : status.socket.capabilities,
       intake_paused: status.socket === null ? null : status.socket.intakePaused,
       recent_cycles: status.recentCycles.map((cycle) => ({
@@ -506,7 +532,16 @@ export class Integration {
     const onAbort = (): void => controller.abort()
     if (request.signal.aborted) controller.abort()
     else request.signal.addEventListener('abort', onAbort, { once: true })
-    const identityLine = this.texts.current()?.identity_line
+    const texts = this.texts.current()
+    const identityLine = texts?.identity_line
+    // Where the manual is, as the texts in hand say (the constant only without any).
+    // A pointer function that throws costs the line, never the run.
+    let pointer = ''
+    try {
+      pointer = resolveManualPointer(this.options.manualPointer, texts)
+    } catch (err) {
+      log.warn(`run pointer: the integration's pointer function threw (${err instanceof Error ? err.message : String(err)}); the run starts without the line`)
+    }
     let outcome: RunOutcome
     try {
       outcome = await withDeadline(
@@ -515,7 +550,7 @@ export class Integration {
           ...(conversationId !== undefined ? { conversationId } : {}),
           wake,
           // No pointer, no trailing blank lines.
-          prompt: this.options.manualPointer.trim().length > 0 ? `${request.prompt}\n\n${this.options.manualPointer}` : request.prompt,
+          prompt: pointer.trim().length > 0 ? `${request.prompt}\n\n${pointer}` : request.prompt,
           runId,
           ...(identityLine !== undefined && identityLine.trim().length > 0 ? { identityLine } : {}),
           budgetMs,
@@ -812,6 +847,41 @@ export class Integration {
       else this.paused.clear(event.conversationId)
     }
     this.writeStatus()
+  }
+
+  /**
+   * The identity block follows the served identity line: on each texts
+   * change, this agent's own block in the host's instruction file is brought
+   * to the line served now (`followIdentityAnchor`, under its rules). Said in
+   * the log and the status file (`identity_line`); never throws.
+   */
+  private followIdentityLine(texts: Texts): void {
+    const filePath = this.options.anchorPath
+    if (filePath === undefined || this.stopping) return
+    const result = followIdentityAnchor({
+      filePath,
+      handle: this.options.cfg.handle,
+      identityLine: texts.identity_line,
+      template: texts.identity_line_template,
+    })
+    this.identityLine = { outcome: result.outcome, path: result.path, at: new Date().toISOString(), texts_version: texts.version, detail: result.detail }
+    const line = `identity line: ${result.outcome} — ${result.detail}`
+    switch (result.outcome) {
+      case 'updated':
+      case 'absent':
+      case 'hand_edited':
+        log.info(line)
+        break
+      case 'unchanged':
+        log.debug(line)
+        break
+      case 'other_agent':
+        // The file says this agent is someone else: peers would be handed an address that reaches another agent.
+        log.error(line)
+        break
+      default:
+        log.warn(line)
+    }
   }
 
   private writeStatus(): void {

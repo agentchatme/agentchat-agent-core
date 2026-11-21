@@ -62,6 +62,32 @@ describe('atomicWriteFile', () => {
     expect(Buffer.compare(fs.readFileSync(file), Buffer.from(bytes))).toBe(0)
     expect(fs.readdirSync(dir)).toEqual(['bin'])
   })
+
+  it('beforeRename runs with the new contents flushed beside the file; a throw there leaves the file exactly as it was and no tmp file', () => {
+    const file = path.join(dir, 'f.md')
+    fs.writeFileSync(file, 'old\n')
+    let tmpSeen: string | null = null
+    atomicWriteFile(file, 'new\n', 0o644, {
+      beforeRename: () => {
+        const tmp = fs.readdirSync(dir).find((f) => f.endsWith('.tmp'))
+        tmpSeen = tmp === undefined ? null : fs.readFileSync(path.join(dir, tmp), 'utf-8')
+        // The file being replaced is still the old one here.
+        expect(fs.readFileSync(file, 'utf-8')).toBe('old\n')
+      },
+    })
+    expect(tmpSeen).toBe('new\n')
+    expect(fs.readFileSync(file, 'utf-8')).toBe('new\n')
+
+    expect(() =>
+      atomicWriteFile(file, 'newer\n', 0o644, {
+        beforeRename: () => {
+          throw new Error('changed meanwhile')
+        },
+      }),
+    ).toThrow('changed meanwhile')
+    expect(fs.readFileSync(file, 'utf-8')).toBe('new\n')
+    expect(fs.readdirSync(dir)).toEqual(['f.md'])
+  })
 })
 
 describe('atomicCopyFile', () => {

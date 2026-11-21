@@ -196,7 +196,7 @@ const UTF8 = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true })
  * refused: decoding it would turn the user's bytes into U+FFFD, and writing
  * that back would destroy them.
  */
-function readInstructionFile(filePath: string): { bom: string; text: string } | null {
+export function readInstructionFile(filePath: string): { bom: string; text: string } | null {
   let bytes: Buffer
   try {
     bytes = fs.readFileSync(filePath)
@@ -281,7 +281,18 @@ function stillWritable(file: string): boolean {
  * (`.<name>.<12 hex>.tmp`) beside the user's file; the user's file itself is
  * whole either way.
  */
-export function writeInstructionFile(filePath: string, data: string): void {
+export interface WriteInstructionFileOptions {
+  /** Refuse (ENOENT, nothing created) when the file does not exist: for a write that may only replace a file. */
+  readonly mustExist?: boolean
+  /**
+   * Called at the last moment before the file is replaced: once the new text
+   * is written and flushed beside it, before each rename attempt (and before
+   * an in-place write). A throw aborts the write with the file as it was.
+   */
+  readonly beforeReplace?: () => void
+}
+
+export function writeInstructionFile(filePath: string, data: string, options: WriteInstructionFileOptions = {}): void {
   const target = resolveWriteTarget(filePath)
   let existing: fs.Stats | null = null
   try {
@@ -292,14 +303,18 @@ export function writeInstructionFile(filePath: string, data: string): void {
   if (existing !== null) {
     if (!existing.isFile()) throw new Error(`${filePath} is not a regular file`)
     fs.accessSync(target, fs.constants.W_OK)
+  } else if (options.mustExist === true) {
+    throw Object.assign(new Error(`${filePath} does not exist; nothing was created`), { code: 'ENOENT' })
   } else {
     fs.mkdirSync(path.dirname(target), { recursive: true })
   }
+  const beforeReplace = options.beforeReplace
   try {
-    atomicWriteFile(target, data, existing === null ? undefined : existing.mode & 0o7777)
+    atomicWriteFile(target, data, existing === null ? undefined : existing.mode & 0o7777, beforeReplace !== undefined ? { beforeRename: beforeReplace } : {})
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code
     if (existing !== null && code !== undefined && IN_PLACE_FALLBACK_CODES.has(code) && stillWritable(target)) {
+      beforeReplace?.()
       fs.writeFileSync(target, data, 'utf-8')
       return
     }

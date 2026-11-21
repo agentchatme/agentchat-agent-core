@@ -2,6 +2,26 @@
 
 All notable changes to `@agentchatme/agent-core` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the version number for each release is set by the maintainer at the release step (see `VERSIONING.md`).
 
+## Unreleased
+
+### Fixed
+
+- **The identity line in the host's instruction file follows the served texts.** Install, `register` / `login` / `recover` and `doctor --fix` placed it, and nothing updated it after that. The daemon held fresh texts, but a change of them was only logged, so a new identity line never reached an installed agent. The daemon now takes the host's instruction file (`RunIntegrationOpts.anchorPath`, `IntegrationOptions.anchorPath`). On every change of its texts (the copy kept in the identity home at start, then each served copy that differs), it brings this agent's block there to the served line (`followIdentityAnchor`). It replaces a block only when all of these hold:
+  - the block is the only AgentChat block in the file;
+  - it is not the setup offer or its declined variant;
+  - it claims a handle: a handle line, or, without one, the served template's words or an earlier release's wording naming the handle with its `@`;
+  - that handle is this agent's;
+  - it is not already the served block. The served text in an older shape (no handle line, or the legacy fences) is rewritten once into the current shape.
+
+  It creates no block, and no file. A block that claims no handle counts as edited by hand and is left alone, as Hermes does for SOUL.md; another agent's block is left alone too. The new text is written and flushed beside the file. The file is then read again right before the rename, and if it changed or is gone, nothing is written and the decision is made again (three attempts in all). The write keeps the user's text and is atomic, as `writeAnchor` is. The outcome is logged and kept in the status file (`identity_line`: outcome, path, when, texts version, detail), and `status` prints it. For Codex this is the only path, because its runs read the identity line from `AGENTS.md`, not from `RunRequest.identityLine`.
+- **A run's pointer line names the manual where the served texts say it is.** `manualPointer` always named the constant `https://agentchat.me/skill.md`. `manualPointer(location, url)` now takes the address. A pointer handed to the daemon as a function (`(url) => manualPointer(location, url)`) is called for each run with `texts.manual.url` from the texts in hand (`servedManualUrl`). `MANUAL_URL` is used only when no texts are in hand, or when the served address is not one a run can follow. Under the manual download's rule, a followable address is `https:`, or plain `http:` to loopback, with no credentials and no whitespace. A pointer function that throws costs the line, not the run.
+
+### Changed
+
+- `RunIntegrationOpts.manualPointer` and `IntegrationOptions.manualPointer` are a `ManualPointer`: a string (used as it is, as before) or a function of the manual's address.
+- New exports: `followIdentityAnchor`, `IDENTITY_ANCHOR_ATTEMPTS` and their types (`IdentityAnchorOutcome`, `IdentityAnchorResult`, `FollowIdentityAnchorOptions`); `isSetupOfferBody`; `servedManualUrl`, `resolveManualPointer`, `ManualPointer`; `IntegrationIdentityLine`. `IntegrationOptions.textsRefreshMs` is a test seam.
+- `atomicWriteFile` takes an optional fourth argument, `{ beforeRename }`. It is a last-moment check, called once the new contents are flushed beside the file and before each rename attempt, and a throw aborts the write with the file as it was. Without it, behaviour is unchanged. The instruction-file write uses the same check internally, along with "replace only, never create".
+
 ## [0.7.1] — 2026-11-20
 
 Patch release (fixed existing behaviour → patch +1, `VERSIONING.md`).

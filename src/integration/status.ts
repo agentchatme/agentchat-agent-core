@@ -131,6 +131,27 @@ export interface IntegrationStatus {
   last_ok_run_at?: string | null
   /** Could not process: the kit's reports and the server's answers, and the conversations paused for this agent. Null or absent from an older daemon. */
   could_not_process?: IntegrationCouldNotProcess | null
+  /**
+   * What the daemon last did with the identity block in the host's
+   * instruction file when the served texts changed (`followIdentityAnchor`).
+   * Null or absent when the daemon is not given one (the CLI places none),
+   * before the first texts, or from an older daemon.
+   */
+  identity_line?: IntegrationIdentityLine | null
+}
+
+/** The identity block's last follow of the served identity line. */
+export interface IntegrationIdentityLine {
+  /** `updated`, `unchanged`, `absent`, `setup_offer`, `hand_edited`, `other_agent`, `several_blocks`, `edited_meanwhile` or `failed` (`IdentityAnchorOutcome`). */
+  readonly outcome: string
+  /** The instruction file. */
+  readonly path: string
+  /** When it was done. */
+  readonly at: string
+  /** The served text set's version it followed. */
+  readonly texts_version: string
+  /** What happened, in words. */
+  readonly detail: string
 }
 
 /** A conversation paused for this agent (the server's 24 h mute, source `could_not_process`). */
@@ -323,6 +344,7 @@ const StatusSchema = z
     failed_runs_in_a_row: z.number().nullable().optional(),
     last_ok_run_at: z.string().nullable().optional(),
     could_not_process: CouldNotProcessSchema.nullable().optional(),
+    identity_line: z.object({ outcome: z.string(), path: z.string(), at: z.string(), texts_version: z.string(), detail: z.string() }).nullable().optional(),
   })
   .passthrough()
 
@@ -377,6 +399,7 @@ function normalize(raw: z.infer<typeof StatusSchema>): IntegrationStatus {
     failed_runs_in_a_row: raw.failed_runs_in_a_row ?? null,
     last_ok_run_at: raw.last_ok_run_at ?? null,
     could_not_process: raw.could_not_process ?? null,
+    identity_line: raw.identity_line ?? null,
   }
 }
 
@@ -600,6 +623,10 @@ export function formatIntegrationStatus(status: IntegrationStatus | null, now = 
     `  wakes: ${status.wakes} (${status.wakes_absorbed} absorbed into a pending run), invites: ${status.invites}`,
     `  runs: ${status.runs_started} started, ${status.runs_ok} ok, ${status.runs_failed} failed, ${status.runs_timed_out} timed out, ${status.runs_not_started} did not start; ${status.runs_skipped_empty} wake(s) found the tray empty (no run)`,
     textsLine(status.texts, now),
+    // What the daemon last did with the identity block when the served texts changed.
+    ...(status.identity_line !== undefined && status.identity_line !== null
+      ? [`  identity line (daemon): ${status.identity_line.outcome}, ${ago(Math.max(0, now - Date.parse(status.identity_line.at)))} — ${status.identity_line.detail}`]
+      : []),
     ...(status.capabilities === null || status.capabilities === undefined
       ? []
       : [

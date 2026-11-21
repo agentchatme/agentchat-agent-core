@@ -77,8 +77,18 @@ function removeQuietly(file: string): void {
   }
 }
 
+export interface AtomicWriteOptions {
+  /**
+   * Called right before each rename attempt, once the new contents are
+   * written and flushed to the temp file: the last moment to look at the file
+   * being replaced. A throw aborts the write: the temp file is removed, the
+   * file is left exactly as it was, and the error is rethrown.
+   */
+  readonly beforeRename?: () => void
+}
+
 /** `mode` is set exactly (whatever the umask); without one the file gets the umask's default, as `writeFileSync` would. */
-export function atomicWriteFile(filePath: string, data: string | Uint8Array, mode?: number): void {
+export function atomicWriteFile(filePath: string, data: string | Uint8Array, mode?: number, options: AtomicWriteOptions = {}): void {
   const dir = path.dirname(filePath)
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
   const tmp = tmpPathFor(filePath)
@@ -91,7 +101,15 @@ export function atomicWriteFile(filePath: string, data: string | Uint8Array, mod
     } finally {
       fs.closeSync(fd)
     }
-    renameWithRetry(tmp, filePath)
+    const beforeRename = options.beforeRename
+    if (beforeRename === undefined) renameWithRetry(tmp, filePath)
+    else
+      renameWithRetry(tmp, filePath, {
+        rename: (from, to) => {
+          beforeRename()
+          fs.renameSync(from, to)
+        },
+      })
   } catch (err) {
     removeQuietly(tmp)
     throw err

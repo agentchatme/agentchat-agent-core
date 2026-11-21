@@ -64,6 +64,8 @@ export interface ServerDoubleOptions {
   manual?: ServedManualDouble
   /** Serve `conversation_run_template` in the texts (conversation runs); absent: an older server. */
   conversationRunTemplate?: string
+  /** Serve this `identity_line` (absent: the fixture's line for `@me`). */
+  identityLine?: string
 }
 
 /** One `POST /v1/conversations/{id}/processing-failures` the double received. */
@@ -112,6 +114,8 @@ export interface ServerDouble {
   setTextsStatus(status: number): void
   /** Announce (and serve) a different manual from the next texts fetch on. */
   setManual(manual: ServedManualDouble): void
+  /** Serve a different `identity_line` from the next texts fetch on. */
+  setIdentityLine(line: string): void
   /** The Authorization header of every `/skill.md` request (undefined: none sent). */
   readonly manualAuth: Array<string | undefined>
   /** Invite ids dismissed through `POST /v1/groups/invites/{id}/dismiss`, in order (each leaves the tray). */
@@ -139,6 +143,7 @@ export async function startServerDouble(options: ServerDoubleOptions = {}): Prom
   const invites = options.invites ?? []
   const caps = options.helloCapabilities ?? ['ack']
   let manual = options.manual ?? null
+  let identityLine = options.identityLine ?? null
   const manualAuth: Array<string | undefined> = []
   const dismissed: string[] = []
   const processingFailures: ProcessingFailurePost[] = []
@@ -234,6 +239,7 @@ export async function startServerDouble(options: ServerDoubleOptions = {}): Prom
       const texts = textsFor('me', url.searchParams.get('runtime') ?? 'generic')
       if (conversationRunTemplate !== undefined) texts.conversation_run_template = conversationRunTemplate
       if (manual !== null) texts.manual = { url: `${double.apiBase}/skill.md`, version: manual.version }
+      if (identityLine !== null) texts.identity_line = identityLine
       res.end(JSON.stringify({ runtime: url.searchParams.get('runtime'), ...texts }))
       return
     }
@@ -265,6 +271,9 @@ export async function startServerDouble(options: ServerDoubleOptions = {}): Prom
     },
     setManual: (next) => {
       manual = next
+    },
+    setIdentityLine: (next) => {
+      identityLine = next
     },
     manualAuth,
     dismissed,
