@@ -150,6 +150,8 @@ export {
   type IdentityBlockState,
   type IdentityBlockStateName,
   type IdentityBlockStateOptions,
+  type AnchorLoadNote,
+  type AnchorServedLine,
 } from './anchor/follow.js'
 
 // Run profile and switches.

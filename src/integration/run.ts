@@ -14,6 +14,7 @@ import { INTEGRATION_ENV, INTEGRATION_ENV_LEGACY, INTEGRATION_ENV_LEGACY_REMOVAL
 import { isRunnerFactory, type RunRunner, type RunnerSource } from './runner.js'
 import { writeIntegrationStatus, type IntegrationRunsFailing, type IntegrationStandby, type IntegrationStatus, type IntegrationUnservable } from './status.js'
 import type { ManualPointer } from '../skill/manual.js'
+import type { AnchorLoadNote, AnchorServedLine } from '../anchor/follow.js'
 
 // ─── The resident supervisor ────────────────────────────────────────────────
 //
@@ -94,8 +95,8 @@ export interface RunIntegrationOpts {
    * CLI's install and `doctor --fix`.
    */
   anchorPath?: string
-  /** Why the runtime would not load `anchorPath` now, in words, or null when it does (see `IntegrationOptions.anchorNotLoaded`). */
-  anchorNotLoaded?: (handle: string) => string | null
+  /** Which file the runtime loads in `anchorPath`'s place, and whether its identity line is the served one, or null (see `IntegrationOptions.anchorLoadNote`). */
+  anchorLoadNote?: (handle: string, served: AnchorServedLine) => AnchorLoadNote | null
   /** Scratch dir for runs. The integration decides where; this package never derives one. */
   workdir: string
   /** Defaults to `AGENTCHAT_RUN_PROFILE` (`resolveRunProfile`: unset is `own`, a value that names no profile is `answer`). */
@@ -512,7 +513,7 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
           manualPointer: opts.manualPointer,
           ...(opts.manualPath !== undefined ? { manualPath: opts.manualPath } : {}),
           ...(opts.anchorPath !== undefined ? { anchorPath: opts.anchorPath } : {}),
-          ...(opts.anchorNotLoaded !== undefined ? { anchorNotLoaded: opts.anchorNotLoaded } : {}),
+          ...(opts.anchorLoadNote !== undefined ? { anchorLoadNote: opts.anchorLoadNote } : {}),
           profile,
           budgetMs,
           ...(opts.dismissIgnoredInvites !== undefined ? { dismissIgnoredInvites: opts.dismissIgnoredInvites } : {}),

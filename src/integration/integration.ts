@@ -20,7 +20,7 @@ import { blockedDetail, socketStateOf } from './socket-state.js'
 import { textsCachePath } from './texts.js'
 import { MANUAL, resolveManualPointer, type ManualPointer } from '../skill/manual.js'
 import { describeManualSync, type ManualFetch } from '../skill/served-manual.js'
-import { followIdentityAnchor } from '../anchor/follow.js'
+import { followIdentityAnchor, type AnchorLoadNote, type AnchorServedLine } from '../anchor/follow.js'
 
 // ─── The integration: the SDK kit's receive loop, and one runtime's runner ──
 //
@@ -119,12 +119,14 @@ export interface IntegrationOptions {
    */
   readonly anchorPath?: string
   /**
-   * Why the runtime would not load `anchorPath` now, in words (a runtime that
-   * reads another file in its place when that one exists), or null when it
-   * does: said with every follow (the log at warn, the status file's
-   * `identity_line.not_loaded`). Nothing is written into that other file.
+   * For a runtime that reads another file in `anchorPath`'s place when that
+   * one exists: which file it loads, and whether the identity line there is
+   * the served one (judged against the texts being followed), or null when
+   * it loads `anchorPath` (`HostProfile.anchorLoadNote`). Said with every
+   * follow; when `ok` is false, at warn and as the status file's
+   * `identity_line.not_loaded`. Nothing is written into that other file.
    */
-  readonly anchorNotLoaded?: (handle: string) => string | null
+  readonly anchorLoadNote?: (handle: string, served: AnchorServedLine) => AnchorLoadNote | null
   /** The skill file that follows the served manual (`<skills dir>/agentchat/SKILL.md`); absent, the manual is left to the CLI. */
   readonly manualPath?: string
   /** Injectable for tests; the manual download's `fetch`. */
@@ -882,13 +884,14 @@ export class Integration {
       // The kit's follow never throws; a chain that broke here would stop every later follow.
       result = { outcome: 'failed', path: filePath, claimed: null, detail: `could not follow the identity line in ${filePath}: ${err instanceof Error ? err.message : String(err)}` }
     }
-    let notLoaded: string | null = null
+    let loadNote: AnchorLoadNote | null = null
     try {
-      notLoaded = this.options.anchorNotLoaded?.(this.options.cfg.handle) ?? null
+      loadNote = this.options.anchorLoadNote?.(this.options.cfg.handle, { identityLine: texts.identity_line, template: texts.identity_line_template }) ?? null
     } catch {
-      notLoaded = null
+      loadNote = null
     }
-    const detail = notLoaded === null ? result.detail : `${result.detail}; ${notLoaded}`
+    const notLoaded = loadNote !== null && !loadNote.ok ? loadNote.note : null
+    const detail = loadNote === null ? result.detail : `${result.detail}; ${loadNote.note}`
     this.identityLine = { outcome: result.outcome, path: result.path, at: new Date().toISOString(), texts_version: texts.version, detail, not_loaded: notLoaded }
     const line = `identity line: ${result.outcome} — ${detail}`
     this.writeStatus()

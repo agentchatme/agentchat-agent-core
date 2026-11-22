@@ -191,14 +191,14 @@ describe('status and doctor say one verdict for the block, in the daemon\'s term
     }
   })
 
-  it('a block the runtime does not load (the host\'s anchorNotLoaded) is a WARN with what to do, and doctor --fix writes nothing for it', async () => {
+  it('a block the runtime does not load (the host\'s anchorLoadNote, not ok) is a WARN with what to do, and doctor --fix writes nothing for it', async () => {
     serve((h) => textsFor(h))
     const why = 'Example reads OVERRIDE.md instead of CLAUDE.md, so it does not load the AgentChat identity line; add the block to OVERRIDE.md or remove that file'
-    const asked: string[] = []
+    const asked: Array<[string, string | null]> = []
     const { anchor, commands } = fixture({
-      anchorNotLoaded: (handle) => {
-        asked.push(handle)
-        return why
+      anchorLoadNote: (handle, served) => {
+        asked.push([handle, served.identityLine])
+        return { note: why, ok: false }
       },
     })
     fs.writeFileSync(anchor, `# mine\n\n${renderAnchorBlock(line('probe'), 'probe')}\n`)
@@ -212,12 +212,29 @@ describe('status and doctor say one verdict for the block, in the daemon\'s term
     await commands.runDoctor({ fix: true })
     expect(out.join('\n').split('\n')).toContain(`WARN identity-line: @probe in ${anchor}; ${why}`)
     expect(fs.statSync(anchor).ino).toBe(ino)
-    expect(asked.every((h) => h === 'probe')).toBe(true)
+    // The host is handed the served line, to judge the file its runtime loads instead.
+    expect(asked.length).toBeGreaterThan(0)
+    expect(asked.every(([h, l]) => h === 'probe' && l === line('probe'))).toBe(true)
+  })
+
+  it('a note that is ok (the runtime loads the served line from the other file) keeps the PASS and says which file', async () => {
+    serve((h) => textsFor(h))
+    const loads = 'Example loads OVERRIDE.md instead of CLAUDE.md, and the AgentChat block there is current'
+    const { anchor, commands } = fixture({ anchorLoadNote: () => ({ note: loads, ok: true }) })
+    fs.writeFileSync(anchor, `# mine\n\n${renderAnchorBlock(line('probe'), 'probe')}\n`)
+    const { out } = capture()
+    await commands.runStatus({})
+    expect(header(out)).toEqual([`Identity line: current (${anchor}); ${loads}`])
+    await commands.runStatus({ json: true })
+    expect(JSON.parse(out.pop() ?? '{}')).toMatchObject({ anchor_state: 'current', anchor_not_loaded: null })
+    out.length = 0
+    await commands.runDoctor({})
+    expect(out.join('\n').split('\n')).toContain(`PASS identity-line: @probe in ${anchor}; ${loads}`)
   })
 
   it('the served block where the runtime loads it reads current, once', async () => {
     serve((h) => textsFor(h))
-    const { anchor, commands } = fixture({ anchorNotLoaded: () => null })
+    const { anchor, commands } = fixture({ anchorLoadNote: () => null })
     fs.writeFileSync(anchor, `# mine\n\n${renderAnchorBlock(line('probe'), 'probe')}\n`)
     const { out } = capture()
     await commands.runStatus({})

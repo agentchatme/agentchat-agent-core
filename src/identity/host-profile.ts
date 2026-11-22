@@ -1,3 +1,4 @@
+import type { AnchorLoadNote, AnchorServedLine } from '../anchor/follow.js'
 import type { IntegrationClient } from '../client-identity.js'
 import type { ServedManual } from '../skill/served-manual.js'
 import type { ResolvedIdentity } from './credentials.js'
@@ -67,13 +68,14 @@ export interface HostProfile {
    */
   anchorFile?(): string
   /**
-   * Why the runtime would not load `anchorFile()` right now, in words — a
-   * runtime that reads another file in its place when that one exists —
-   * or null when it does. `status` and `doctor` say it (never a PASS while
-   * it holds), and the daemon's follow of the identity line says it too.
-   * Nothing writes into that other file: it is the user's.
+   * For a runtime that reads another file in `anchorFile()`'s place when
+   * that one exists: which file it loads now, and whether the identity line
+   * it gets there is the served one (`served`, the texts in hand), or null
+   * when it loads `anchorFile()`. `status` and `doctor` say it (never a PASS
+   * when `ok` is false), and the daemon's follow of the identity line says
+   * it too. Nothing writes into that other file: it is the user's.
    */
-  anchorNotLoaded?(handle: string): string | null
+  anchorLoadNote?(handle: string, served: AnchorServedLine): AnchorLoadNote | null
   /** Exactly what a user types to reach this integration. */
   invocation(): string
   /**

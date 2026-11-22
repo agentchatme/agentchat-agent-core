@@ -15,7 +15,7 @@ import {
 } from './credentials.js'
 import { clearOfferDeclined } from './state.js'
 import { writeAnchor, removeAnchorAt, hasAnchorAt } from '../anchor/block.js'
-import { describeIdentityBlock, identityBlockState, type IdentityBlockState } from '../anchor/follow.js'
+import { describeIdentityBlock, identityBlockState, type AnchorLoadNote, type IdentityBlockState } from '../anchor/follow.js'
 import { traySummary } from '../integration/tray.js'
 import { loadTexts, readCachedTexts } from '../integration/texts.js'
 import { identityLineOf } from '../skill/identity-line.js'
@@ -722,10 +722,10 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
     return startSignup('recover', { email, ...(handle !== undefined ? { handle } : {}) }, apiBase)
   }
 
-  /** Why the runtime would not load the instruction file now (the host's `anchorNotLoaded`), or null; a host check that throws reads as none. */
-  function notLoadedFor(handle: string): string | null {
+  /** The host's note on the file its runtime loads instead of the instruction file (`anchorLoadNote`), judged against the texts in hand, or null; a host check that throws reads as none. */
+  function loadNoteFor(handle: string, texts: StatusContext): AnchorLoadNote | null {
     try {
-      return profile.anchorNotLoaded?.(handle) ?? null
+      return profile.anchorLoadNote?.(handle, { identityLine: texts.identityLine, template: texts.identityLineTemplate }) ?? null
     } catch {
       return null
     }
@@ -751,7 +751,7 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
         return { present: null, current: null, error: errorText(err), state: null }
       }
     }
-    const state = identityBlockState(file, { handle, identityLine: texts.identityLine, template: texts.identityLineTemplate, notLoaded: notLoadedFor(handle) })
+    const state = identityBlockState(file, { handle, identityLine: texts.identityLine, template: texts.identityLineTemplate, loadNote: loadNoteFor(handle, texts) })
     if (state.state === 'unreadable') return { present: null, current: null, error: state.what.replace(/^cannot read [^:]*: /, ''), state }
     return {
       present: state.state !== 'missing',
@@ -761,12 +761,12 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
     }
   }
 
-  /** The status header's words for the block: `current` alone when it is the served one and loaded, else the reading's one sentence. */
+  /** The status header's words for the block: `current` when it is the served one (with the note on the file the runtime loads, if any), else the reading's one sentence. */
   function anchorWords(file: string, view: ReturnType<typeof anchorView>): string {
     if (view.error !== null) return `unreadable — ${view.error} (${file})`
     const state = view.state
     if (state === null) return `${view.present ? 'present' : 'missing'} (${file})`
-    if (state.verdict === 'PASS') return `current (${file})`
+    if (state.verdict === 'PASS') return `current (${file})${state.loadNote !== null ? `; ${state.loadNote.note}` : ''}`
     return describeIdentityBlock(state, `${invocation()} doctor --fix`)
   }
 
@@ -976,7 +976,7 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
 
   /** The block as the daemon reads it (`identityBlockState`), for this agent. */
   function readIdentityLine(anchorFile: string, handle: string, texts: StatusContext): IdentityBlockState {
-    return identityBlockState(anchorFile, { handle, identityLine: texts.identityLine, template: texts.identityLineTemplate, notLoaded: notLoadedFor(handle) })
+    return identityBlockState(anchorFile, { handle, identityLine: texts.identityLine, template: texts.identityLineTemplate, loadNote: loadNoteFor(handle, texts) })
   }
 
   /**
@@ -1006,7 +1006,7 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
       // Said repaired only when the file now reads as repaired.
       const after = readIdentityLine(anchorFile, creds.handle, texts)
       if (after.state === 'current') {
-        return { name: 'identity-line', verdict: after.verdict, detail: after.notLoaded === null ? `repaired → @${creds.handle}` : `repaired → @${creds.handle} in ${anchorFile}; ${after.notLoaded}` }
+        return { name: 'identity-line', verdict: after.verdict, detail: after.loadNote === null ? `repaired → @${creds.handle}` : `repaired → @${creds.handle} in ${anchorFile}; ${after.loadNote.note}` }
       }
       if (after.state === 'unreadable') return { name: 'identity-line', verdict: 'FAIL', detail: `${after.what} (after the repair)` }
       return { name: 'identity-line', verdict: 'FAIL', detail: `repair did not take: ${after.what}${report.length > 0 ? ` (${report.join('; ').trim()})` : ''}` }

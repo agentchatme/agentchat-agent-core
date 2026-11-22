@@ -80,6 +80,30 @@ export async function followIdentityAnchor(options: FollowIdentityAnchorOptions)
 
 // ─── The same reading, for `status` and `doctor` ────────────────────────────
 
+/** The served line a host's `anchorLoadNote` judges another file's block against (the texts in hand; nulls when none are). */
+export interface AnchorServedLine {
+  readonly identityLine: string | null
+  readonly template: string | null
+}
+
+/**
+ * What a host says when its runtime loads another file in the instruction
+ * file's place (`HostProfile.anchorLoadNote`): one clause naming the file
+ * the runtime loads, and whether the identity line it gets there is the
+ * served one. Said by `status`, `doctor` and every daemon follow; nothing
+ * writes that other file.
+ */
+export interface AnchorLoadNote {
+  /** One clause, naming the file the runtime loads, and what to do when `ok` is false. */
+  readonly note: string
+  /**
+   * True: the runtime loads the served identity line all the same (from the
+   * other file); the note is said, nothing is wrong. False: it loads no
+   * identity line, or an older one — never a PASS.
+   */
+  readonly ok: boolean
+}
+
 /**
  * - `current` — this agent's block, the served one (`checked: false`: no usable served line in hand to compare with);
  * - `stale` — this agent's block, older text or an older shape;
@@ -97,7 +121,9 @@ export interface IdentityBlockState {
   readonly checked: boolean
   /** The handle the block is AgentChat's for (the kit's `owner`), or null. */
   readonly claimed: string | null
-  /** Why the runtime does not load this file now (the host's `anchorNotLoaded`), or null. */
+  /** What the host says about the file its runtime loads instead (`anchorLoadNote`), or null when it loads this one. */
+  readonly loadNote: AnchorLoadNote | null
+  /** That note when the runtime does not get the served line (`loadNote.ok` false), else null: what `status --json` carries as `anchor_not_loaded`. */
   readonly notLoaded: string | null
   /** What the block is, in one clause, naming the file (no repair: `describeIdentityBlock` adds it). */
   readonly what: string
@@ -107,8 +133,8 @@ export interface IdentityBlockStateOptions {
   readonly handle: string
   readonly identityLine: string | null
   readonly template: string | null
-  /** Why the runtime would not load the file now, in words (the host's `anchorNotLoaded`); null when it does. */
-  readonly notLoaded?: string | null
+  /** The host's note on the file its runtime loads instead (`anchorLoadNote`); null when it loads this one. */
+  readonly loadNote?: AnchorLoadNote | null
 }
 
 type Reading =
@@ -164,13 +190,15 @@ function readByOwner(text: string, handle: string, template: string | null): Rea
  */
 export function identityBlockState(filePath: string, options: IdentityBlockStateOptions): IdentityBlockState {
   const handle = kit.anchor.normalizeHandle(options.handle)
-  const notLoaded = options.notLoaded ?? null
+  const loadNote = options.loadNote ?? null
+  const notLoaded = loadNote !== null && !loadNote.ok ? loadNote.note : null
   const state = (name: IdentityBlockStateName, verdict: IdentityBlockState['verdict'], claimed: string | null, what: string, checked: boolean): IdentityBlockState => ({
     state: name,
-    // A block the runtime does not load is never a pass.
+    // A runtime that does not get the served line is never a pass.
     verdict: notLoaded !== null && verdict === 'PASS' ? 'WARN' : verdict,
     checked,
     claimed,
+    loadNote,
     notLoaded,
     what,
   })
@@ -214,9 +242,10 @@ export function identityBlockState(filePath: string, options: IdentityBlockState
 /**
  * The one sentence `status` and `doctor` say about the block: what it is,
  * the repair (`fix`: the command that places the served block, e.g.
- * `npx -y @agentchatme/example doctor --fix`), and why the runtime does not
- * load the file when it does not. The repair is said only where it changes
- * something: not for the served block, nor for a file it cannot read.
+ * `npx -y @agentchatme/example doctor --fix`), and the host's note on the
+ * file its runtime loads instead, when there is one. The repair is said only
+ * where it changes something: not for the served block, nor for a file it
+ * cannot read.
  */
 export function describeIdentityBlock(state: IdentityBlockState, fix: string): string {
   const repair =
@@ -225,5 +254,5 @@ export function describeIdentityBlock(state: IdentityBlockState, fix: string): s
       : state.state === 'hand_edited'
         ? `\`${fix}\` puts the served block back`
         : `repair with \`${fix}\``
-  return [state.what, repair].filter((part): part is string => part !== null).join(' — ') + (state.notLoaded !== null ? `; ${state.notLoaded}` : '')
+  return [state.what, repair].filter((part): part is string => part !== null).join(' — ') + (state.loadNote !== null ? `; ${state.loadNote.note}` : '')
 }

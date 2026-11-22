@@ -429,9 +429,14 @@ describe('identityBlockState — status and doctor read the block the way the da
   it('a file the runtime does not load is never a pass, whatever the block, and says why', () => {
     const why = 'Example reads OVERRIDE.md instead of INSTRUCTIONS.md, so it does not load the AgentChat identity line; add the block to OVERRIDE.md or remove that file'
     fs.writeFileSync(file, around(renderAnchorBlock(NEW_LINE, HANDLE)))
-    const state = read({ notLoaded: why })
+    const state = read({ loadNote: { note: why, ok: false } })
     expect(state).toMatchObject({ state: 'current', verdict: 'WARN', notLoaded: why })
     expect(describeIdentityBlock(state, FIX)).toBe(`@${HANDLE} in ${file}; ${why}`)
+    // An ok note (the served line reaches the runtime from the other file) keeps the verdict, and is said.
+    const loads = 'Example loads OVERRIDE.md instead, and the AgentChat block there is current'
+    const ok = read({ loadNote: { note: loads, ok: true } })
+    expect(ok).toMatchObject({ state: 'current', verdict: 'PASS', notLoaded: null })
+    expect(describeIdentityBlock(ok, FIX)).toBe(`@${HANDLE} in ${file}; ${loads}`)
   })
 
   it('without texts in hand, this agent\'s marked block is current but unchecked (a WARN), and an exact earlier line is still recognised', () => {

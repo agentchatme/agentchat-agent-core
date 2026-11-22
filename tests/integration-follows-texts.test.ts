@@ -109,19 +109,34 @@ describe('the identity block follows the served texts (anchorPath)', () => {
     })
     double = await startServerDouble({ tray: { waiting: 0 } })
     fs.writeFileSync(anchor, placed(served()))
-    const asked: string[] = []
+    const asked: Array<[string, string | null]> = []
     const i = await integration(new FakeRunner(), {
       anchorPath: anchor,
-      anchorNotLoaded: (handle) => {
-        asked.push(handle)
-        return why
+      anchorLoadNote: (handle, served) => {
+        asked.push([handle, served.identityLine])
+        return { note: why, ok: false }
       },
     })
-    expect(asked).toContain('me')
+    // Judged against the texts being followed.
+    expect(asked).toContainEqual(['me', served()])
     expect(i.snapshot().identity_line).toMatchObject({ outcome: 'unchanged', not_loaded: why })
     expect(i.snapshot().identity_line?.detail).toContain(why)
     expect(warned.some((line) => line.startsWith('identity line: unchanged') && line.endsWith(why))).toBe(true)
     expect(fs.readFileSync(anchor, 'utf-8')).toBe(placed(served()))
+  }, 10_000)
+
+  it('an ok note (the runtime loads the served line from the other file) is said in the detail, not as a warning', async () => {
+    const loads = 'Example loads OVERRIDE.md instead of INSTRUCTIONS.md, and the AgentChat block there is current'
+    const warned: string[] = []
+    vi.spyOn(log, 'warn').mockImplementation((msg: string) => {
+      if (msg.startsWith('identity line: ')) warned.push(msg)
+    })
+    double = await startServerDouble({ tray: { waiting: 0 } })
+    fs.writeFileSync(anchor, placed(OLD_LINE))
+    const i = await integration(new FakeRunner(), { anchorPath: anchor, anchorLoadNote: () => ({ note: loads, ok: true }) })
+    expect(i.snapshot().identity_line).toMatchObject({ outcome: 'updated', not_loaded: null })
+    expect(i.snapshot().identity_line?.detail.endsWith(`; ${loads}`)).toBe(true)
+    expect(warned).toEqual([])
   }, 10_000)
 
   it('a texts change re-places it: the copy kept at install (already placed), then the served copy that differs', async () => {
