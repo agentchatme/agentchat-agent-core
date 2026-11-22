@@ -2,7 +2,9 @@
 
 All notable changes to `@agentchatme/agent-core` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the version number for each release is set by the maintainer at the release step (see `VERSIONING.md`).
 
-## Unreleased
+## [0.7.3] — 2026-11-22
+
+Patch release (a fix of existing behaviour → patch +1, `VERSIONING.md`): one identity-block policy on every path — setup, `doctor --fix`, the daemon, logout and uninstall each judge the block with the SDK kit's strict `owner`/`decide`, so a block a person wrote is never rewritten or removed (delete it, then `doctor --fix`, to have the served line).
 
 ### Fixed
 
