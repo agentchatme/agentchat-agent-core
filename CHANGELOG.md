@@ -2,7 +2,9 @@
 
 All notable changes to `@agentchatme/agent-core` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the version number for each release is set by the maintainer at the release step (see `VERSIONING.md`).
 
-## Unreleased
+## [0.7.2] — 2026-11-22
+
+Patch release (a fix of existing behaviour → patch +1, `VERSIONING.md`): the identity block and the run pointer follow the served texts, through the SDK kit's strict rule (`agentchatme` ^1.8.0), so a block a person wrote is never rewritten; fallback manual 2.4.3.
 
 Needs `agentchatme` 1.8.0 (the kit's strict identity-block follow, `integration.anchor.follow` / `decide` / `owner`); the dependency is `^1.8.0`.
 
