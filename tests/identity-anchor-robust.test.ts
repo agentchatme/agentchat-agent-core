@@ -167,8 +167,8 @@ describe('status and doctor say one verdict for the block, in the daemon\'s term
   it('a hand-edited block, another agent\'s, the setup offer: each named for what it is, never "older text"', async () => {
     serve((h) => textsFor(h))
     const cases: Array<[string, RegExp]> = [
-      [`${ANCHOR_START}\nMy own words: I am @probe there.\n${ANCHOR_END}`, /edited by hand \(no handle line, and not a text AgentChat served\), so it is left as it is — `example doctor --fix` puts the served block back$/],
-      [renderAnchorBlock(line('someone-else'), 'someone-else'), /says @someone-else but this agent is @probe — repair with `example doctor --fix`$/],
+      [`${ANCHOR_START}\nMy own words: I am @probe there.\n${ANCHOR_END}`, /edited by hand \(no handle line, and not a text AgentChat served\), so it is left; to have the served line, delete that block, then run `example doctor --fix`$/],
+      [renderAnchorBlock(line('someone-else'), 'someone-else'), /says @someone-else but this agent is @probe — fix the key, or remove that block$/],
       [`${ANCHOR_START}\n## AgentChat is installed — this agent has no account yet\n\nOffer it once.\n${ANCHOR_END}`, /holds the setup offer \(no account\), not @probe's identity line — repair with `example doctor --fix`$/],
     ]
     for (const [block, verdict] of cases) {

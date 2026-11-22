@@ -166,7 +166,7 @@ describe('followIdentityAnchor — this agent\'s block follows the served line',
     const before = snapshot()
     const result = await follow()
     expect(result).toMatchObject({ outcome: 'hand_edited', claimed: null })
-    expect(result.detail).toContain('`doctor --fix` puts the served block back')
+    expect(result.detail).toContain('to have the served line, delete that block, then run `doctor --fix`')
     expect(snapshot()).toEqual(before)
     // And again with no template in hand, and at the next start: the same.
     expect((await follow({ template: null })).outcome).toBe('hand_edited')
@@ -413,17 +413,18 @@ describe('identityBlockState — status and doctor read the block the way the da
       expect(read1.verdict, state).toBe(verdict)
       // The repair is named only where it changes something.
       const sentence = describeIdentityBlock(read1, FIX)
-      expect(sentence.includes(FIX), state).toBe(state !== 'current')
+      // The repair command is named where running it changes something: not for the served block, nor for another agent's (fix the key first).
+      expect(sentence.includes(FIX), state).toBe(state !== 'current' && state !== 'other_agent')
     }
   })
 
   it('the hand-edited sentence says it is left as it is and how to restore it; another agent\'s names both handles', () => {
     fs.writeFileSync(file, around(['<!-- agentchat:start -->', 'My own words.', '<!-- agentchat:end -->'].join('\n')))
     expect(describeIdentityBlock(read(), FIX)).toBe(
-      `the AgentChat block in ${file} was edited by hand (no handle line, and not a text AgentChat served), so it is left as it is — \`${FIX}\` puts the served block back`,
+      `the AgentChat block in ${file} was edited by hand (no handle line, and not a text AgentChat served), so it is left; to have the served line, delete that block, then run \`${FIX}\``,
     )
     fs.writeFileSync(file, around(renderAnchorBlock(servedLine('someone-else'), 'someone-else')))
-    expect(describeIdentityBlock(read(), FIX)).toBe(`${file} says @someone-else but this agent is @${HANDLE} — repair with \`${FIX}\``)
+    expect(describeIdentityBlock(read(), FIX)).toBe(`${file} says @someone-else but this agent is @${HANDLE} — fix the key, or remove that block`)
   })
 
   it('a file the runtime does not load is never a pass, whatever the block, and says why', () => {

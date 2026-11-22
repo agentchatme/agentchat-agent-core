@@ -54,8 +54,8 @@ export const IDENTITY_ANCHOR_ATTEMPTS: number = kit.anchor.FOLLOW_ATTEMPTS
 const REPAIR: Partial<Record<IdentityAnchorOutcome, string>> = {
   absent: 'install or `doctor --fix` places the identity line',
   setup_offer: '`doctor --fix` places the identity line',
-  hand_edited: '`doctor --fix` puts the served block back',
-  several_blocks: '`doctor --fix` keeps one, this agent\'s',
+  hand_edited: 'to have the served line, delete that block, then run `doctor --fix`',
+  several_blocks: 'to have the served line, delete them, then run `doctor --fix`',
   other_agent: '`doctor` reports the mismatch',
   edited_meanwhile: 'tried again on the next texts change or daemon start',
 }
@@ -225,7 +225,7 @@ export function identityBlockState(filePath: string, options: IdentityBlockState
         'hand_edited',
         'WARN',
         null,
-        `the AgentChat block in ${filePath} was edited by hand (no handle line, and not a text AgentChat served), so it is left as it is${reading.named !== null ? `; it names @${reading.named}, not @${handle}` : ''}`,
+        `the AgentChat block in ${filePath} was edited by hand (no handle line, and not a text AgentChat served), so it is left${reading.named !== null ? ` (it names @${reading.named}, not @${handle})` : ''}`,
         checked,
       )
     case 'other_agent':
@@ -248,11 +248,17 @@ export function identityBlockState(filePath: string, options: IdentityBlockState
  * cannot read.
  */
 export function describeIdentityBlock(state: IdentityBlockState, fix: string): string {
+  // A person's words are only replaced once they delete the block themselves:
+  // for a block that is not plainly this agent's, the repair is theirs first.
   const repair =
     state.state === 'current' || state.state === 'unreadable'
-      ? null
+      ? ''
       : state.state === 'hand_edited'
-        ? `\`${fix}\` puts the served block back`
-        : `repair with \`${fix}\``
-  return [state.what, repair].filter((part): part is string => part !== null).join(' — ') + (state.loadNote !== null ? `; ${state.loadNote.note}` : '')
+        ? `; to have the served line, delete that block, then run \`${fix}\``
+        : state.state === 'several_blocks'
+          ? `; to have the served line, delete them, then run \`${fix}\``
+          : state.state === 'other_agent'
+            ? ' — fix the key, or remove that block'
+            : ` — repair with \`${fix}\``
+  return state.what + repair + (state.loadNote !== null ? `; ${state.loadNote.note}` : '')
 }
