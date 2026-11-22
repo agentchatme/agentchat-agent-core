@@ -1,2 +1,2 @@
 /** Published package version, kept in lockstep with package.json by tests. */
-export const VERSION = '0.7.2'
+export const VERSION = '0.7.3'
