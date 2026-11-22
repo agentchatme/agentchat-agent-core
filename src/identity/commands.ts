@@ -940,9 +940,21 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
       // A file that cannot be rewritten must not stop the sign-out half-way:
       // `unplace` below still has to take the old key out of the host.
       try {
-        if (removeAnchorAt(anchorFile) === 'removed') {
+        // Only what AgentChat placed for this agent goes: its own block (by the
+        // kit's strict reading, with the kept texts when there are any) or the
+        // setup offer. A block edited by hand, or another agent's, is left.
+        const cached = readCachedTexts(home, profile.client.runtime)
+        const removed = removeAnchorAt(anchorFile, {
+          handle: identity?.handle ?? null,
+          identityLine: cached?.texts.identity_line ?? null,
+          template: cached?.texts.identity_line_template ?? null,
+        })
+        if (removed.action === 'removed') {
           any = true
           reports.push(`  ${anchorLabelOf(profile)} identity line removed`)
+        } else if (removed.action === 'kept') {
+          any = true
+          reports.push(`  ${removed.detail}`)
         }
       } catch (err) {
         any = true

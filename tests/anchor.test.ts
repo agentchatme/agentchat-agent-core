@@ -114,14 +114,14 @@ describe('removeAnchorAt', () => {
   it('strips our block and leaves the rest byte-for-byte', () => {
     fs.writeFileSync(fileA(), '# Keep me\n')
     writeAnchor(fileA(), block('agent-a'), 'agent-a')
-    expect(removeAnchorAt(fileA())).toBe('removed')
+    expect(removeAnchorAt(fileA(), { handle: 'agent-a' }).action).toBe('removed')
     expect(fs.readFileSync(fileA(), 'utf-8')).toBe('# Keep me\n')
   })
 
   it('is a no-op on a file with no block, and on a missing file', () => {
     fs.writeFileSync(fileA(), '# Nothing of ours\n')
-    expect(removeAnchorAt(fileA())).toBe('noop')
-    expect(removeAnchorAt(path.join(dir, 'absent.md'))).toBe('noop')
+    expect(removeAnchorAt(fileA(), { handle: HANDLE }).action).toBe('noop')
+    expect(removeAnchorAt(path.join(dir, 'absent.md'), { handle: HANDLE }).action).toBe('noop')
     expect(fs.existsSync(path.join(dir, 'absent.md'))).toBe(false)
   })
 })
@@ -238,10 +238,18 @@ describe('every block an earlier release wrote', () => {
         expect(fs.readFileSync(fileA(), 'utf-8')).toBe(once)
       })
 
-      it('logout removes it and leaves exactly the user’s text', () => {
-        fs.writeFileSync(fileA(), `${USER_BEFORE}\n\n${old.block}\n\n${USER_AFTER}\n`)
-        expect(removeAnchorAt(fileA())).toBe('removed')
-        expect(fs.readFileSync(fileA(), 'utf-8')).toBe(`${USER_BEFORE}\n\n${USER_AFTER}\n`)
+      it('logout removes it when it is this agent\'s (strictly), and leaves exactly the user\'s text; otherwise leaves it', () => {
+        const text = `${USER_BEFORE}\n\n${old.block}\n\n${USER_AFTER}\n`
+        fs.writeFileSync(fileA(), text)
+        const removed = removeAnchorAt(fileA(), { handle: HANDLE, template: SERVED_TEMPLATE })
+        if (servedEra(old)) {
+          expect(removed.action).toBe('removed')
+          expect(fs.readFileSync(fileA(), 'utf-8')).toBe(`${USER_BEFORE}\n\n${USER_AFTER}\n`)
+        } else {
+          // A release's own words, never served: not a text that can be told from the user's.
+          expect(removed).toMatchObject({ action: 'kept', kept: 'hand_edited' })
+          expect(fs.readFileSync(fileA(), 'utf-8')).toBe(text)
+        }
       })
 
       it('in a CRLF file: the user’s lines keep their CRLF, no text is lost', () => {
@@ -351,7 +359,7 @@ describe('the user’s file is never left half-written or lost', () => {
       throw Object.assign(new Error('EIO: i/o error, rename'), { code: 'EIO' })
     })
     expect(() => writeAnchor(fileA(), next, HANDLE)).toThrow(/EIO/)
-    expect(() => removeAnchorAt(fileA())).toThrow(/EIO/)
+    expect(() => removeAnchorAt(fileA(), { handle: HANDLE })).toThrow(/EIO/)
     vi.mocked(fs.renameSync).mockReset()
     expect(fs.readFileSync(fileA(), 'utf-8')).toBe(original)
     expect(strays()).toEqual([])
@@ -396,7 +404,7 @@ describe('the user’s file is never left half-written or lost', () => {
     writeAnchor(link, next, HANDLE)
     expect(fs.lstatSync(link).isSymbolicLink()).toBe(true)
     expect(fs.readFileSync(real, 'utf-8')).toBe(`${USER_BEFORE}\n\n${next}\n\n${USER_AFTER}\n`)
-    expect(removeAnchorAt(link)).toBe('removed')
+    expect(removeAnchorAt(link, { handle: HANDLE }).action).toBe('removed')
     expect(fs.lstatSync(link).isSymbolicLink()).toBe(true)
     expect(fs.readFileSync(real, 'utf-8')).toBe(`${USER_BEFORE}\n\n${USER_AFTER}\n`)
   })
@@ -422,7 +430,7 @@ describe('the user’s file is never left half-written or lost', () => {
     fs.writeFileSync(fileA(), original)
     fs.chmodSync(fileA(), 0o444)
     expect(() => writeAnchor(fileA(), next, HANDLE)).toThrow(/EACCES/)
-    expect(() => removeAnchorAt(fileA())).toThrow(/EACCES/)
+    expect(() => removeAnchorAt(fileA(), { handle: HANDLE })).toThrow(/EACCES/)
     expect(fs.readFileSync(fileA(), 'utf-8')).toBe(original)
     fs.chmodSync(fileA(), 0o644)
   })
@@ -456,7 +464,7 @@ describe('what the review of 0.4.1 found, pinned', () => {
     expect(fs.readFileSync(path.join(dir, 'x', 'CLAUDE.md'), 'utf-8')).toBe('an unrelated file\n')
     expect(fs.lstatSync(path.join(real, 'sub', 'CLAUDE.md')).isSymbolicLink()).toBe(true)
 
-    expect(removeAnchorAt(path.join(dir, 'home', 'CLAUDE.md'))).toBe('removed')
+    expect(removeAnchorAt(path.join(dir, 'home', 'CLAUDE.md'), { handle: HANDLE }).action).toBe('removed')
     expect(fs.readFileSync(path.join(real, 'x', 'CLAUDE.md'), 'utf-8')).toBe(`${USER_BEFORE}\n\n${USER_AFTER}\n`)
     expect(fs.readFileSync(path.join(dir, 'x', 'CLAUDE.md'), 'utf-8')).toBe('an unrelated file\n')
   })
@@ -477,7 +485,7 @@ describe('what the review of 0.4.1 found, pinned', () => {
     try {
       writeAnchor(file, next, HANDLE)
       expect(fs.readFileSync(file, 'utf-8')).toBe(updated)
-      expect(removeAnchorAt(file)).toBe('removed')
+      expect(removeAnchorAt(file, { handle: HANDLE }).action).toBe('removed')
       expect(fs.readFileSync(file, 'utf-8')).toBe(`${USER_BEFORE}\n\n${USER_AFTER}\n`)
       expect(fs.readdirSync(locked)).toEqual(['CLAUDE.md'])
     } finally {
@@ -491,7 +499,7 @@ describe('what the review of 0.4.1 found, pinned', () => {
     writeAnchor(fileA(), next, HANDLE)
     expect(fs.readFileSync(fileA(), 'utf-8')).toBe(`\uFEFF${next}\n\n${USER_AFTER}\n`)
     expect(anchorIsCurrentAt(fileA(), servedLine(), HANDLE)).toBe(true)
-    expect(removeAnchorAt(fileA())).toBe('removed')
+    expect(removeAnchorAt(fileA(), { handle: HANDLE }).action).toBe('removed')
     expect(fs.readFileSync(fileA(), 'utf-8')).toBe(`\uFEFF${USER_AFTER}\n`)
     fs.writeFileSync(fileA(), `\uFEFF${USER_BEFORE}\n`)
     writeAnchor(fileA(), next, HANDLE)
@@ -502,7 +510,7 @@ describe('what the review of 0.4.1 found, pinned', () => {
     const latin1 = Buffer.concat([Buffer.from('# R'), Buffer.from([0xe9]), Buffer.from('sumé\n', 'latin1'), Buffer.from(`\n${OLD_BLOCKS[4]!.block}\n`)])
     fs.writeFileSync(fileA(), latin1)
     expect(() => writeAnchor(fileA(), next, HANDLE)).toThrow(/not UTF-8/)
-    expect(() => removeAnchorAt(fileA())).toThrow(/not UTF-8/)
+    expect(() => removeAnchorAt(fileA(), { handle: HANDLE })).toThrow(/not UTF-8/)
     expect(() => hasAnchorAt(fileA())).toThrow(/not UTF-8/)
     expect(fs.readFileSync(fileA()).equals(latin1)).toBe(true)
   })
@@ -561,7 +569,7 @@ describe('what the second review of 0.4.1 found, pinned', () => {
       writeAnchor(link, next, HANDLE)
       expect(fs.readFileSync(real, 'utf-8')).toBe(updated)
       expect(fs.readFileSync(unrelated, 'utf-8')).toBe('an unrelated file\n')
-      expect(removeAnchorAt(link)).toBe('removed')
+      expect(removeAnchorAt(link, { handle: HANDLE }).action).toBe('removed')
       expect(fs.readFileSync(real, 'utf-8')).toBe(`${USER_BEFORE}\n\n${USER_AFTER}\n`)
       expect(fs.readFileSync(unrelated, 'utf-8')).toBe('an unrelated file\n')
       expect(fs.lstatSync(link).isSymbolicLink()).toBe(true)
@@ -584,7 +592,7 @@ describe('what the second review of 0.4.1 found, pinned', () => {
     })
     writeAnchor(fileA(), next, HANDLE)
     expect(fs.readFileSync(fileA(), 'utf-8')).toBe(updated)
-    expect(removeAnchorAt(fileA())).toBe('removed')
+    expect(removeAnchorAt(fileA(), { handle: HANDLE }).action).toBe('removed')
     expect(fs.readFileSync(fileA(), 'utf-8')).toBe(`${USER_BEFORE}\n\n${USER_AFTER}\n`)
     expect(strays()).toEqual([])
   })

@@ -2,6 +2,21 @@
 
 All notable changes to `@agentchatme/agent-core` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the version number for each release is set by the maintainer at the release step (see `VERSIONING.md`).
 
+## Unreleased
+
+### Fixed
+
+- **Logout and uninstall remove only what AgentChat placed for this agent.** `removeAnchorAt` took out every AgentChat block in the file, so signing out or uninstalling deleted a block a person had written inside the markers, or another agent's block. It now takes `{ handle, identityLine, template }` and removes only:
+  - this agent's identity block, by the kit's strict `owner` (its handle line, or a whole text that is exactly a served one);
+  - the setup offer or its declined variant.
+
+  A block edited by hand, another agent's block, or a file with more than one AgentChat block is left exactly as it is. The result says so (`{ action: 'kept', kept, detail }`), and logout prints the detail: "left your edited AgentChat block in …; remove it by hand if you no longer want it". Logout passes the home's handle and the kept texts. The write stays atomic, and the file keeps its line breaks, whether it ends with one, and a byte-order mark.
+- **The setup offer is never written over a block that is not an offer** (`writeOfferAt`). It is appended where there is no block, or replaces the offer or its declined variant. Any other block is left, and the result says so. The integrations write the offer with it after a logout, at install without an account, and on `register --not-now`, so a block that logout left stays.
+
+### Changed
+
+- `removeAnchorAt(file, options)` now requires the owner options and returns `RemoveAnchorResult` (it returned `'removed' | 'noop'`). New exports: `writeOfferAt`, `RemoveAnchorOptions`, `RemoveAnchorResult`, `WriteOfferResult`.
+
 ## [0.7.2] — 2026-11-22
 
 Patch release (a fix of existing behaviour → patch +1, `VERSIONING.md`): the identity block and the run pointer follow the served texts, through the SDK kit's strict rule (`agentchatme` ^1.8.0), so a block a person wrote is never rewritten; fallback manual 2.4.3.
