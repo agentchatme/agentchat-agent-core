@@ -71,7 +71,7 @@ describe('operations on home A leave home B byte-identical', () => {
     }],
     ['writeAnchor/removeAnchorAt', (h) => {
       writeAnchor(path.join(h, 'ANCHOR.md'), renderAnchorBlock(line('renamed-agent'), 'renamed-agent'), 'renamed-agent')
-      removeAnchorAt(path.join(h, 'ANCHOR.md'))
+      removeAnchorAt(path.join(h, 'ANCHOR.md'), { handle: 'renamed-agent' })
     }],
     ['always-on markers', (h) => {
       clearAlwaysOnWanted(h)

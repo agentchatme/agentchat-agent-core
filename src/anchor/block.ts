@@ -2,6 +2,7 @@ import * as fs from 'node:fs'
 import * as path from 'node:path'
 import { integration as kit } from 'agentchatme'
 import { atomicWriteFile } from '../util/fsutil.js'
+import { isSetupOfferBody } from './offer.js'
 
 // ─── Instruction-file identity anchor (host-agnostic) ───────────────────────
 //
@@ -63,60 +64,245 @@ export function renderAnchorBlock(identityLine: string, handle: string): string 
   return kit.anchor.render({ identity_line: identityLine, identity_line_template: '' }, handle)
 }
 
-export type AnchorAction = 'written' | 'removed' | 'noop'
+/** `kept`: the file holds a block that is not this agent's (nor the setup offer), and nothing was written. */
+export type AnchorAction = 'written' | 'removed' | 'noop' | 'kept'
 
 /**
- * Put `block` in the file at `filePath`, in place of the first AgentChat block
- * of any known shape (every other one is removed), or after the file's own
- * text when there is none. Creates the file if needed. The rest of the file is
- * kept as it was, except that the blank lines next to the block become
- * exactly one; the write is atomic (see `writeInstructionFile`).
+ * Put `block` in the file at `filePath` — only where it takes nothing of
+ * anyone's: after the file's own text when there is no AgentChat block, or in
+ * place of the setup offer (or its declined variant), or — with
+ * `expectHandle` — in place of that agent's own block (the kit's strict
+ * `owner`). Any other block (edited by hand, another agent's, more than one
+ * block) is left exactly as it is, and the result is `kept`. Creates the file
+ * if needed. The rest of the file is kept as it was (the blank lines next to
+ * the block become exactly one; line breaks, whether it ends with one, a
+ * byte-order mark); the write is atomic (see `writeInstructionFile`).
+ * Placing the identity line follows its own policy (`placeAnchorAt`).
  *
  * With `expectHandle`, throws — writing nothing — unless the block names that
  * handle, and throws if the file does not read back as written.
  */
 export function writeAnchor(filePath: string, block: string, expectHandle?: string): AnchorAction {
-  if (expectHandle !== undefined) {
-    const bare = kit.anchor.normalizeHandle(expectHandle)
+  const bare = expectHandle !== undefined ? kit.anchor.normalizeHandle(expectHandle) : null
+  if (bare !== null) {
     const claimed = kit.anchor.find(block)?.handle ?? null
     if (claimed !== bare) {
       throw new Error(`writeAnchor: the block for ${filePath} does not name @${bare} — nothing was written`)
     }
   }
   const existing = readInstructionFile(filePath) ?? { bom: '', text: '' }
-  const next = untilStable(existing.text, (text) => kit.anchor.replace(text, block))
+  const found = kit.anchor.find(existing.text)
+  if (found !== null) {
+    const several = kit.anchor.find(existing.text.slice(0, found.start) + existing.text.slice(found.end)) !== null
+    const replaceable = !several && (isSetupOfferBody(found.body) || (bare !== null && kit.anchor.owner(found, { handle: bare }) === bare))
+    if (!replaceable) return 'kept'
+  }
+  const next = kit.anchor.replace(existing.text, block)
   if (next !== existing.text) writeInstructionFile(filePath, existing.bom + next)
-  if (expectHandle !== undefined && readInstructionFile(filePath)?.text !== next) {
+  if (bare !== null && readInstructionFile(filePath)?.text !== next) {
     throw new Error(`writeAnchor: ${filePath} did not read back as written — remove the agentchat block manually and re-run`)
   }
   return 'written'
 }
 
 /**
- * `step` applied until the text stops changing (bounded). One `replace` or
- * `remove` is not always the end: taking a block out can leave two stray
- * markers that now fence a block of their own (hand-made nesting). Repeating
- * makes a write reach the state a second write would, so `anchorIsCurrentAt`
- * holds right after it.
+ * - `placed` — there was no AgentChat block (or only the setup offer): the identity block is in the file now;
+ * - `updated` — this agent's block held other text, or the served text in an older shape: it holds the served block now;
+ * - `unchanged` — it already is the served block;
+ * - `replaced_other` — (setup) another agent's block was there: it is this agent's now, and said;
+ * - `other_agent` — (repair) another agent's block is there: left as it is;
+ * - `hand_edited` — the block is not AgentChat's (edited by hand): left as it is;
+ * - `several_blocks` — more than one AgentChat block: left as it is;
+ * - `failed` — the served line does not name this agent (or holds a marker line): nothing written.
  */
-function untilStable(text: string, step: (text: string) => string): string {
-  let current = text
-  for (let i = 0; i < 8; i++) {
-    const next = step(current)
-    if (next === current) return current
-    current = next
-  }
-  return current
+export type PlaceAnchorOutcome = 'placed' | 'updated' | 'unchanged' | 'replaced_other' | 'other_agent' | 'hand_edited' | 'several_blocks' | 'failed'
+
+export interface PlaceAnchorOptions {
+  readonly handle: string
+  /** The served identity line for this agent. */
+  readonly identityLine: string
+  /** The served `identity_line_template`, when in hand: a block with no handle line in exactly its words is AgentChat's. */
+  readonly template?: string | null
+  /**
+   * `setup` (install, register, login, recover): another agent's block is
+   * replaced, and said — the key just set is the agent this file is for.
+   * `repair` (`doctor --fix`): another agent's block is refused — the key or
+   * the file is wrong, and which is for the person to say.
+   */
+  readonly mode: 'setup' | 'repair'
+  /** The command that repairs, as the user types it (`npx -y @agentchatme/example doctor --fix`), for the remedy a left block names. */
+  readonly fix?: string
 }
 
-/** Remove every AgentChat block (current or legacy) from the file; the rest stays as it was. */
-export function removeAnchorAt(filePath: string): AnchorAction {
+export interface PlaceAnchorResult {
+  readonly outcome: PlaceAnchorOutcome
+  /** Something was written. */
+  readonly written: boolean
+  /** The handle the block in the file was AgentChat's for, before (for `replaced_other` / `other_agent`, the other agent's); null otherwise. */
+  readonly claimed: string | null
+  /** What happened, in words, naming the file — with the remedy for a block that was left. */
+  readonly detail: string
+}
+
+/**
+ * Place this agent's identity block in `filePath` (the served line, `handle`)
+ * under the one policy every integration follows: a person's words are only
+ * replaced once they delete the block themselves. The kit's `decide` (and so
+ * its strict `owner`) says what the file holds:
+ *
+ *   - no block, or the setup offer: placed;
+ *   - this agent's block: updated (or unchanged);
+ *   - edited by hand: left, with the remedy (delete that block, then run `doctor --fix`);
+ *   - another agent's: `setup` replaces it and says so; `repair` leaves it (fix the key, or remove that block);
+ *   - more than one block: left, with the remedy.
+ *
+ * Creates the file when there is none. The write is atomic and keeps the
+ * user's text (`writeInstructionFile`); the result is read back. Throws when
+ * the file exists but cannot be read or written, as `hasAnchorAt` does.
+ */
+export function placeAnchorAt(filePath: string, options: PlaceAnchorOptions): PlaceAnchorResult {
+  const handle = kit.anchor.normalizeHandle(options.handle)
+  const fix = options.fix ?? 'doctor --fix'
+  const result = (outcome: PlaceAnchorOutcome, written: boolean, claimed: string | null, detail: string): PlaceAnchorResult => ({ outcome, written, claimed, detail })
+  const existing = readInstructionFile(filePath) ?? { bom: '', text: '' }
+  const decision = kit.anchor.decide(existing.text, { handle, identityLine: options.identityLine, template: options.template ?? null, isSetupOffer: isSetupOfferBody })
+  const write = (next: string): void => {
+    writeInstructionFile(filePath, existing.bom + next)
+    const back = readInstructionFile(filePath)
+    const landed = back === null ? null : kit.anchor.find(back.text)
+    if (landed === null || !landed.marked || landed.handle !== handle) {
+      throw new Error(`${filePath} did not read back with @${handle}'s identity line — remove the agentchat block manually and re-run`)
+    }
+  }
+  const block = (): string => renderAnchorBlock(options.identityLine, handle)
+  switch (decision.outcome) {
+    case 'unchanged':
+      return result('unchanged', false, handle, `identity line for @${handle} in ${filePath}`)
+    case 'updated':
+      write(decision.next ?? kit.anchor.replace(existing.text, block()))
+      return result('updated', true, handle, `identity line for @${handle} in ${filePath}`)
+    case 'absent':
+    case 'setup_offer':
+      write(kit.anchor.replace(existing.text, block()))
+      return result('placed', true, null, `identity line for @${handle} in ${filePath}`)
+    case 'hand_edited':
+      return result(
+        'hand_edited',
+        false,
+        null,
+        `the AgentChat block in ${filePath} was edited by hand, so it is left; to have the served line, delete that block, then run \`${fix}\``,
+      )
+    case 'several_blocks':
+      return result(
+        'several_blocks',
+        false,
+        decision.claimed,
+        `${filePath} holds more than one AgentChat block, so they are left; to have the served line, delete them, then run \`${fix}\``,
+      )
+    case 'other_agent': {
+      const other = decision.claimed ?? '?'
+      if (options.mode === 'repair') {
+        return result('other_agent', false, other, `${filePath} says @${other} but this agent is @${handle}; it is left — fix the key, or remove that block`)
+      }
+      // One block, another agent's: the key just set is the agent this file is for.
+      write(kit.anchor.replace(existing.text, block()))
+      return result('replaced_other', true, other, `replaced @${other}'s identity line in ${filePath} with @${handle}'s`)
+    }
+    default:
+      return result('failed', false, null, `the identity line for @${handle} was not written to ${filePath}: ${decision.detail}`)
+  }
+}
+
+
+/** Whose identity block a removal may take out: this agent's (the served line and template recognise its unmarked blocks exactly). */
+export interface RemoveAnchorOptions {
+  /** The agent being signed out or uninstalled; null when the home holds none (then only the setup offer is AgentChat's to remove). */
+  readonly handle: string | null
+  /** The served identity line, when texts are in hand (the identity-home cache will do). */
+  readonly identityLine?: string | null
+  /** The served `identity_line_template`, when in hand. */
+  readonly template?: string | null
+}
+
+export interface RemoveAnchorResult {
+  /** `removed`: AgentChat's block for this agent (or the setup offer) is gone; `kept`: a block that is not was left; `noop`: no file, or no block. */
+  readonly action: 'removed' | 'noop' | 'kept'
+  /** Why a block was left: edited by hand, another agent's, or more than one block (which are this agent's is not certain). */
+  readonly kept: 'hand_edited' | 'other_agent' | 'several_blocks' | null
+  /** The handle the block is AgentChat's for (the kit's `owner`), or null. */
+  readonly claimed: string | null
+  /** What was done, in words, naming the file. */
+  readonly detail: string
+}
+
+/**
+ * Take AgentChat out of the file — only what AgentChat placed for this
+ * agent: its identity block (the kit's strict `owner` is `handle`: its handle
+ * line, or a whole text that is exactly a served one), or the wizard's setup
+ * offer or its declined variant. A block edited by hand, another agent's
+ * block, or a file with more than one AgentChat block is left exactly as it
+ * is, and the result says so. The rest of the file is kept as it was (line
+ * breaks, whether it ends with one, a byte-order mark; the blank lines next
+ * to the block become exactly one), and the write is atomic
+ * (`writeInstructionFile`). Throws when the file exists but cannot be read
+ * or written, as `hasAnchorAt` does.
+ */
+export function removeAnchorAt(filePath: string, options: RemoveAnchorOptions): RemoveAnchorResult {
+  const result = (action: RemoveAnchorResult['action'], kept: RemoveAnchorResult['kept'], claimed: string | null, detail: string): RemoveAnchorResult => ({ action, kept, claimed, detail })
   const existing = readInstructionFile(filePath)
-  if (existing === null) return 'noop'
-  const next = untilStable(existing.text, (text) => kit.anchor.remove(text))
-  if (next === existing.text) return 'noop'
+  if (existing === null) return result('noop', null, null, `${filePath} does not exist; no AgentChat block to remove`)
+  const template = options.template ?? null
+  const found = kit.anchor.find(existing.text, { template })
+  if (found === null) return result('noop', null, null, `no AgentChat block in ${filePath}`)
+  const handle = options.handle === null ? null : kit.anchor.normalizeHandle(options.handle)
+  const owner = kit.anchor.owner(found, { ...(handle !== null ? { handle } : {}), identityLine: options.identityLine ?? null, template })
+  // Taking the block out shows whether another one is left: then which are this agent's is not certain.
+  if (kit.anchor.find(existing.text.slice(0, found.start) + existing.text.slice(found.end)) !== null) {
+    return result('kept', 'several_blocks', owner, `left the AgentChat blocks in ${filePath}: there is more than one, so which are this agent's is not certain; remove them by hand if you no longer want them`)
+  }
+  const ours = isSetupOfferBody(found.body) || (handle !== null && owner === handle)
+  if (!ours) {
+    return owner === null
+      ? result('kept', 'hand_edited', null, `left your edited AgentChat block in ${filePath}; remove it by hand if you no longer want it`)
+      : result('kept', 'other_agent', owner, `left @${owner}'s AgentChat block in ${filePath} (not this agent's); remove it by hand if you no longer want it`)
+  }
+  const next = kit.anchor.remove(existing.text)
+  if (next === existing.text) return result('noop', null, owner, `no AgentChat block in ${filePath}`)
   writeInstructionFile(filePath, existing.bom + next)
-  return 'removed'
+  return result('removed', null, owner, `AgentChat block removed from ${filePath}`)
+}
+
+export interface WriteOfferResult {
+  /** `written`: the offer (or its declined variant) is in the file; `kept`: a block that is not AgentChat's offer is there, and was left. */
+  readonly action: 'written' | 'kept'
+  readonly detail: string
+}
+
+/**
+ * Put the wizard's offer (or its declined variant, `block`) in the file —
+ * only where it takes nothing of anyone's: after the file's own text when
+ * there is no AgentChat block, or in place of the offer or declined block
+ * already there. Any other block (this or another agent's identity block, one
+ * edited by hand, more than one block) is left exactly as it is, and the
+ * result says so. Logout writes the offer after taking this agent's block
+ * out (`removeAnchorAt`), so a block it left stays. Throws as
+ * `writeAnchor` does.
+ */
+export function writeOfferAt(filePath: string, block: string): WriteOfferResult {
+  const existing = readInstructionFile(filePath)
+  const text = existing?.text ?? ''
+  const found = kit.anchor.find(text)
+  if (found !== null) {
+    const several = kit.anchor.find(text.slice(0, found.start) + text.slice(found.end)) !== null
+    if (several || !isSetupOfferBody(found.body)) {
+      return {
+        action: 'kept',
+        detail: `left the AgentChat block${several ? 's' : ''} in ${filePath} as ${several ? 'they are' : 'it is'} (not the setup offer); the offer is not written over ${several ? 'them' : 'it'} — remove ${several ? 'them' : 'it'} by hand if you no longer want ${several ? 'them' : 'it'}`,
+      }
+    }
+  }
+  writeAnchor(filePath, block)
+  return { action: 'written', detail: `setup offer in ${filePath}` }
 }
 
 /**

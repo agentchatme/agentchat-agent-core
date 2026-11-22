@@ -77,13 +77,25 @@ describe('writeAnchor', () => {
     expect(fs.readFileSync(fileA(), 'utf-8')).toBe(`# My notes\n\nSomething I wrote.\n\n${block('agent-a')}\n`)
   })
 
-  it('replaces rather than appends on re-write, converging to ONE block', () => {
-    writeAnchor(fileA(), block('old-handle'), 'old-handle')
-    writeAnchor(fileA(), block('new-handle'), 'new-handle')
+  it('replaces this agent\'s own block rather than appending, converging to ONE block', () => {
+    writeAnchor(fileA(), renderAnchorBlock(line('agent-a').replace('Served line', 'An older line'), 'agent-a'), 'agent-a')
+    expect(writeAnchor(fileA(), block('agent-a'), 'agent-a')).toBe('written')
     const out = fs.readFileSync(fileA(), 'utf-8')
     expect(out.split(ANCHOR_START)).toHaveLength(2)
-    expect(out).toContain('@new-handle')
-    expect(out).not.toContain('old-handle')
+    expect(out).toContain(line('agent-a'))
+    expect(out).not.toContain('An older line')
+  })
+
+  it('never writes over a block that is not this agent\'s or the setup offer: another agent\'s, one edited by hand, several (kept)', () => {
+    for (const text of [
+      `# mine\n\n${block('old-handle')}\n`,
+      `# mine\n\n${ANCHOR_START}\nMy own words.\n${ANCHOR_END}\n`,
+      `# mine\n\n${block('agent-a')}\n\n${block('agent-a')}\n`,
+    ]) {
+      fs.writeFileSync(fileA(), text)
+      expect(writeAnchor(fileA(), block('agent-a'), 'agent-a')).toBe('kept')
+      expect(fs.readFileSync(fileA(), 'utf-8')).toBe(text)
+    }
   })
 
   it('does not touch the file when the block is already there', () => {
@@ -114,14 +126,14 @@ describe('removeAnchorAt', () => {
   it('strips our block and leaves the rest byte-for-byte', () => {
     fs.writeFileSync(fileA(), '# Keep me\n')
     writeAnchor(fileA(), block('agent-a'), 'agent-a')
-    expect(removeAnchorAt(fileA())).toBe('removed')
+    expect(removeAnchorAt(fileA(), { handle: 'agent-a' }).action).toBe('removed')
     expect(fs.readFileSync(fileA(), 'utf-8')).toBe('# Keep me\n')
   })
 
   it('is a no-op on a file with no block, and on a missing file', () => {
     fs.writeFileSync(fileA(), '# Nothing of ours\n')
-    expect(removeAnchorAt(fileA())).toBe('noop')
-    expect(removeAnchorAt(path.join(dir, 'absent.md'))).toBe('noop')
+    expect(removeAnchorAt(fileA(), { handle: HANDLE }).action).toBe('noop')
+    expect(removeAnchorAt(path.join(dir, 'absent.md'), { handle: HANDLE }).action).toBe('noop')
     expect(fs.existsSync(path.join(dir, 'absent.md'))).toBe(false)
   })
 })
@@ -211,23 +223,24 @@ describe('every block an earlier release wrote', () => {
         expect(anchorIsCurrentAt(fileA(), servedLine(), HANDLE)).toBe(false)
       })
 
-      it('in the middle of the file: replaced in place, the user’s text on both sides kept byte for byte', () => {
-        fs.writeFileSync(fileA(), `${USER_BEFORE}\n\n${old.block}\n\n${USER_AFTER}\n`)
-        writeAnchor(fileA(), next, HANDLE)
-        expect(fs.readFileSync(fileA(), 'utf-8')).toBe(`${USER_BEFORE}\n\n${next}\n\n${USER_AFTER}\n`)
-        expect(anchorIsCurrentAt(fileA(), servedLine(), HANDLE)).toBe(true)
+      /** A served-era block is this agent's (an exact served text): replaced. A hook-era one, in a release's own words, is not a text that can be told from the user's: kept. */
+      const expectWrite = (before: string, after: string): void => {
+        fs.writeFileSync(fileA(), before)
+        expect(writeAnchor(fileA(), next, HANDLE)).toBe(servedEra(old) ? 'written' : 'kept')
+        expect(fs.readFileSync(fileA(), 'utf-8')).toBe(servedEra(old) ? after : before)
+      }
+
+      it('in the middle of the file: replaced in place when it is this agent\'s, the user’s text on both sides kept byte for byte; otherwise kept', () => {
+        expectWrite(`${USER_BEFORE}\n\n${old.block}\n\n${USER_AFTER}\n`, `${USER_BEFORE}\n\n${next}\n\n${USER_AFTER}\n`)
+        if (servedEra(old)) expect(anchorIsCurrentAt(fileA(), servedLine(), HANDLE)).toBe(true)
       })
 
       it('at the top of the file (the shape on real machines): stays at the top', () => {
-        fs.writeFileSync(fileA(), `${old.block}\n\n---\n${USER_AFTER}\n`)
-        writeAnchor(fileA(), next, HANDLE)
-        expect(fs.readFileSync(fileA(), 'utf-8')).toBe(`${next}\n\n---\n${USER_AFTER}\n`)
+        expectWrite(`${old.block}\n\n---\n${USER_AFTER}\n`, `${next}\n\n---\n${USER_AFTER}\n`)
       })
 
       it('at the end of a file with no final line break: replaced in place, and still no final line break', () => {
-        fs.writeFileSync(fileA(), `${USER_BEFORE}\n\n${old.block}`)
-        writeAnchor(fileA(), next, HANDLE)
-        expect(fs.readFileSync(fileA(), 'utf-8')).toBe(`${USER_BEFORE}\n\n${next}`)
+        expectWrite(`${USER_BEFORE}\n\n${old.block}`, `${USER_BEFORE}\n\n${next}`)
       })
 
       it('a second write changes nothing (idempotent)', () => {
@@ -238,32 +251,38 @@ describe('every block an earlier release wrote', () => {
         expect(fs.readFileSync(fileA(), 'utf-8')).toBe(once)
       })
 
-      it('logout removes it and leaves exactly the user’s text', () => {
-        fs.writeFileSync(fileA(), `${USER_BEFORE}\n\n${old.block}\n\n${USER_AFTER}\n`)
-        expect(removeAnchorAt(fileA())).toBe('removed')
-        expect(fs.readFileSync(fileA(), 'utf-8')).toBe(`${USER_BEFORE}\n\n${USER_AFTER}\n`)
+      it('logout removes it when it is this agent\'s (strictly), and leaves exactly the user\'s text; otherwise leaves it', () => {
+        const text = `${USER_BEFORE}\n\n${old.block}\n\n${USER_AFTER}\n`
+        fs.writeFileSync(fileA(), text)
+        const removed = removeAnchorAt(fileA(), { handle: HANDLE, template: SERVED_TEMPLATE })
+        if (servedEra(old)) {
+          expect(removed.action).toBe('removed')
+          expect(fs.readFileSync(fileA(), 'utf-8')).toBe(`${USER_BEFORE}\n\n${USER_AFTER}\n`)
+        } else {
+          // A release's own words, never served: not a text that can be told from the user's.
+          expect(removed).toMatchObject({ action: 'kept', kept: 'hand_edited' })
+          expect(fs.readFileSync(fileA(), 'utf-8')).toBe(text)
+        }
       })
 
       it('in a CRLF file: the user’s lines keep their CRLF, no text is lost', () => {
         const crlf = (s: string): string => s.replace(/\n/g, '\r\n')
         fs.writeFileSync(fileA(), crlf(`${USER_BEFORE}\n\n${old.block}\n\n${USER_AFTER}\n`))
         expect(readAnchorHandleAt(fileA(), SERVED_TEMPLATE)).toBe(servedEra(old) ? old.handle : null)
-        writeAnchor(fileA(), next, HANDLE)
-        const out = fs.readFileSync(fileA(), 'utf-8')
+        expectWrite(crlf(`${USER_BEFORE}\n\n${old.block}\n\n${USER_AFTER}\n`), crlf(`${USER_BEFORE}\n\n${next}\n\n${USER_AFTER}\n`))
         // The whole file stays CRLF, the new block included.
-        expect(out).toBe(crlf(`${USER_BEFORE}\n\n${next}\n\n${USER_AFTER}\n`))
-        expect(out.split(ANCHOR_START)).toHaveLength(2)
-        expect(readAnchorHandleAt(fileA())).toBe(HANDLE)
+        if (servedEra(old)) expect(readAnchorHandleAt(fileA())).toBe(HANDLE)
       })
     })
   }
 
-  it('a file carrying a legacy block AND a current one converges to one block, where the first one was', () => {
+  it('a file carrying a legacy block AND a current one is left whole: which are this agent\'s is not certain', () => {
     const legacy = OLD_BLOCKS.find((b) => b.block.startsWith('<!-- agentchat-skill:start -->'))!
     const unmarked = OLD_BLOCKS[4]!
-    fs.writeFileSync(fileA(), `${USER_BEFORE}\n\n${legacy.block}\n\nmiddle text\n\n${unmarked.block}\n\n${USER_AFTER}\n`)
-    writeAnchor(fileA(), next, HANDLE)
-    expect(fs.readFileSync(fileA(), 'utf-8')).toBe(`${USER_BEFORE}\n\n${next}\n\nmiddle text\n\n${USER_AFTER}\n`)
+    const text = `${USER_BEFORE}\n\n${legacy.block}\n\nmiddle text\n\n${unmarked.block}\n\n${USER_AFTER}\n`
+    fs.writeFileSync(fileA(), text)
+    expect(writeAnchor(fileA(), next, HANDLE)).toBe('kept')
+    expect(fs.readFileSync(fileA(), 'utf-8')).toBe(text)
   })
 
   it('the wizard’s offer is replaced by the identity block on registration, in place', () => {
@@ -315,17 +334,19 @@ describe('odd files', () => {
   it('markers with surrounding spaces still fence (whole line, trimmed)', () => {
     fs.writeFileSync(fileA(), `${USER_BEFORE}\n\n  ${ANCHOR_START}  \n${servedLine('old-agent')}\n\t${ANCHOR_END}\n`)
     expect(readAnchorHandleAt(fileA())).toBe('old-agent')
-    writeAnchor(fileA(), next, HANDLE)
+    fs.writeFileSync(fileA(), `${USER_BEFORE}\n\n  ${ANCHOR_START}  \n${servedLine()}\n\t${ANCHOR_END}\n`)
+    expect(writeAnchor(fileA(), next, HANDLE)).toBe('written')
     expect(fs.readFileSync(fileA(), 'utf-8')).toBe(`${USER_BEFORE}\n\n${next}\n`)
   })
 
-  it('an empty block, and a hand-edited one naming no handle, are found and replaced', () => {
+  it('an empty block, and a hand-edited one naming no handle, are found, and kept: a person\'s block is theirs to delete', () => {
     for (const inner of ['', 'my own note about AgentChat']) {
-      fs.writeFileSync(fileA(), `${USER_BEFORE}\n\n${ANCHOR_START}\n${inner}${inner ? '\n' : ''}${ANCHOR_END}\n`)
+      const text = `${USER_BEFORE}\n\n${ANCHOR_START}\n${inner}${inner ? '\n' : ''}${ANCHOR_END}\n`
+      fs.writeFileSync(fileA(), text)
       expect(hasAnchorAt(fileA())).toBe(true)
       expect(readAnchorHandleAt(fileA(), SERVED_TEMPLATE)).toBeNull()
-      writeAnchor(fileA(), next, HANDLE)
-      expect(fs.readFileSync(fileA(), 'utf-8')).toBe(`${USER_BEFORE}\n\n${next}\n`)
+      expect(writeAnchor(fileA(), next, HANDLE)).toBe('kept')
+      expect(fs.readFileSync(fileA(), 'utf-8')).toBe(text)
     }
   })
 
@@ -351,7 +372,7 @@ describe('the user’s file is never left half-written or lost', () => {
       throw Object.assign(new Error('EIO: i/o error, rename'), { code: 'EIO' })
     })
     expect(() => writeAnchor(fileA(), next, HANDLE)).toThrow(/EIO/)
-    expect(() => removeAnchorAt(fileA())).toThrow(/EIO/)
+    expect(() => removeAnchorAt(fileA(), { handle: HANDLE })).toThrow(/EIO/)
     vi.mocked(fs.renameSync).mockReset()
     expect(fs.readFileSync(fileA(), 'utf-8')).toBe(original)
     expect(strays()).toEqual([])
@@ -396,7 +417,7 @@ describe('the user’s file is never left half-written or lost', () => {
     writeAnchor(link, next, HANDLE)
     expect(fs.lstatSync(link).isSymbolicLink()).toBe(true)
     expect(fs.readFileSync(real, 'utf-8')).toBe(`${USER_BEFORE}\n\n${next}\n\n${USER_AFTER}\n`)
-    expect(removeAnchorAt(link)).toBe('removed')
+    expect(removeAnchorAt(link, { handle: HANDLE }).action).toBe('removed')
     expect(fs.lstatSync(link).isSymbolicLink()).toBe(true)
     expect(fs.readFileSync(real, 'utf-8')).toBe(`${USER_BEFORE}\n\n${USER_AFTER}\n`)
   })
@@ -422,7 +443,7 @@ describe('the user’s file is never left half-written or lost', () => {
     fs.writeFileSync(fileA(), original)
     fs.chmodSync(fileA(), 0o444)
     expect(() => writeAnchor(fileA(), next, HANDLE)).toThrow(/EACCES/)
-    expect(() => removeAnchorAt(fileA())).toThrow(/EACCES/)
+    expect(() => removeAnchorAt(fileA(), { handle: HANDLE })).toThrow(/EACCES/)
     expect(fs.readFileSync(fileA(), 'utf-8')).toBe(original)
     fs.chmodSync(fileA(), 0o644)
   })
@@ -456,7 +477,7 @@ describe('what the review of 0.4.1 found, pinned', () => {
     expect(fs.readFileSync(path.join(dir, 'x', 'CLAUDE.md'), 'utf-8')).toBe('an unrelated file\n')
     expect(fs.lstatSync(path.join(real, 'sub', 'CLAUDE.md')).isSymbolicLink()).toBe(true)
 
-    expect(removeAnchorAt(path.join(dir, 'home', 'CLAUDE.md'))).toBe('removed')
+    expect(removeAnchorAt(path.join(dir, 'home', 'CLAUDE.md'), { handle: HANDLE }).action).toBe('removed')
     expect(fs.readFileSync(path.join(real, 'x', 'CLAUDE.md'), 'utf-8')).toBe(`${USER_BEFORE}\n\n${USER_AFTER}\n`)
     expect(fs.readFileSync(path.join(dir, 'x', 'CLAUDE.md'), 'utf-8')).toBe('an unrelated file\n')
   })
@@ -477,7 +498,7 @@ describe('what the review of 0.4.1 found, pinned', () => {
     try {
       writeAnchor(file, next, HANDLE)
       expect(fs.readFileSync(file, 'utf-8')).toBe(updated)
-      expect(removeAnchorAt(file)).toBe('removed')
+      expect(removeAnchorAt(file, { handle: HANDLE }).action).toBe('removed')
       expect(fs.readFileSync(file, 'utf-8')).toBe(`${USER_BEFORE}\n\n${USER_AFTER}\n`)
       expect(fs.readdirSync(locked)).toEqual(['CLAUDE.md'])
     } finally {
@@ -491,7 +512,7 @@ describe('what the review of 0.4.1 found, pinned', () => {
     writeAnchor(fileA(), next, HANDLE)
     expect(fs.readFileSync(fileA(), 'utf-8')).toBe(`\uFEFF${next}\n\n${USER_AFTER}\n`)
     expect(anchorIsCurrentAt(fileA(), servedLine(), HANDLE)).toBe(true)
-    expect(removeAnchorAt(fileA())).toBe('removed')
+    expect(removeAnchorAt(fileA(), { handle: HANDLE }).action).toBe('removed')
     expect(fs.readFileSync(fileA(), 'utf-8')).toBe(`\uFEFF${USER_AFTER}\n`)
     fs.writeFileSync(fileA(), `\uFEFF${USER_BEFORE}\n`)
     writeAnchor(fileA(), next, HANDLE)
@@ -502,7 +523,7 @@ describe('what the review of 0.4.1 found, pinned', () => {
     const latin1 = Buffer.concat([Buffer.from('# R'), Buffer.from([0xe9]), Buffer.from('sumé\n', 'latin1'), Buffer.from(`\n${OLD_BLOCKS[4]!.block}\n`)])
     fs.writeFileSync(fileA(), latin1)
     expect(() => writeAnchor(fileA(), next, HANDLE)).toThrow(/not UTF-8/)
-    expect(() => removeAnchorAt(fileA())).toThrow(/not UTF-8/)
+    expect(() => removeAnchorAt(fileA(), { handle: HANDLE })).toThrow(/not UTF-8/)
     expect(() => hasAnchorAt(fileA())).toThrow(/not UTF-8/)
     expect(fs.readFileSync(fileA()).equals(latin1)).toBe(true)
   })
@@ -516,13 +537,11 @@ describe('what the review of 0.4.1 found, pinned', () => {
   })
 
   it('currency agrees with what a write would do, so status and doctor --fix converge', () => {
-    // The current block inside a legacy pair: a write changes nothing … once.
-    fs.writeFileSync(fileA(), `<!-- agentchat-skill:start -->\n${next}\n<!-- agentchat-skill:end -->\n`)
-    writeAnchor(fileA(), next, HANDLE)
-    expect(anchorIsCurrentAt(fileA(), servedLine(), HANDLE)).toBe(true)
-    const once = fs.readFileSync(fileA(), 'utf-8')
-    writeAnchor(fileA(), next, HANDLE)
-    expect(fs.readFileSync(fileA(), 'utf-8')).toBe(once)
+    // The current block inside a legacy pair (hand-made nesting) reads as two blocks: a write leaves it.
+    const nested = `<!-- agentchat-skill:start -->\n${next}\n<!-- agentchat-skill:end -->\n`
+    fs.writeFileSync(fileA(), nested)
+    expect(writeAnchor(fileA(), next, HANDLE)).toBe('kept')
+    expect(fs.readFileSync(fileA(), 'utf-8')).toBe(nested)
     // The block with no blank line before it: a write would re-space it, so it is not current — until written.
     fs.writeFileSync(fileA(), `${USER_BEFORE}\n${next}\n`)
     expect(anchorIsCurrentAt(fileA(), servedLine(), HANDLE)).toBe(false)
@@ -561,7 +580,7 @@ describe('what the second review of 0.4.1 found, pinned', () => {
       writeAnchor(link, next, HANDLE)
       expect(fs.readFileSync(real, 'utf-8')).toBe(updated)
       expect(fs.readFileSync(unrelated, 'utf-8')).toBe('an unrelated file\n')
-      expect(removeAnchorAt(link)).toBe('removed')
+      expect(removeAnchorAt(link, { handle: HANDLE }).action).toBe('removed')
       expect(fs.readFileSync(real, 'utf-8')).toBe(`${USER_BEFORE}\n\n${USER_AFTER}\n`)
       expect(fs.readFileSync(unrelated, 'utf-8')).toBe('an unrelated file\n')
       expect(fs.lstatSync(link).isSymbolicLink()).toBe(true)
@@ -584,21 +603,17 @@ describe('what the second review of 0.4.1 found, pinned', () => {
     })
     writeAnchor(fileA(), next, HANDLE)
     expect(fs.readFileSync(fileA(), 'utf-8')).toBe(updated)
-    expect(removeAnchorAt(fileA())).toBe('removed')
+    expect(removeAnchorAt(fileA(), { handle: HANDLE }).action).toBe('removed')
     expect(fs.readFileSync(fileA(), 'utf-8')).toBe(`${USER_BEFORE}\n\n${USER_AFTER}\n`)
     expect(strays()).toEqual([])
   })
 
-  it('one write reaches the end state even when taking a block out lets stray markers fence a new one', () => {
+  it('a file where taking a block out lets stray markers fence a new one holds several blocks: left whole', () => {
     const legacyStart = '<!-- agentchat-skill:start -->'
     const legacyEnd = '<!-- agentchat-skill:end -->'
-    fs.writeFileSync(fileA(), `${next}\n\ntext\n\n${legacyStart}\nbody\n\n${next}\n${legacyEnd}\n`)
-    writeAnchor(fileA(), next, HANDLE)
-    expect(anchorIsCurrentAt(fileA(), servedLine(), HANDLE)).toBe(true)
-    const once = fs.readFileSync(fileA(), 'utf-8')
-    writeAnchor(fileA(), next, HANDLE)
-    expect(fs.readFileSync(fileA(), 'utf-8')).toBe(once)
-    expect(once.split(ANCHOR_START)).toHaveLength(2)
-    expect(once).toContain('text')
+    const text = `${next}\n\ntext\n\n${legacyStart}\nbody\n\n${next}\n${legacyEnd}\n`
+    fs.writeFileSync(fileA(), text)
+    expect(writeAnchor(fileA(), next, HANDLE)).toBe('kept')
+    expect(fs.readFileSync(fileA(), 'utf-8')).toBe(text)
   })
 })

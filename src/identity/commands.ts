@@ -14,7 +14,7 @@ import {
   type PendingSignup,
 } from './credentials.js'
 import { clearOfferDeclined } from './state.js'
-import { writeAnchor, removeAnchorAt, hasAnchorAt } from '../anchor/block.js'
+import { placeAnchorAt, removeAnchorAt, hasAnchorAt } from '../anchor/block.js'
 import { describeIdentityBlock, identityBlockState, type AnchorLoadNote, type IdentityBlockState } from '../anchor/follow.js'
 import { traySummary } from '../integration/tray.js'
 import { loadTexts, readCachedTexts } from '../integration/texts.js'
@@ -341,7 +341,12 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
           `  ${label}: identity line not written — GET /v1/texts could not be reached and nothing is cached; run \`${invocation()} doctor --fix\` once online`,
         ]
       }
-      writeAnchor(file, profile.renderAnchor(identityLine, handle), handle)
+      // Setup: this agent's block is updated (or placed), another agent's replaced
+      // and said, one edited by hand (or several) left with the remedy.
+      const placed = placeAnchorAt(file, { handle, identityLine, template: null, mode: 'setup', fix: `${invocation()} doctor --fix` })
+      if (placed.outcome === 'hand_edited' || placed.outcome === 'several_blocks') return [`  ${label}: WARNING — ${placed.detail}`]
+      if (placed.outcome === 'failed') return [`  ${label}: FAILED — ${placed.detail}`]
+      if (placed.outcome === 'replaced_other') return [`  ${label}: ${placed.detail}`]
       return [`  ${label}: @${handle} → ${file}`]
     } catch (err) {
       return [`  ${label}: FAILED — ${String(err)}`]
@@ -940,9 +945,21 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
       // A file that cannot be rewritten must not stop the sign-out half-way:
       // `unplace` below still has to take the old key out of the host.
       try {
-        if (removeAnchorAt(anchorFile) === 'removed') {
+        // Only what AgentChat placed for this agent goes: its own block (by the
+        // kit's strict reading, with the kept texts when there are any) or the
+        // setup offer. A block edited by hand, or another agent's, is left.
+        const cached = readCachedTexts(home, profile.client.runtime)
+        const removed = removeAnchorAt(anchorFile, {
+          handle: identity?.handle ?? null,
+          identityLine: cached?.texts.identity_line ?? null,
+          template: cached?.texts.identity_line_template ?? null,
+        })
+        if (removed.action === 'removed') {
           any = true
           reports.push(`  ${anchorLabelOf(profile)} identity line removed`)
+        } else if (removed.action === 'kept') {
+          any = true
+          reports.push(`  ${removed.detail}`)
         }
       } catch (err) {
         any = true
@@ -997,9 +1014,13 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
     const fixCommand = `${invocation()} doctor --fix`
     const before = readIdentityLine(anchorFile, creds.handle, texts)
     if (before.state === 'unreadable') return { name: 'identity-line', verdict: 'FAIL', detail: before.what }
-    // The served block in place: nothing to repair here (a runtime that does not load the file is said, not written around).
-    const inPlace = before.state === 'current'
-    if (fix && !inPlace) {
+    // doctor --fix writes only where it takes nothing of anyone's: no block, the
+    // setup offer, or this agent's own block. A block edited by hand (or
+    // several) is the person's to delete first; another agent's means the key
+    // or the file is wrong — both are said, never written over. A runtime that
+    // does not load the file is said too, not written around.
+    const repairable = before.state === 'missing' || before.state === 'setup_offer' || before.state === 'stale'
+    if (fix && repairable) {
       const report = await placeIdentity(creds.handle, creds.api_key, apiBase)
       const failed = report.some((l) => l.includes('FAILED') || l.includes('not written'))
       if (failed) return { name: 'identity-line', verdict: 'FAIL', detail: `could not repair: ${report.join('; ')}` }
