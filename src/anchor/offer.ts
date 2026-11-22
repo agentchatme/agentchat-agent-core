@@ -13,6 +13,12 @@ import { ANCHOR_START, ANCHOR_END } from './block.js'
 // removed), so registering REPLACES this with the identity block and logout
 // removes it. It cannot accumulate.
 
+/** The offer's first line: what `isSetupOfferBody` recognises it by. */
+export const UNREGISTERED_HEADING = '## AgentChat is installed — this agent has no account yet'
+/** The silent variant's first line, and the start of the sentence after it. */
+export const DECLINED_HEADING = '## AgentChat'
+const DECLINED_LEAD = 'AgentChat is installed for this '
+
 /**
  * How ONE integration names itself in user-facing copy.
  *
@@ -44,7 +50,7 @@ export function renderUnregisteredBlock(copy: HostCopy): string {
   const { invoke, label } = copy
   return [
     ANCHOR_START,
-    '## AgentChat is installed — this agent has no account yet',
+    UNREGISTERED_HEADING,
     '',
     `[AgentChat](https://agentchat.me) gives you, the ${label} agent, a persistent \`@handle\` other AI agents can DM. AgentChat is installed for this ${label} agent, but it does not have an AgentChat account yet.`,
     '',
@@ -76,11 +82,26 @@ export function renderDeclinedBlock(copy: HostCopy): string {
   const { invoke, label } = copy
   return [
     ANCHOR_START,
-    '## AgentChat',
+    DECLINED_HEADING,
     '',
-    `AgentChat is installed for this ${label} agent, but no handle is configured and the user has said not for now. **Do not offer to set it up.** Mention it only if they ask about AgentChat or about messaging other agents.`,
+    `${DECLINED_LEAD}${label} agent, but no handle is configured and the user has said not for now. **Do not offer to set it up.** Mention it only if they ask about AgentChat or about messaging other agents.`,
     '',
     `If they ask to set it up later: ${invoke} register --email <email> --handle <handle>`,
     ANCHOR_END,
   ].join('\n')
+}
+
+/**
+ * Whether a block's body (between the fences, as `kit.anchor.find` reads it)
+ * is the wizard's: the offer (its first line is `UNREGISTERED_HEADING`) or
+ * the silent variant (`DECLINED_HEADING`, then a line that opens with the
+ * variant's first sentence). Whatever host wrote it: the host's name is not
+ * part of what is compared. Neither carries a handle; registering replaces
+ * them (`writeAnchor`), and nothing that follows the served texts touches
+ * either (`followIdentityAnchor`).
+ */
+export function isSetupOfferBody(body: string): boolean {
+  const lines = body.replace(/\r\n/g, '\n').split('\n').map((line) => line.trim()).filter((line) => line.length > 0)
+  if (lines[0] === UNREGISTERED_HEADING) return true
+  return lines[0] === DECLINED_HEADING && (lines[1]?.startsWith(DECLINED_LEAD) ?? false)
 }

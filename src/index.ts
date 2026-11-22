@@ -90,7 +90,18 @@ export {
 // The manual: the served one placed and kept current (the bundled copy is the
 // fallback for a skill file that does not exist and cannot be downloaded),
 // then the identity line's placement and the wizard's offer.
-export { MANUAL, MANUAL_URL, MANUAL_SKILL_NAME, MANUAL_FILENAME, manualFrontMatter, manualVersion, manualPointer } from './skill/manual.js'
+export {
+  MANUAL,
+  MANUAL_URL,
+  MANUAL_SKILL_NAME,
+  MANUAL_FILENAME,
+  manualFrontMatter,
+  manualVersion,
+  manualPointer,
+  servedManualUrl,
+  resolveManualPointer,
+  type ManualPointer,
+} from './skill/manual.js'
 export {
   syncManual,
   fromKitResult,
@@ -110,7 +121,7 @@ export {
   type CheckManualOptions,
 } from './skill/served-manual.js'
 export { identityLineOf, normalizeHandle } from './skill/identity-line.js'
-export { renderUnregisteredBlock, renderDeclinedBlock, type HostCopy } from './anchor/offer.js'
+export { renderUnregisteredBlock, renderDeclinedBlock, isSetupOfferBody, type HostCopy } from './anchor/offer.js'
 
 // Instruction-file anchor — fenced-block editing against an explicit path.
 export {
@@ -127,6 +138,21 @@ export {
   stripAnchorBlock,
   type AnchorAction,
 } from './anchor/block.js'
+// The daemon's half: the identity block follows the served identity line.
+export {
+  followIdentityAnchor,
+  identityBlockState,
+  describeIdentityBlock,
+  IDENTITY_ANCHOR_ATTEMPTS,
+  type IdentityAnchorOutcome,
+  type IdentityAnchorResult,
+  type FollowIdentityAnchorOptions,
+  type IdentityBlockState,
+  type IdentityBlockStateName,
+  type IdentityBlockStateOptions,
+  type AnchorLoadNote,
+  type AnchorServedLine,
+} from './anchor/follow.js'
 
 // Run profile and switches.
 export {
@@ -174,6 +200,7 @@ export {
   type IntegrationRunsFailing,
   type IntegrationUnservable,
   type IntegrationCouldNotProcess,
+  type IntegrationIdentityLine,
   type IntegrationPausedConversation,
   describePausedConversations,
   describeCouldNotProcessCounts,

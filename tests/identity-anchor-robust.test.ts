@@ -156,6 +156,91 @@ describe('the doctor reads the block by the served template and converges', () =
     fs.writeFileSync(anchor, '# mine\n')
     const { out } = capture()
     await commands.runDoctor({ fix: true })
-    expect(out.join('\n')).toMatch(/FAIL identity-line: repair did not take: .* still has no identity line/)
+    expect(out.join('\n')).toMatch(/FAIL identity-line: repair did not take: no identity line in .*CLAUDE\.md/)
+  })
+})
+
+describe('status and doctor say one verdict for the block, in the daemon\'s terms', () => {
+  const line = (h: string): string => textsFor(h).identity_line
+  const header = (out: string[]): string[] => out.join('\n').split('\n').filter((l) => l.startsWith('Identity line:'))
+
+  it('a hand-edited block, another agent\'s, the setup offer: each named for what it is, never "older text"', async () => {
+    serve((h) => textsFor(h))
+    const cases: Array<[string, RegExp]> = [
+      [`${ANCHOR_START}\nMy own words: I am @probe there.\n${ANCHOR_END}`, /edited by hand \(no handle line, and not a text AgentChat served\), so it is left as it is — `example doctor --fix` puts the served block back$/],
+      [renderAnchorBlock(line('someone-else'), 'someone-else'), /says @someone-else but this agent is @probe — repair with `example doctor --fix`$/],
+      [`${ANCHOR_START}\n## AgentChat is installed — this agent has no account yet\n\nOffer it once.\n${ANCHOR_END}`, /holds the setup offer \(no account\), not @probe's identity line — repair with `example doctor --fix`$/],
+    ]
+    for (const [block, verdict] of cases) {
+      const { anchor, commands } = fixture()
+      fs.writeFileSync(anchor, `# mine\n\n${block}\n`)
+      const { out } = capture()
+      expect(await commands.runStatus({})).toBe(0)
+      const lines = header(out)
+      expect(lines).toHaveLength(1)
+      expect(lines[0]).toMatch(verdict)
+      expect(out.join('\n')).not.toContain('older text')
+      out.length = 0
+      await commands.runDoctor({})
+      const doctor = out.join('\n').split('\n').filter((l) => l.includes('identity-line'))
+      expect(doctor).toHaveLength(1)
+      expect(doctor[0]).toMatch(/^WARN identity-line: /)
+      expect(doctor[0]).toMatch(verdict)
+      vi.restoreAllMocks()
+      serve((h) => textsFor(h))
+    }
+  })
+
+  it('a block the runtime does not load (the host\'s anchorLoadNote, not ok) is a WARN with what to do, and doctor --fix writes nothing for it', async () => {
+    serve((h) => textsFor(h))
+    const why = 'Example reads OVERRIDE.md instead of CLAUDE.md, so it does not load the AgentChat identity line; add the block to OVERRIDE.md or remove that file'
+    const asked: Array<[string, string | null]> = []
+    const { anchor, commands } = fixture({
+      anchorLoadNote: (handle, served) => {
+        asked.push([handle, served.identityLine])
+        return { note: why, ok: false }
+      },
+    })
+    fs.writeFileSync(anchor, `# mine\n\n${renderAnchorBlock(line('probe'), 'probe')}\n`)
+    const ino = fs.statSync(anchor).ino
+    const { out } = capture()
+    await commands.runStatus({})
+    expect(header(out)).toEqual([`Identity line: @probe in ${anchor}; ${why}`])
+    await commands.runStatus({ json: true })
+    expect(JSON.parse(out.pop() ?? '{}')).toMatchObject({ anchor_state: 'current', anchor_not_loaded: why })
+    out.length = 0
+    await commands.runDoctor({ fix: true })
+    expect(out.join('\n').split('\n')).toContain(`WARN identity-line: @probe in ${anchor}; ${why}`)
+    expect(fs.statSync(anchor).ino).toBe(ino)
+    // The host is handed the served line, to judge the file its runtime loads instead.
+    expect(asked.length).toBeGreaterThan(0)
+    expect(asked.every(([h, l]) => h === 'probe' && l === line('probe'))).toBe(true)
+  })
+
+  it('a note that is ok (the runtime loads the served line from the other file) keeps the PASS and says which file', async () => {
+    serve((h) => textsFor(h))
+    const loads = 'Example loads OVERRIDE.md instead of CLAUDE.md, and the AgentChat block there is current'
+    const { anchor, commands } = fixture({ anchorLoadNote: () => ({ note: loads, ok: true }) })
+    fs.writeFileSync(anchor, `# mine\n\n${renderAnchorBlock(line('probe'), 'probe')}\n`)
+    const { out } = capture()
+    await commands.runStatus({})
+    expect(header(out)).toEqual([`Identity line: current (${anchor}); ${loads}`])
+    await commands.runStatus({ json: true })
+    expect(JSON.parse(out.pop() ?? '{}')).toMatchObject({ anchor_state: 'current', anchor_not_loaded: null })
+    out.length = 0
+    await commands.runDoctor({})
+    expect(out.join('\n').split('\n')).toContain(`PASS identity-line: @probe in ${anchor}; ${loads}`)
+  })
+
+  it('the served block where the runtime loads it reads current, once', async () => {
+    serve((h) => textsFor(h))
+    const { anchor, commands } = fixture({ anchorLoadNote: () => null })
+    fs.writeFileSync(anchor, `# mine\n\n${renderAnchorBlock(line('probe'), 'probe')}\n`)
+    const { out } = capture()
+    await commands.runStatus({})
+    expect(header(out)).toEqual([`Identity line: current (${anchor})`])
+    out.length = 0
+    await commands.runDoctor({})
+    expect(out.join('\n').split('\n')).toContain(`PASS identity-line: @probe in ${anchor}`)
   })
 })

@@ -13,6 +13,8 @@ import { Integration, PREFLIGHT_DEADLINE_MS, RUNTIME_RECHECK_MS, withDeadline } 
 import { INTEGRATION_ENV, INTEGRATION_ENV_LEGACY, INTEGRATION_ENV_LEGACY_REMOVAL, integrationDisabledBy, resolveRunBudgetMs, resolveRunProfile, type RunProfile } from './profile.js'
 import { isRunnerFactory, type RunRunner, type RunnerSource } from './runner.js'
 import { writeIntegrationStatus, type IntegrationRunsFailing, type IntegrationStandby, type IntegrationStatus, type IntegrationUnservable } from './status.js'
+import type { ManualPointer } from '../skill/manual.js'
+import type { AnchorLoadNote, AnchorServedLine } from '../anchor/follow.js'
 
 // ─── The resident supervisor ────────────────────────────────────────────────
 //
@@ -69,8 +71,14 @@ export interface RunIntegrationOpts {
   runner: RunnerSource
   /** How this integration names itself to the server: the texts runtime and its own version. */
   client: IntegrationClient
-  /** The one pointer line a run prompt ends with: how THIS runtime reaches its copy of the manual (`manualPointer(...)`). */
-  manualPointer: string
+  /**
+   * The one pointer line a run prompt ends with: how THIS runtime reaches its
+   * copy of the manual. A function of the manual's address
+   * (`(url) => manualPointer(location, url)`) is called for each run with the
+   * address the served texts announce, so the line follows them; a plain
+   * string is used as it is.
+   */
+  manualPointer: ManualPointer
   /**
    * The skill file that follows the served manual (`<skills dir>/agentchat/SKILL.md`):
    * whenever the texts in hand announce a version the file does not carry, the
@@ -78,6 +86,17 @@ export interface RunIntegrationOpts {
    * daemon leaves the manual to the CLI's install and `doctor --fix`.
    */
   manualPath?: string
+  /**
+   * The host's always-loaded instruction file (the one install places the
+   * identity line in): whenever the served texts change, this agent's own
+   * identity block there is brought to the served line — never created where
+   * there is none, never one that is another agent's, the setup offer, or
+   * edited by hand (`followIdentityAnchor`). Absent, the block is left to the
+   * CLI's install and `doctor --fix`.
+   */
+  anchorPath?: string
+  /** Which file the runtime loads in `anchorPath`'s place, and whether its identity line is the served one, or null (see `IntegrationOptions.anchorLoadNote`). */
+  anchorLoadNote?: (handle: string, served: AnchorServedLine) => AnchorLoadNote | null
   /** Scratch dir for runs. The integration decides where; this package never derives one. */
   workdir: string
   /** Defaults to `AGENTCHAT_RUN_PROFILE` (`resolveRunProfile`: unset is `own`, a value that names no profile is `answer`). */
@@ -493,6 +512,8 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
           client: opts.client,
           manualPointer: opts.manualPointer,
           ...(opts.manualPath !== undefined ? { manualPath: opts.manualPath } : {}),
+          ...(opts.anchorPath !== undefined ? { anchorPath: opts.anchorPath } : {}),
+          ...(opts.anchorLoadNote !== undefined ? { anchorLoadNote: opts.anchorLoadNote } : {}),
           profile,
           budgetMs,
           ...(opts.dismissIgnoredInvites !== undefined ? { dismissIgnoredInvites: opts.dismissIgnoredInvites } : {}),

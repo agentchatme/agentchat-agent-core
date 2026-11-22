@@ -28,7 +28,7 @@ describe('the bundled manual (the fallback for a skill file that cannot be downl
     // copy is only what a first install writes when it cannot download one.
     // Refresh it at release time with the two-command refresh (README §
     // Refreshing the bundled manual) so the fallback is never far behind.
-    expect(manualVersion()).toBe('2.4.0')
+    expect(manualVersion()).toBe('2.4.3')
   })
 
   it('is the main line’s text, not a per-host rendering: what it says about one integration it says about all', () => {
@@ -77,7 +77,7 @@ describe('the identity line', () => {
     expect(() => renderAnchorBlock(textsFor('agent-b').identity_line, 'agent-a')).toThrow(/names @agent-a/)
   })
 
-  it('still reads the block releases before the integration wrote, so doctor can refresh it', () => {
-    expect(readAnchorHandleFrom(`${ANCHOR_START}\nYou are **@old-agent** on AgentChat.\n${ANCHOR_END}`)).toBe('old-agent')
+  it('a block an early release wrote in its own words names no owner (strict): doctor --fix still replaces it, nothing unattended does', () => {
+    expect(readAnchorHandleFrom(`${ANCHOR_START}\nYou are **@old-agent** on AgentChat.\n${ANCHOR_END}`)).toBeNull()
   })
 })

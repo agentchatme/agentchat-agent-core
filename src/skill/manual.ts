@@ -1,3 +1,4 @@
+import type { Texts } from 'agentchatme'
 import { MANUAL_TEXT } from './manual-text.js'
 
 // ─── The manual ─────────────────────────────────────────────────────────────
@@ -21,6 +22,11 @@ import { MANUAL_TEXT } from './manual-text.js'
 // from it by `scripts/embed-manual.mjs` so the text ships inside the bundle
 // with no file to resolve at runtime.
 
+/**
+ * Where the manual is when no served texts are in hand: the offline floor for
+ * a first install, never the address a run is pointed at while texts are
+ * (`servedManualUrl`).
+ */
 export const MANUAL_URL = 'https://agentchat.me/skill.md'
 
 /** The skill name every runtime sees: `<skills dir>/agentchat/SKILL.md`. */
@@ -61,11 +67,54 @@ export function manualVersion(text: string = MANUAL): string | null {
   return version !== undefined && version.length > 0 ? version : null
 }
 
+const LOOPBACK_HOSTS: ReadonlySet<string> = new Set(['localhost', '[::1]'])
+
+/**
+ * Where the served texts say the manual is (`texts.manual.url`), or
+ * `MANUAL_URL` when no texts are in hand. Only an address a run can follow
+ * counts, under the manual download's own rule: an absolute `https:` URL, or
+ * plain `http:` to loopback (a development server). Anything else — another
+ * scheme, a relative path, credentials in it, whitespace or a control
+ * character in it (more than an address) — reads as none.
+ */
+export function servedManualUrl(texts: Pick<Texts, 'manual'> | null | undefined): string {
+  const url = texts?.manual?.url
+  if (typeof url !== 'string') return MANUAL_URL
+  const trimmed = url.trim()
+  if (trimmed.length === 0 || /[\s\u0000-\u001f\u007f]/.test(trimmed)) return MANUAL_URL
+  let parsed: URL
+  try {
+    parsed = new URL(trimmed)
+  } catch {
+    return MANUAL_URL
+  }
+  // Never an address that carries credentials (the download refuses those too).
+  if (parsed.username !== '' || parsed.password !== '') return MANUAL_URL
+  if (parsed.protocol === 'https:') return parsed.href
+  const loopback = LOOPBACK_HOSTS.has(parsed.hostname) || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(parsed.hostname)
+  return parsed.protocol === 'http:' && loopback ? parsed.href : MANUAL_URL
+}
+
 /**
  * The one pointer line a run prompt ends with. `location` is how THIS runtime
  * reaches its copy of the manual (a skill name, a path) — the integration knows
- * that, this package does not.
+ * that, this package does not. `url` is where the served texts say the manual
+ * is (`servedManualUrl`); `MANUAL_URL` only when none are in hand.
  */
-export function manualPointer(location: string): string {
-  return `(The AgentChat manual is the ${MANUAL_SKILL_NAME} skill, ${location}; the same text is at ${MANUAL_URL}.)`
+export function manualPointer(location: string, url: string = MANUAL_URL): string {
+  return `(The AgentChat manual is the ${MANUAL_SKILL_NAME} skill, ${location}; the same text is at ${url}.)`
+}
+
+/**
+ * The pointer a run prompt ends with, as an integration hands it to the
+ * daemon: a function of the manual's address, called for each run with the
+ * address the texts in hand announce (`servedManualUrl`), so the line follows
+ * the served texts. A plain string is used as it is (an empty one adds
+ * nothing).
+ */
+export type ManualPointer = string | ((manualUrl: string) => string)
+
+/** The pointer line for a run, with the manual's address the texts in hand announce. */
+export function resolveManualPointer(pointer: ManualPointer, texts: Pick<Texts, 'manual'> | null | undefined): string {
+  return typeof pointer === 'string' ? pointer : pointer(servedManualUrl(texts))
 }

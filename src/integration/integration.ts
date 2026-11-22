@@ -1,5 +1,5 @@
 import * as crypto from 'node:crypto'
-import { AgentChatClient, RealtimeClient, integration as kit } from 'agentchatme'
+import { AgentChatClient, RealtimeClient, integration as kit, type Texts } from 'agentchatme'
 import { log } from '../util/log.js'
 import type { DaemonConfig } from '../daemon/config.js'
 import { beat, idle } from '../daemon/health.js'
@@ -9,6 +9,7 @@ import type { RunKind, RunOutcome, RunPreflight, RunRunner, RunWake } from './ru
 import {
   writeIntegrationStatus,
   type IntegrationCouldNotProcess,
+  type IntegrationIdentityLine,
   type IntegrationLastRun,
   type IntegrationRunsFailing,
   type IntegrationStatus,
@@ -17,8 +18,9 @@ import {
 import { PausedConversations } from './could-not-process.js'
 import { blockedDetail, socketStateOf } from './socket-state.js'
 import { textsCachePath } from './texts.js'
-import { MANUAL } from '../skill/manual.js'
+import { MANUAL, resolveManualPointer, type ManualPointer } from '../skill/manual.js'
 import { describeManualSync, type ManualFetch } from '../skill/served-manual.js'
+import { followIdentityAnchor, type AnchorLoadNote, type AnchorServedLine } from '../anchor/follow.js'
 
 // ─── The integration: the SDK kit's receive loop, and one runtime's runner ──
 //
@@ -51,6 +53,13 @@ import { describeManualSync, type ManualFetch } from '../skill/served-manual.js'
 //     note), paused (a 24 h mute) or none, and the kit follows it once;
 //   * the served texts (`TextsCache`, the last good copy kept in the identity
 //     home) and the manual they announce (`ManualSync`).
+//
+// And what this package adds to the texts: on every change of them (the copy
+// read from the identity home at start, then each served copy that differs),
+// the identity block in the host's always-loaded instruction file follows the
+// served identity line (`anchorPath`, `followIdentityAnchor`: only this
+// agent's own block, never created, never one edited by hand), and each run's
+// pointer line names the manual where the texts in hand say it is.
 //
 // There is no retry ladder here, and no invite ledger: the server re-wakes
 // unanswered cards on its own durable ladder and shows pending invites on the
@@ -97,8 +106,27 @@ export interface IntegrationOptions {
   readonly runner: RunRunner
   /** How this integration names itself to the server (texts runtime + its version). */
   readonly client: IntegrationClient
-  /** The one pointer line a run prompt ends with (`manualPointer(...)`). */
-  readonly manualPointer: string
+  /**
+   * The one pointer line a run prompt ends with: a function of the manual's
+   * address (`(url) => manualPointer(location, url)`), called with the address
+   * the texts in hand announce; a plain string is used as it is.
+   */
+  readonly manualPointer: ManualPointer
+  /**
+   * The host's always-loaded instruction file, whose AgentChat identity block
+   * follows the served identity line from then on (`followIdentityAnchor`).
+   * Absent, the block is left to the CLI's install and `doctor --fix`.
+   */
+  readonly anchorPath?: string
+  /**
+   * For a runtime that reads another file in `anchorPath`'s place when that
+   * one exists: which file it loads, and whether the identity line there is
+   * the served one (judged against the texts being followed), or null when
+   * it loads `anchorPath` (`HostProfile.anchorLoadNote`). Said with every
+   * follow; when `ok` is false, at warn and as the status file's
+   * `identity_line.not_loaded`. Nothing is written into that other file.
+   */
+  readonly anchorLoadNote?: (handle: string, served: AnchorServedLine) => AnchorLoadNote | null
   /** The skill file that follows the served manual (`<skills dir>/agentchat/SKILL.md`); absent, the manual is left to the CLI. */
   readonly manualPath?: string
   /** Injectable for tests; the manual download's `fetch`. */
@@ -145,6 +173,8 @@ export interface IntegrationOptions {
   readonly conversationRuns?: boolean
   /** Injectable for tests; `RUNTIME_CHECK_DEADLINE_MS`. */
   readonly runtimeCheckDeadlineMs?: number
+  /** Injectable for tests: how soon the served texts are fetched again after a fetch (the kit's 24 h). */
+  readonly textsRefreshMs?: number
 }
 
 type ProcessingFailureCounts = ReturnType<kit.ReceiveLoop['status']>['processingFailures']
@@ -254,6 +284,10 @@ export class Integration {
   private readonly paused: PausedConversations
   /** The runner's runtime check in flight: concurrent asks share it. */
   private runtimeCheckInFlight: Promise<RunPreflight> | null = null
+  /** What the identity block's last follow did (status `identity_line`); null without `anchorPath`, or before the first texts. */
+  private identityLine: IntegrationIdentityLine | null = null
+  /** The follows of the identity line, one after another (each texts change queues one; a stop waits for the one in flight). */
+  private follows: Promise<void> = Promise.resolve()
 
   constructor(private readonly options: IntegrationOptions) {
     const { cfg, client } = options
@@ -267,9 +301,12 @@ export class Integration {
       runtime: client.runtime,
       filePath: textsCachePath(cfg.home),
       onError: (err) => log.warn(err.message),
+      ...(options.textsRefreshMs !== undefined ? { refreshMs: options.textsRefreshMs } : {}),
     })
     this.texts.onChange((texts, source) => {
       log.info(`texts ${source === 'server' ? 'fetched' : 'read from the cache'} for ${client.runtime} (texts v${texts.version}, manual ${texts.manual.version})`)
+      // In order, one at a time: a follow reads and writes the file, and the newer texts must land last.
+      this.follows = this.follows.then(() => this.followIdentityLine(texts))
       this.writeStatus()
     })
     this.manual =
@@ -363,6 +400,8 @@ export class Integration {
     // The texts are in before the socket opens, so the first wake has the
     // freshest text; a failure is logged and the cached copy (if any) serves.
     await this.texts.start()
+    // The block follows the texts in hand before the first wake can start a run.
+    await this.follows
     if (this.stopping) return
     // The skill file follows the announced manual from now on; a download
     // never holds up the socket.
@@ -388,7 +427,7 @@ export class Integration {
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer)
     if (this.statusTimer) clearInterval(this.statusTimer)
     this.recheckAbort.abort()
-    this.stopped = Promise.all([this.loop.stop(), this.recheckInFlight ?? Promise.resolve()]).then(() => undefined)
+    this.stopped = Promise.all([this.loop.stop(), this.recheckInFlight ?? Promise.resolve(), this.follows]).then(() => undefined)
     this.texts.stop()
     this.manual?.stop()
     this.socket = 'closed'
@@ -462,6 +501,7 @@ export class Integration {
         version: texts?.version ?? null,
         manual_version: texts?.manual.version ?? null,
       },
+      identity_line: this.identityLine,
       capabilities: status.socket === null ? null : status.socket.capabilities,
       intake_paused: status.socket === null ? null : status.socket.intakePaused,
       recent_cycles: status.recentCycles.map((cycle) => ({
@@ -506,7 +546,16 @@ export class Integration {
     const onAbort = (): void => controller.abort()
     if (request.signal.aborted) controller.abort()
     else request.signal.addEventListener('abort', onAbort, { once: true })
-    const identityLine = this.texts.current()?.identity_line
+    const texts = this.texts.current()
+    const identityLine = texts?.identity_line
+    // Where the manual is, as the texts in hand say (the constant only without any).
+    // A pointer function that throws costs the line, never the run.
+    let pointer = ''
+    try {
+      pointer = resolveManualPointer(this.options.manualPointer, texts)
+    } catch (err) {
+      log.warn(`run pointer: the integration's pointer function threw (${err instanceof Error ? err.message : String(err)}); the run starts without the line`)
+    }
     let outcome: RunOutcome
     try {
       outcome = await withDeadline(
@@ -515,7 +564,7 @@ export class Integration {
           ...(conversationId !== undefined ? { conversationId } : {}),
           wake,
           // No pointer, no trailing blank lines.
-          prompt: this.options.manualPointer.trim().length > 0 ? `${request.prompt}\n\n${this.options.manualPointer}` : request.prompt,
+          prompt: pointer.trim().length > 0 ? `${request.prompt}\n\n${pointer}` : request.prompt,
           runId,
           ...(identityLine !== undefined && identityLine.trim().length > 0 ? { identityLine } : {}),
           budgetMs,
@@ -812,6 +861,61 @@ export class Integration {
       else this.paused.clear(event.conversationId)
     }
     this.writeStatus()
+  }
+
+  /**
+   * The identity block follows the served identity line: on each texts
+   * change, this agent's own block in the host's instruction file is brought
+   * to the line served now (`followIdentityAnchor`, under its rules). Said in
+   * the log and the status file (`identity_line`); never throws.
+   */
+  private async followIdentityLine(texts: Texts): Promise<void> {
+    const filePath = this.options.anchorPath
+    if (filePath === undefined || this.stopping) return
+    let result: Awaited<ReturnType<typeof followIdentityAnchor>>
+    try {
+      result = await followIdentityAnchor({
+        filePath,
+        handle: this.options.cfg.handle,
+        identityLine: texts.identity_line,
+        template: texts.identity_line_template,
+      })
+    } catch (err) {
+      // The kit's follow never throws; a chain that broke here would stop every later follow.
+      result = { outcome: 'failed', path: filePath, claimed: null, detail: `could not follow the identity line in ${filePath}: ${err instanceof Error ? err.message : String(err)}` }
+    }
+    let loadNote: AnchorLoadNote | null = null
+    try {
+      loadNote = this.options.anchorLoadNote?.(this.options.cfg.handle, { identityLine: texts.identity_line, template: texts.identity_line_template }) ?? null
+    } catch {
+      loadNote = null
+    }
+    const notLoaded = loadNote !== null && !loadNote.ok ? loadNote.note : null
+    const detail = loadNote === null ? result.detail : `${result.detail}; ${loadNote.note}`
+    this.identityLine = { outcome: result.outcome, path: result.path, at: new Date().toISOString(), texts_version: texts.version, detail, not_loaded: notLoaded }
+    const line = `identity line: ${result.outcome} — ${detail}`
+    this.writeStatus()
+    // The runtime does not read the file: whatever happened to the block, the agent does not see it.
+    if (notLoaded !== null && result.outcome !== 'other_agent') {
+      log.warn(line)
+      return
+    }
+    switch (result.outcome) {
+      case 'updated':
+      case 'absent':
+      case 'hand_edited':
+        log.info(line)
+        break
+      case 'unchanged':
+        log.debug(line)
+        break
+      case 'other_agent':
+        // The file says this agent is someone else: peers would be handed an address that reaches another agent.
+        log.error(line)
+        break
+      default:
+        log.warn(line)
+    }
   }
 
   private writeStatus(): void {

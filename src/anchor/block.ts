@@ -152,28 +152,29 @@ export function anchorIsCurrentAt(filePath: string, identityLine: string, handle
 }
 
 /**
- * The handle a file's block currently CLAIMS, or null when there is no block
- * or it names no handle that can be read (the wizard's offer, most
- * hand-edited blocks). Lets an integration catch a block that disagrees with
- * its own credential — an agent told it is @a while authenticating as @b
- * hands peers an address that reaches someone else — so a WRONG handle is
- * read back, not treated as "no anchor".
+ * The handle a file's block is AgentChat's for, or null when there is no
+ * block or it is not AgentChat's (the wizard's offer, a block edited by
+ * hand). The kit's strict reading (`integration.anchor.owner`): the handle of
+ * its handle line, or — with none — the handle its whole text is EXACTLY a
+ * served text for (the served template filled in, or an identity line served
+ * before). A sentence of the user's that says "I am @<handle>" names no
+ * owner: the kit's loose `find` reading is display only. Lets an integration
+ * catch a block that disagrees with its own credential — an agent told it is
+ * @a while authenticating as @b hands peers an address that reaches someone
+ * else — so a WRONG handle is read back, not treated as "no anchor".
+ * (`identityBlockState` says the whole verdict in one sentence.)
  *
  * `template` is the served `identity_line_template` (null when no texts are
- * in hand): it recognises an unmarked block in whatever words the server
- * serves today; without it, the handle line and the two wordings earlier
- * releases wrote are still read. A hand-edited block whose words happen to
- * follow one of those (`I am happy … on AgentChat`) reads as claiming that
- * word: the kit's wording match does not require the `@`. Throws as
- * `hasAnchorAt` does.
+ * in hand). Throws as `hasAnchorAt` does.
  */
-export function readAnchorHandleAt(filePath: string, template: string | null): string | null {
+export function readAnchorHandleAt(filePath: string, template: string | null = null): string | null {
   const file = readInstructionFile(filePath)
   return file === null ? null : readAnchorHandleFrom(file.text, template)
 }
 
-export function readAnchorHandleFrom(text: string, template: string | null): string | null {
-  return kit.anchor.find(text.replace(/^\uFEFF/, ''), { template })?.handle ?? null
+export function readAnchorHandleFrom(text: string, template: string | null = null): string | null {
+  const found = kit.anchor.find(text.replace(/^\uFEFF/, ''), { template })
+  return found === null ? null : kit.anchor.owner(found, { template })
 }
 
 /** `existing` with `block` in place of the first block (current or legacy) and every other block removed; `kit.anchor.replace`. */
@@ -196,7 +197,7 @@ const UTF8 = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true })
  * refused: decoding it would turn the user's bytes into U+FFFD, and writing
  * that back would destroy them.
  */
-function readInstructionFile(filePath: string): { bom: string; text: string } | null {
+export function readInstructionFile(filePath: string): { bom: string; text: string } | null {
   let bytes: Buffer
   try {
     bytes = fs.readFileSync(filePath)
