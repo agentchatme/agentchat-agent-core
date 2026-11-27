@@ -2,9 +2,9 @@
 
 All notable changes to `@agentchatme/agent-core` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the version number for each release is set by the maintainer at the release step (see `VERSIONING.md`).
 
-## Unreleased
+## [0.8.0] — 2026-11-27
 
-The version number is set at the release step (`VERSIONING.md`).
+Minor release (added behaviour → minor +1, `VERSIONING.md`): every account command leaves a listening agent and ends with the setup verdict; the listener tells AgentChat when it cannot do its job (the listener report); the host and the install are named, with one `setup_verdict` event per command that says a verdict. Needs `agentchatme` ^1.11.0.
 
 ### Added
 
