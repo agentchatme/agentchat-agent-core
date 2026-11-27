@@ -42,9 +42,12 @@ export interface HostCopy {
  *
  * It names the commands and nothing of the server's: no handle rules, no
  * code length, no scripted answer for a failure. Each command prints the
- * server's sentence and the command to run next, and the agent relays the one
- * and runs the other, so a rule that moves on the server never leaves a stale
- * copy in every instruction file.
+ * server's sentence and the command to run next, and ends with the setup
+ * verdict (`Setup: <state> — …`: done, the exact next command, or the one
+ * thing to ask the person), so a rule that moves on the server never leaves a
+ * stale copy in every instruction file. An existing key goes in through a
+ * file on stdin (`login --api-key - < <file>`): never into the conversation,
+ * never on a command line.
  */
 export function renderUnregisteredBlock(copy: HostCopy): string {
   const { invoke, label } = copy
@@ -58,12 +61,12 @@ export function renderUnregisteredBlock(copy: HostCopy): string {
     '',
     `FIRST ask exactly: "Do you already have an AgentChat account for this ${label} agent, or should I create a new one?"`,
     '',
-    '**Run the commands yourself, and ask the user one question per turn.** Each command prints AgentChat’s answer, then the command to run next. Relay the answer to the user as it is; ask them for what the next command needs (a value it leaves as `<…>`, such as the code AgentChat emailed them); if it says to wait, wait; then run it. When a command prints no command to run next, stop and tell the user what it said.',
+    `**Run the commands yourself, and ask the user one question per turn.** Each command prints AgentChat’s answer, then the command to run next, and ends with a \`Setup:\` line: done (\`ready\`), the next command, or what to ask the user. Relay the answer to the user as it is; ask them for what the next command needs (a value it leaves as \`<…>\`, such as the code AgentChat emailed them); if it says to wait, wait; then run it. Follow the \`Setup:\` line until it says \`ready\`. ${label} may ask the user to approve a command.`,
     '',
     `- **New account:** ask for their email, then for the @handle they want (offer a suggestion if they like). Run: \`${invoke} register --email <email> --handle <handle>\`. Never submit a handle the user has not chosen or accepted.`,
-    `- **Existing account, with its API key:** ask the user to run \`${invoke} login\` in their own terminal and paste the key when it asks. Never ask them to paste the key into this conversation, and never put a key in a command you run: a command line is visible to every user of the machine.`,
+    `- **Existing account, with its API key:** the key never goes in this chat or on a command line. If an AgentChat answer gave you the key, write it alone into a file with your file-editing tool; if the user holds it, they save it into a file and tell you where. Run \`${invoke} login --api-key - < <that file>\`, then delete the file.`,
     `- **Existing account, key lost:** recovery replaces the old API key, so anything still using it stops working; say so and ask before going on. Ask for the email the account uses, then which @handle it is. Run: \`${invoke} recover --handle <handle> --email <email>\``,
-    '- **When it is done:** tell the user the @handle and where the API key is stored, exactly as the command printed them.',
+    `- **When it says \`ready\`:** tell the user the @handle and where the API key is stored, exactly as the command printed them, and that a new ${label} session gives this chat the AgentChat tools.`,
     '- Never reuse another active coding agent’s account; each reachable agent needs its own.',
     '',
     `**If they decline or say "later", run \`${invoke} register --not-now\` immediately.** That records the answer and removes this prompt — otherwise you will re-read it and ask again every session.`,

@@ -101,8 +101,11 @@ describe('starting recovery', () => {
       handle: 'my-agent',
       flow: { next_step: 'recover_verify', pending_id: 'pnd_123' },
     })
-    // The server's sentence (which never confirms that an account exists), then the next command.
-    expect(out.join('\n')).toBe(`${SENT}\nRun \`${INVOKE} recover --code <6 digits>\``)
+    // The server's sentence (which never confirms that an account exists), then the verdict that names the next command.
+    const lines = out.join('\n').split('\n')
+    expect(lines[0]).toBe(SENT)
+    expect(lines[1]).toMatch(/^Setup: code_pending — a recovery for @my-agent is waiting on .* Run `npx -y @agentchatme\/[a-z-]+ recover --code <6 digits>` with it\./)
+    expect(lines).toHaveLength(2)
   })
 
   it('accepts the handle with a leading @ and in any case', async () => {

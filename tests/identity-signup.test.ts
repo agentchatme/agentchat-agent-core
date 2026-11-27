@@ -145,7 +145,12 @@ describe('register: asking for a code', () => {
     expect(server.calls).toHaveLength(1)
     expect(server.calls[0]).toMatchObject({ method: 'POST', path: '/v1/register', body: { email: 'owner@example.com', handle: 'new-agent' } })
     expect(server.calls[0]?.headers['x-agentchat-client']).toBe('generic')
-    expect(text(out)).toBe(`${SENT_REGISTER}\nRun \`${INVOKE} register --code <6 digits>\``)
+    // The server's sentence, then the setup verdict for this step: it names the code command.
+    const lines = text(out).split('\n')
+    expect(lines[0]).toBe(SENT_REGISTER)
+    expect(lines[1]).toMatch(/^Setup: code_pending — a registration of @new-agent is waiting on the 6-digit code AgentChat emailed to owner@example\.com; it expires in 10 minutes\./)
+    expect(lines[1]).toContain(`Run \`${INVOKE} register --code <6 digits>\` with it. If you cannot read that inbox, ask the person you work with for the code.`)
+    expect(lines).toHaveLength(2)
     expect(err).toEqual([])
     const pending = readPending(home)
     expect(pending).toMatchObject({
@@ -509,7 +514,10 @@ describe('recover', () => {
     expect(await commands.runRecover({ email: 'owner@example.com', handle: 'my-agent' })).toBe(0)
 
     expect(server.calls[0]).toMatchObject({ path: '/v1/agents/recover', body: { email: 'owner@example.com', handle: 'my-agent' } })
-    expect(text(out)).toBe(`${SENT_RECOVER}\nRun \`${INVOKE} recover --code <6 digits>\``)
+    const lines = text(out).split('\n')
+    expect(lines[0]).toBe(SENT_RECOVER)
+    expect(lines[1]).toMatch(/^Setup: code_pending — a recovery for @my-agent is waiting on the 6-digit code AgentChat emailed to owner@example\.com/)
+    expect(lines[1]).toContain(`Run \`${INVOKE} recover --code <6 digits>\` with it.`)
     expect(readPending(home)).toMatchObject({ kind: 'recover', handle: 'my-agent', flow: { next_step: 'recover_verify', pending_id: 'pnd_r' } })
   })
 

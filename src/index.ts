@@ -248,19 +248,51 @@ export { COULD_NOT_PROCESS_FILE, couldNotProcessPath, PausedConversations, type 
 // and gets register/login/recover/status/logout/doctor back.
 export {
   createIdentityCommands,
+  SETUP_WAIT_MS,
   type IdentityCommands,
+  type IdentityCommandOptions,
+  type ConfirmSetupOptions,
   type RegisterOpts,
   type RecoverOpts,
   type DoctorOpts,
 } from './identity/commands.js'
 export {
   anchorLabelOf,
+  placementReportOf,
   type HostProfile,
   type DoctorCheck,
   type DoctorContext,
   type StatusContext,
   type Verdict,
+  type ListenerEnsure,
+  type PlacementProblem,
+  type PlacementReport,
+  type PlacementOutput,
 } from './identity/host-profile.js'
+// The setup verdict: whether this agent is set up (a peer's message starts a
+// run on this computer), and the one next step — a command, or what to ask
+// the person. `listenerReasonKindOf` gives the server's words for why a
+// listener cannot start runs (contract v1 §3.13 `reason_kind`).
+export {
+  setupVerdict,
+  formatSetupVerdict,
+  readListener,
+  daemonPidOf,
+  reachabilityOf,
+  listenerReasonKindOf,
+  newerRelease,
+  SETUP_STATES,
+  SETUP_GRACE_MS,
+  type SetupState,
+  type SetupVerdict,
+  type SetupInputs,
+  type ServerView,
+  type ReachabilityView,
+  type ListenerReading,
+  type ReadListenerOptions,
+  type DaemonWord,
+  type ListenerReasonKind,
+} from './identity/setup.js'
 
 // Service plumbing: always-on markers, heartbeat, leader lock, service units.
 export {

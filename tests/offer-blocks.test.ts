@@ -41,10 +41,18 @@ describe('the unregistered offer block', () => {
   })
 
   it('covers login and recovery for an existing account, with the handle AND the email', () => {
-    expect(block).toContain(`ask the user to run \`${COPY.invoke} login\` in their own terminal`)
-    expect(block).not.toContain('--api-key')
+    // An existing key goes in on stdin from a file the agent writes with its file tool: never the chat, never argv.
+    expect(block).toContain(`${COPY.invoke} login --api-key - < <that file>`)
+    expect(block).toContain('file-editing tool')
+    expect(block).not.toMatch(/--api-key (?!- <)/)
     expect(block).toContain(`${COPY.invoke} recover --handle <handle> --email <email>`)
     expect(block).toContain('recovery replaces the old API key')
+  })
+
+  it('has the agent follow each command’s `Setup:` line to the end, and warn that the runtime may ask the person to approve', () => {
+    expect(block).toContain('ends with a `Setup:` line')
+    expect(block).toContain('Follow the `Setup:` line until it says `ready`.')
+    expect(block).toContain('Example may ask the user to approve a command')
   })
 
   it('tells the agent how to stop being asked', () => {

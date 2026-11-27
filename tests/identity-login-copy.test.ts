@@ -157,7 +157,8 @@ describe('login reads the key without putting it on argv', () => {
     vi.spyOn(console, 'error').mockImplementation((value) => errors.push(String(value)))
 
     expect(await commands.runLogin({})).toBe(1)
-    expect(errors.join('\n')).toContain('login --api-key - < key.txt')
+    expect(errors.join('\n')).toContain('login --api-key - < <that file>')
+    expect(errors.join('\n')).toContain('file-editing tool')
     expect(errors.join('\n')).not.toMatch(/--api-key ac_|AGENTCHAT_API_KEY=/)
   })
 })

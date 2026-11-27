@@ -2,6 +2,26 @@
 
 All notable changes to `@agentchatme/agent-core` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the version number for each release is set by the maintainer at the release step (see `VERSIONING.md`).
 
+## Unreleased
+
+The version number is set at the release step (`VERSIONING.md`).
+
+### Added
+
+- **Every account command leaves a listening agent, and says what is left.** `register --code`, `recover --code` and `login` placed the key, the tools and the identity line but never the listener service, and said "the integration daemon follows the credential on its own" — so an agent that signed in with `login` (the path the hosted tools give a Claude Code or Codex agent) was deaf, and our own text called it wired. Now, after `place`, the shared flow calls the host's new `HostProfile.ensureListener()` (the person's opt-out is respected), waits up to 30 s for the listener to connect, asks `GET /v1/agents/me` once, and ends with the setup verdict. `doctor --fix` registers the listener too. A sign-up or login that saved the key still exits 0.
+- **The setup verdict** (`setupVerdict`, `formatSetupVerdict`, `readListener`): one answer to "is this agent set up?" — `no_account`, `code_pending`, `code_expired`, `key_refused`, `suspended`, `unreachable`, `paused`, `tools_missing`, `listener_off`, `listener_missing`, `listener_down`, `listener_starting`, `listener_failing` or `ready` — with the exact command to run next, whether only the person can do the next step, and what to ask them. `status` prints it first and as `.setup` in `--json`; account commands print it last; hosts print it as install's last line (`confirmSetup`). It reads `reachability` from `GET /v1/agents/me` when the server sends it, and never needs it.
+- `HostProfile.place` and `extraStatus` may return `{ lines, problem }`: a problem that keeps runs from having the AgentChat tools (said as `tools_missing`, in the host's words, and no listener is registered over it). A host that returns lines is unchanged.
+- `listenerReasonKindOf(detail)`: why a listener cannot start runs, in the server's `reason_kind` words (`not_signed_in`, `runtime_missing`, `runtime_outdated`, `runtime_check_failed`, `other`), from the runtime check's own words.
+- `newerRelease(a, b)` (what a host's implicit ensure uses so it never downgrades a newer registered service) and `daemonPidOf(home)` (the daemon that holds the home's lease).
+
+### Changed
+
+- The setup offer in the instruction file has the agent follow each command's `Setup:` line until it says `ready`, says the runtime may ask the person to approve a command, and sends an existing key through a file the agent writes with its file-editing tool (`login --api-key - < <that file>`), never "the user's own terminal".
+- `status` with no identity says how to create one (`register --email <email> --handle <handle>`, or `login --api-key - < <that file>`), not a bare `register`. With a refused key or an unreachable server, the verdict comes first on stdout (it used to be one line on stderr); a suspended account is said as such, with no recovery advice.
+- `register --email` / `recover --email` that sent a code end with `Setup: code_pending — …`, which names the code command (it replaces the bare `Run …` line).
+- A host with no listener of its own ends a sign-in with "Open a new session for the hosted AgentChat tools to pick up the key." (the false "the integration daemon follows the credential on its own" is gone).
+- The Codex preset's not-signed-in reason names the fix: ``codex login status failed: … (run `codex login` once and sign in)``.
+
 ## [0.7.3] — 2026-11-22
 
 Patch release (a fix of existing behaviour → patch +1, `VERSIONING.md`): one identity-block policy on every path — setup, `doctor --fix`, the daemon, logout and uninstall each judge the block with the SDK kit's strict `owner`/`decide`, so a block a person wrote is never rewritten or removed (delete it, then `doctor --fix`, to have the served line).
