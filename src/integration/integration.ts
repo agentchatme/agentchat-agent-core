@@ -21,6 +21,8 @@ import { textsCachePath } from './texts.js'
 import { MANUAL, resolveManualPointer, type ManualPointer } from '../skill/manual.js'
 import { describeManualSync, type ManualFetch } from '../skill/served-manual.js'
 import { followIdentityAnchor, type AnchorLoadNote, type AnchorServedLine } from '../anchor/follow.js'
+import { listenerReasonKindOf, type ListenerReasonKind } from '../identity/setup.js'
+import { listenerReportStatusOf, tellListener, type ListenerReportSink } from './listener-report.js'
 
 // ─── The integration: the SDK kit's receive loop, and one runtime's runner ──
 //
@@ -69,7 +71,14 @@ import { followIdentityAnchor, type AnchorLoadNote, type AnchorServedLine } from
 // What stays here is this package's own: the runner seam (how a runtime's run
 // is started is the integration's — `RunRunner`), the one pointer line a run
 // prompt ends with, a deadline on every run (a runner that never returns must
-// not hold the loop), and the status file `status` and `doctor` read.
+// not hold the loop), the status file `status` and `doctor` read, and what
+// the listener report says (`listenerReport`, contract v1 §3.13; the
+// supervisor owns the reporter, the kit's `ListenerReporter` sends it):
+// `not_ready` when the start preflight fails, `ok` once connected with the
+// runtime healthy, `runs_failing` while the recheck after a failed run fails
+// (its reason) or the runtime check after a failed run fails
+// (`runtime_check_failed`, which changes neither `health()` nor the
+// hand-over), back to `ok` when a run completes or that check passes.
 
 const HEARTBEAT_MS = 30_000
 const STATUS_MS = 30_000
@@ -175,6 +184,13 @@ export interface IntegrationOptions {
   readonly runtimeCheckDeadlineMs?: number
   /** Injectable for tests: how soon the served texts are fetched again after a fetch (the kit's 24 h). */
   readonly textsRefreshMs?: number
+  /**
+   * The listener report for this agent (contract v1 §3.13): what this
+   * integration tells AgentChat about itself. The supervisor owns it, so it
+   * outlives an integration whose start failed, and gives it only to the
+   * integration that holds the agent lock. Absent, nothing is reported.
+   */
+  readonly listenerReport?: ListenerReportSink
 }
 
 type ProcessingFailureCounts = ReturnType<kit.ReceiveLoop['status']>['processingFailures']
@@ -288,6 +304,12 @@ export class Integration {
   private identityLine: IntegrationIdentityLine | null = null
   /** The follows of the identity line, one after another (each texts change queues one; a stop waits for the one in flight). */
   private follows: Promise<void> = Promise.resolve()
+  /** The socket's hello has been accepted since this integration started (a reconnect after it changes nothing). */
+  private connected = false
+  /** The recheck after a failed run failed, and the reason it gives (`runs_failing`); null when it passed or a run completed since. */
+  private recheckFailing: ListenerReasonKind | null = null
+  /** The runtime check after a failed run failed, and nothing has passed or completed since. */
+  private runtimeCheckFailing = false
 
   constructor(private readonly options: IntegrationOptions) {
     const { cfg, client } = options
@@ -346,6 +368,8 @@ export class Integration {
         // An accepted hello lifts a refusal: the key works again.
         this.lastError = null
         log.info(`socket ready (hello.ok) — acks ${this.realtime.ackNegotiated ? 'on receipt' : 'not negotiated by this server'}; ${this.realtime.capabilities.has('rewake') ? 'the server re-wakes unanswered cards' : 'this server does not re-wake unanswered cards'}`)
+        this.connected = true
+        this.reportListener()
       } else {
         idle(cfg.home)
         if (word === 'reconnecting') log.info('socket reconnecting — the SDK backs off and retries; it never gives up')
@@ -393,7 +417,18 @@ export class Integration {
       ok: false,
       detail: `preflight did not answer within ${Math.round(PREFLIGHT_DEADLINE_MS / 1000)} s`,
     }))
-    if (!pre.ok) throw new Error(`runtime (${this.options.runner.name}) not ready: ${pre.detail ?? 'unknown'}`)
+    if (!pre.ok) {
+      // It cannot start the runtime, so it does not connect: AgentChat says
+      // so (signed out, missing, too old) instead of a closed laptop. The
+      // supervisor keeps the reporter across its retries: one report, not one
+      // per retry.
+      if (!this.stopping) tellListener(this.options.listenerReport, 'not_ready', listenerReasonKindOf(pre.detail ?? ''))
+      throw new Error(`runtime (${this.options.runner.name}) not ready: ${pre.detail ?? 'unknown'}`)
+    }
+    // A `not_ready` an earlier start said is no longer true, connected or not
+    // yet: unsaid at once, so a socket that cannot connect is not re-sent
+    // every 30 minutes as a runtime that cannot start.
+    if (!this.stopping && this.options.listenerReport?.status().state === 'not_ready') tellListener(this.options.listenerReport, 'ok')
     log.info(
       `integration up as @${this.options.cfg.handle} via ${this.options.runner.name} (${this.options.client.runtime} ${this.options.client.version}), profile ${this.options.profile}; fetching the served texts, then holding the socket`,
     )
@@ -502,6 +537,7 @@ export class Integration {
         manual_version: texts?.manual.version ?? null,
       },
       identity_line: this.identityLine,
+      listener_report: listenerReportStatusOf(this.options.listenerReport),
       capabilities: status.socket === null ? null : status.socket.capabilities,
       intake_paused: status.socket === null ? null : status.socket.intakePaused,
       recent_cycles: status.recentCycles.map((cycle) => ({
@@ -678,6 +714,14 @@ export class Integration {
       const took = `${Math.round((Date.now() - startedAt) / 1000)} s`
       if (answer.ok) log.info(`runtime check ok (${this.options.runner.name}: the model answered, ${took}; output discarded)`)
       else if (!this.stopping) log.warn(`runtime check failed (${this.options.runner.name}, ${took}): ${answer.detail ?? 'no detail'} — a failed run is not reported as this conversation's`)
+      // The listener report only (a usage limit, a provider outage): runs
+      // fail and the runtime's own check fails too. `health()` and the
+      // hand-over to a standby do not change for it. A check cut short by the
+      // stop says nothing.
+      if (!this.stopping) {
+        this.runtimeCheckFailing = !answer.ok
+        this.reportListener()
+      }
       return answer.ok ? { ok: true } : { ok: false, ...(answer.detail !== undefined ? { detail: answer.detail } : {}) }
     } finally {
       this.recheckAbort.signal.removeEventListener('abort', onStop)
@@ -720,6 +764,10 @@ export class Integration {
       this.runsFailing = null
       // A new failure after a good run is a new problem: checked at once, not after the old window.
       this.lastRecheckAt = 0
+      // A run that completed is the best evidence the runtime works.
+      this.recheckFailing = null
+      this.runtimeCheckFailing = false
+      this.reportListener()
       return
     }
     this.failingSince ??= endedAt
@@ -746,15 +794,37 @@ export class Integration {
       const reason = `${this.options.runner.name}: ${pre.detail ?? 'its check failed'}`
       if (this.runsFailing?.reason !== reason) log.warn(`runs failing — ${reason} (since ${this.failingSince}, ${this.failingRuns} run(s) missed); status says so until a run succeeds`)
       this.runsFailing = { reason, since: this.failingSince, runs_missed: this.failingRuns, checked_at: checkedAt }
-    } else if (this.runsFailing !== null) {
-      // The runtime checks out again, but no run has succeeded yet.
-      this.runsFailing = {
-        ...this.runsFailing,
-        reason: `${this.options.runner.name} checks out now, but runs still fail${this.lastRun?.detail ? ` (last: ${this.lastRun.detail})` : ''}`,
-        checked_at: checkedAt,
+      // The reason from the check's own words (signed out, missing, too old), not the line above.
+      this.recheckFailing = listenerReasonKindOf(pre.detail ?? '')
+    } else {
+      if (this.runsFailing !== null) {
+        // The runtime checks out again, but no run has succeeded yet.
+        this.runsFailing = {
+          ...this.runsFailing,
+          reason: `${this.options.runner.name} checks out now, but runs still fail${this.lastRun?.detail ? ` (last: ${this.lastRun.detail})` : ''}`,
+          checked_at: checkedAt,
+        }
       }
+      // Its own check passes: the report says `runs_failing` only while one fails.
+      this.recheckFailing = null
     }
+    this.reportListener()
     this.writeStatus()
+  }
+
+  /**
+   * What the listener report says now, from what this integration knows:
+   * `runs_failing` while the recheck after a failed run fails (its reason)
+   * or the runtime check after one fails (`runtime_check_failed`), else
+   * `ok` once connected; before the first hello nothing new is said. Nothing
+   * once stopping: a stop is the supervisor's to report, or not.
+   */
+  private reportListener(): void {
+    const sink = this.options.listenerReport
+    if (sink === undefined || this.stopping) return
+    if (this.recheckFailing !== null) tellListener(sink, 'runs_failing', this.recheckFailing)
+    else if (this.runtimeCheckFailing) tellListener(sink, 'runs_failing', 'runtime_check_failed')
+    else if (this.connected) tellListener(sink, 'ok')
   }
 
   /**

@@ -13,6 +13,16 @@ The version number is set at the release step (`VERSIONING.md`).
 - `HostProfile.place` and `extraStatus` may return `{ lines, problem }`: a problem that keeps runs from having the AgentChat tools (said as `tools_missing`, in the host's words, and no listener is registered over it). A host that returns lines is unchanged.
 - `listenerReasonKindOf(detail)`: why a listener cannot start runs, in the server's `reason_kind` words (`not_signed_in`, `runtime_missing`, `runtime_outdated`, `runtime_check_failed`, `other`), from the runtime check's own words.
 - `newerRelease(a, b)` (what a host's implicit ensure uses so it never downgrades a newer registered service) and `daemonPidOf(home)` (the daemon that holds the home's lease).
+- **The listener tells AgentChat when it cannot do its job** (the listener report, contract v1 §3.13; needs `agentchatme` 1.11.0, which the release step moves the dependency to). A failed start or failing runs used to reach the server as nothing: a socket that looked healthy while every run failed, or a silence that looked like a closed laptop. The daemon now keeps the agent's `reachability` (and its person's dashboard) right through the SDK kit's `ListenerReporter`, under one listener id per identity home (`<home>/listener-id`, made by the first report):
+  - the start preflight fails (signed out, missing, too old): `not_ready`, with the reason `listenerReasonKindOf` reads from the check's words. One report for a condition that lasts, not one per retry: the reporter is kept across the start retries, and the kit re-sends it every 30 minutes;
+  - connected (the hello accepted) with the runtime healthy: `ok`. A later start whose preflight passes withdraws a `not_ready` at once;
+  - the recheck after a failed run fails: `runs_failing`, with the check's reason; it passing again, or a run that completes: `ok`;
+  - the runtime check after a failed conversation run fails (a usage limit, a provider outage): `runs_failing` with `runtime_check_failed`. `health()` and the hand-over to a standby do not change for it; a run that completes or a check that passes says `ok` again;
+  - only the home that holds the agent lock reports: a standby, a home that gave the agent up, a lost lock, a new identity and a daemon switched off send nothing, and a report under way is abandoned;
+  - a shutdown (SIGTERM: a service stop, a reboot) sends no `stopped`, so a machine coming back reads as offline meanwhile, not as uninstalled.
+
+  The status file keeps it as `listener_report`, and `status` says it in one line (what AgentChat has, or why it does not yet).
+- **`reportListenerStopped({ home, client, identity })`**: the commands that end the listener on purpose tell AgentChat `stopped` before the key or the service goes, so the agent reads as switched off. `logout` calls it; the integrations' `uninstall` and `daemon disable` call it before removing the service. One attempt, at most 5 s, never throws; skipped when no listener of the home ever reported, and for a standby (another live home holds the agent lock). `describeListenerStopped(result)` is the line to print. The daemon entry exports `createListenerReporter` and `ensureListenerInstanceId` for a host that builds an `Integration` itself.
 
 ### Changed
 
@@ -21,6 +31,12 @@ The version number is set at the release step (`VERSIONING.md`).
 - `register --email` / `recover --email` that sent a code end with `Setup: code_pending — …`, which names the code command (it replaces the bare `Run …` line).
 - A host with no listener of its own ends a sign-in with "Open a new session for the hosted AgentChat tools to pick up the key." (the false "the integration daemon follows the credential on its own" is gone).
 - The Codex preset's not-signed-in reason names the fix: ``codex login status failed: … (run `codex login` once and sign in)``.
+- `IdentityCommands.runLogout()` is async (`Promise<number>`): it reports `stopped` before the credential goes. A host that returns it from an async command handler needs no change.
+
+### Fixed
+
+- **A daemon whose start keeps failing no longer reads as one that is down.** The status file was written once when the start preflight failed (and again only when the message changed), so 3 minutes later `status` and `doctor` said "the daemon may be down" for a daemon that was alive and retrying under a backoff of up to 5 minutes. It is now rewritten on every retry, and every 30 s while nothing is served (a start backing off, signed out, switched off), with its `pid`.
+- The sign-up next-step lines handle the SDK's `connect` answer (a connector sign-up, from `agentchatme` 1.10): these commands never start one, so it adds no line. Without it the package does not build against the SDK it now needs.
 
 ## [0.7.3] — 2026-11-22
 

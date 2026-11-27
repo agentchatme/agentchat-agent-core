@@ -1,5 +1,6 @@
 import * as path from 'node:path'
 import * as fs from 'node:fs'
+import type { integration as kit } from 'agentchatme'
 import { log } from '../util/log.js'
 import { acquireLeaderLock } from '../daemon/leader-lock.js'
 import { acquireAgentLock, agentLockPath, agentLockRefusal, clearStandby, markStandby, standbyWaiting } from '../daemon/agent-lock.js'
@@ -15,6 +16,7 @@ import { isRunnerFactory, type RunRunner, type RunnerSource } from './runner.js'
 import { writeIntegrationStatus, type IntegrationRunsFailing, type IntegrationStandby, type IntegrationStatus, type IntegrationUnservable } from './status.js'
 import type { ManualPointer } from '../skill/manual.js'
 import type { AnchorLoadNote, AnchorServedLine } from '../anchor/follow.js'
+import { createListenerReporter, ensureListenerInstanceId, listenerReportStatusOf, type ListenerReportTiming } from './listener-report.js'
 
 // ─── The resident supervisor ────────────────────────────────────────────────
 //
@@ -41,6 +43,15 @@ import type { AnchorLoadNote, AnchorServedLine } from '../anchor/follow.js'
 // to SHUTDOWN_GRACE_MS for it before exiting. A daemon that exited at once
 // left the detached run orphaned, and the restarted daemon's connect found
 // the same tray and started a second run beside it.
+//
+// The listener report (contract v1 §3.13, `listener-report.ts`): one reporter
+// per identity, made when this home takes the agent lock and kept across its
+// start retries, so a runtime that keeps failing its preflight is one
+// `not_ready` (re-sent every 30 minutes by the kit), not one per retry. It is
+// stopped, with nothing sent, the moment this home does not hold the agent: a
+// standby, a give-up, a lost lock, a new identity, and a shutdown. SIGTERM is
+// a service stop or a reboot, never an uninstall: `stopped` is sent only by
+// the commands that end the listener on purpose (`reportListenerStopped`).
 
 /** How often to re-read the identity. A `stat`; the watcher usually beats it. */
 const POLL_MS = 5_000
@@ -54,6 +65,13 @@ const STANDBY_POLL_MS = 30_000
 const UNSERVABLE_RECHECK_MS = 60_000
 /** A home whose key the server refused tries again this much later (a new hello with the same key). */
 const BLOCKED_RETRY_MS = 5 * 60_000
+/**
+ * While nothing is served (signed out, switched off, a start that keeps
+ * failing under its backoff), the status file is still rewritten this often:
+ * `status` and `doctor` take a file older than 3 minutes for a daemon that is
+ * down, and a backoff runs to 5.
+ */
+const OFF_STATUS_REFRESH_MS = 30_000
 /**
  * How long a shutdown waits for an interrupted run to end before the process
  * exits. The runner SIGTERMs the run's process group at once and SIGKILLs 5 s
@@ -137,6 +155,10 @@ export interface RunIntegrationOpts {
   lease?: LeaseOptions
   /** Test seam: how long a give-up recheck waits for the runtime's preflight (`PREFLIGHT_DEADLINE_MS`). */
   preflightDeadlineMs?: number
+  /** Test seam: the listener reporter's timing (the kit's defaults otherwise: a second's coalescing, a minute between attempts). */
+  listenerReportTiming?: ListenerReportTiming
+  /** Test seam: while nothing is served, how often the status file is rewritten (30 s). */
+  offStatusRefreshMs?: number
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
@@ -224,6 +246,32 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
   if (opts.signal?.aborted === true) stopChecks.abort()
   else opts.signal?.addEventListener('abort', () => stopChecks.abort(), { once: true })
 
+  /** The listener report for the identity this home serves (its fingerprint), while this home holds the agent. */
+  let listener: { readonly fp: string; readonly reporter: kit.ListenerReporter } | null = null
+  /** This home's listener id: made on the first report; null when the home cannot keep one (then nothing is reported). */
+  let instanceId: string | null | undefined
+  /** Stop reporting, sending nothing (a report under way is abandoned): this home does not hold the agent now. */
+  const dropListener = (): void => {
+    listener?.reporter.stop()
+    listener = null
+  }
+  /** The reporter for this identity: the one kept across its start retries, or a new one. */
+  const listenerFor = async (cfg: DaemonConfig, fp: string): Promise<kit.ListenerReporter | null> => {
+    if (listener !== null && listener.fp === fp) return listener.reporter
+    dropListener()
+    if (instanceId === undefined) instanceId = await ensureListenerInstanceId(home)
+    if (instanceId === null) return null
+    const reporter = createListenerReporter({
+      apiKey: cfg.apiKey,
+      apiBase: cfg.apiBase,
+      client: opts.client,
+      instanceId,
+      ...(opts.listenerReportTiming !== undefined ? { timing: opts.listenerReportTiming } : {}),
+    })
+    listener = { fp, reporter }
+    return reporter
+  }
+
   // Taken for the PROCESS, not for a connection: one resident daemon per
   // identity home, signed in or not. A lease: should another daemon ever take
   // it (this one stalled past the lease), this one stands down and exits now.
@@ -238,7 +286,8 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
   lock.onLost((why) => {
     homeLost = why
     nudged = true
-    // At once, not at the loop's next tick: no wake may start a run meanwhile.
+    // At once, not at the loop's next tick: no wake may start a run meanwhile, and nothing is reported.
+    dropListener()
     starting?.stop()
     live?.stop()
     log.error(`lost this home's daemon lock (${why}) — another daemon serves ${home} now; this one exits`)
@@ -301,7 +350,12 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
     return count === 0 ? null : { count, last: agentLock?.lastRenewError ?? lock.lastRenewError }
   }
 
-  const offStatus = (handle: string | null): void =>
+  /** When the status file was last written while nothing is served, and for whom: what the refresh while waiting writes again. */
+  let offStatusAt = 0
+  let offStatusHandle: string | null = null
+  const offStatus = (handle: string | null): void => {
+    offStatusAt = Date.now()
+    offStatusHandle = handle
     writeIntegrationStatus(home, {
       version: 2,
       updated_at: new Date().toISOString(),
@@ -330,9 +384,13 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
       runs_failing: unservable?.runsFailing ?? null,
       unservable: unservable === null ? null : { reason: unservable.kind, detail: unservable.detail, since: unservable.since, retry_at: new Date(unservable.retryAt).toISOString() },
       lease_errors: leaseErrors(),
+      listener_report: listenerReportStatusOf(listener?.reporter),
     })
+  }
 
   const disconnect = (why: string): void => {
+    // This home stops serving the identity: nothing more is reported for it.
+    dropListener()
     if (live === null) return
     log.info(`${why} — disconnecting (a run in flight is interrupted), staying resident`)
     live.stop()
@@ -500,10 +558,13 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
           if (agentLock !== lease) return
           agentLost = why
           nudged = true
-          // At once, not at the loop's next tick: no wake may start a run meanwhile.
+          // At once, not at the loop's next tick: no wake may start a run meanwhile, and the listener that holds the agent now is the one that reports.
+          dropListener()
           starting?.stop()
           live?.stop()
         })
+        // This home holds the agent: it reports (the reporter kept across start retries for this identity).
+        const listenerReport = await listenerFor(cfg, fp)
         const runner = runnerFor(cfg, fp)
         lastRunner = runner
         const candidate = new Integration({
@@ -522,6 +583,7 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
           ...(opts.quietMs !== undefined ? { quietMs: opts.quietMs } : {}),
           ...(opts.maxMs !== undefined ? { maxMs: opts.maxMs } : {}),
           ...(opts.paceMs !== undefined ? { paceMs: opts.paceMs } : {}),
+          ...(listenerReport !== null ? { listenerReport } : {}),
           statusExtra: () => ({ lease_errors: leaseErrors() }),
         })
         starting = candidate
@@ -544,6 +606,9 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
         live = null
         liveFingerprint = null
         if (err instanceof StandbyError) {
+          // Another listener holds the agent, this home waits to serve again,
+          // or it is stopping: it reports nothing.
+          dropListener()
           // Standing by, or waiting to serve again: the status file is rewritten
           // every poll, so `status` never reads it as a daemon that is down.
           offStatus(cachedCfg?.cfg.handle ?? identityOf()?.handle ?? null)
@@ -552,12 +617,16 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
           // down, whatever. Stay resident and try again later — exiting would
           // just make the service manager restart us in a loop. Backed off and
           // de-duplicated so a condition that lasts days does not fill the log.
+          // The listener report is kept: the next retry is the same listener
+          // (a failed preflight said `not_ready` once, not once per retry).
           const msg = String(err instanceof Error ? err.message : err)
           if (msg !== lastFailure) {
             log.warn(`not connecting yet: ${msg}`)
             lastFailure = msg
-            offStatus(identityOf()?.handle ?? null)
           }
+          // On every retry, said or not: a daemon that keeps retrying is
+          // running, and its file must not age into "the daemon may be down".
+          offStatus(identityOf()?.handle ?? null)
           failures += 1
         }
         idle(home)
@@ -574,11 +643,18 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
     const deadline = Date.now() + waitMs
     while (!nudged && !shuttingDown && !opts.signal?.aborted && Date.now() < deadline) {
       await sleepUnless(opts.tickMs ?? TICK_MS, opts.signal)
+      // Nothing served (signed out, switched off, a start backing off): the
+      // status file still says, every 30 s, that this daemon runs.
+      if (live === null && Date.now() - offStatusAt >= (opts.offStatusRefreshMs ?? OFF_STATUS_REFRESH_MS)) offStatus(offStatusHandle)
     }
   }
 
   process.off('SIGINT', onSigint)
   process.off('SIGTERM', onSigterm)
+  // A shutdown is never an uninstall: nothing is sent (the machine coming
+  // back reads as offline meanwhile, not as switched off), and a report under
+  // way is abandoned.
+  dropListener()
   if (live !== null) {
     const ended = await live.stopAndWait(SHUTDOWN_GRACE_MS)
     if (!ended) log.warn(`a run in flight did not end within ${Math.round(SHUTDOWN_GRACE_MS / 1000)}s of being interrupted — exiting anyway`)
