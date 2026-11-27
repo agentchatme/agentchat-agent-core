@@ -204,10 +204,11 @@ describe('no printed step puts a key on a command line', () => {
     expect(out.join('\n')).not.toContain(HOME_KEY)
   })
 
-  it('the setup offer sends an existing key through the user’s own terminal, not a command the agent types', () => {
+  it('the setup offer sends an existing key through a file on stdin, never the conversation or a command line', () => {
     const block = renderUnregisteredBlock({ invoke: 'npx -y @agentchatme/codex', label: 'Codex' })
     expect(block).not.toMatch(/--api-key <ac|--api-key ac_/)
-    expect(block).toContain('npx -y @agentchatme/codex login')
-    expect(block).toMatch(/own terminal/)
+    expect(block).toContain('npx -y @agentchatme/codex login --api-key - < <that file>')
+    expect(block).toContain('the key never goes in this chat or on a command line')
+    expect(block).not.toMatch(/own terminal/)
   })
 })

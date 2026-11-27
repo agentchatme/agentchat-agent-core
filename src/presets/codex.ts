@@ -648,7 +648,8 @@ export class CodexRunner implements RunRunner {
     const runtime = await inspectCodexRuntime(this.options.codexHome, this.command, CODEX_PROBE_TIMEOUT_MS, options.signal)
     if (!runtime.ok) return { ok: false, detail: runtime.detail }
     const auth = await codexIsLoggedIn(this.options.codexHome, this.command, CODEX_PROBE_TIMEOUT_MS, options.signal)
-    if (!auth.ok) return { ok: false, detail: `codex login status failed: ${auth.detail}` }
+    // Says how it is signed in, for whoever reads it (status, doctor, the setup verdict): the person runs `codex login`.
+    if (!auth.ok) return { ok: false, detail: `codex login status failed: ${auth.detail}${auth.detail.includes('`codex login`') ? '' : ' (run `codex login` once and sign in)'}` }
     if (this.workdir() !== this.options.workdir && !this.warnedHome) {
       this.warnedHome = true
       log.warn(`the run workdir ${this.options.workdir} is your home folder or contains it: ${this.options.profile} runs work in ${this.workdir()} instead, so a peer-started run reaches none of your files there. Point the workdir at a folder of its own to choose another.`)

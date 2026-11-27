@@ -36,6 +36,53 @@ export interface DoctorContext {
 }
 
 /**
+ * A placement problem that keeps the agent's runs from having the AgentChat
+ * tools: the hosted tool server could not be registered, or a registration
+ * this integration did not write stands in its place. The setup verdict says
+ * it as `tools_missing`, in the host's words.
+ */
+export interface PlacementProblem {
+  /** What is wrong and what to do, in plain words that name the exact command, or what to ask the person. */
+  readonly text: string
+  /** The command to run next; absent: `doctor --fix` (or none, when only the person can resolve it). */
+  readonly command?: string
+  /** Only the person can resolve it (their own registration stands in the way: ask before touching it). */
+  readonly needsPerson?: boolean
+  /** What to ask the person, when `needsPerson`. */
+  readonly ask?: string
+  /** The facts, as found. */
+  readonly detail?: string
+}
+
+/** What `place` (and `extraStatus`) may return instead of bare lines: the lines, and the problem that blocks the tools, or null. */
+export interface PlacementReport {
+  readonly lines: string[]
+  readonly problem: PlacementProblem | null
+}
+
+/** Lines, or lines with a placement problem: a host that returns bare lines reports no problem. */
+export type PlacementOutput = string[] | PlacementReport
+
+/** A host's lines and problem, whichever shape it returned. */
+export function placementReportOf(output: PlacementOutput): PlacementReport {
+  return Array.isArray(output) ? { lines: output, problem: null } : { lines: output.lines, problem: output.problem ?? null }
+}
+
+/**
+ * What `ensureListener` did.
+ *
+ *   installed  registered now (it was missing, stale, or another release's);
+ *   current    already registered and current: nothing was done;
+ *   opted_out  the person switched it off (`daemon disable`, `uninstall`): nothing was done;
+ *   failed     it could not be registered (`detail` says why).
+ */
+export interface ListenerEnsure {
+  readonly outcome: 'installed' | 'current' | 'opted_out' | 'failed'
+  /** The service's name for `installed` / `current` (e.g. `agentchatd-claude-code`); why, for `failed`; null otherwise. */
+  readonly detail: string | null
+}
+
+/**
  * Everything the shared identity commands need to know about ONE coding agent.
  *
  * This is the seam. The register / login / recover / status / logout / doctor
@@ -105,9 +152,24 @@ export interface HostProfile {
    * or the cached one), or null when neither could be had — the host then
    * leaves the anchor for `doctor --fix` and says so. `manual` is what the
    * same texts announce (`syncManual` brings the skill file to it), or null.
-   * Returns report lines. When absent, only the anchor is written.
+   * Returns report lines, or the lines with the placement problem that keeps
+   * runs from having the AgentChat tools (`PlacementReport`): with a problem,
+   * the listener is not registered and the setup verdict is `tools_missing`.
+   * When absent, only the anchor is written.
    */
-  place?(handle: string, apiKey: string, identityLine: string | null, manual: ServedManual | null): string[] | Promise<string[]>
+  place?(handle: string, apiKey: string, identityLine: string | null, manual: ServedManual | null): PlacementOutput | Promise<PlacementOutput>
+  /**
+   * Have this host's listener service — the resident daemon that holds the
+   * socket and starts a run when a peer writes — registered and current,
+   * unless the person switched it off. Never throws. Called by the shared
+   * flow after `place`: register and recover on their code leg, login, and
+   * doctor --fix. A host that has it turns its listener on with
+   * `<invocation> daemon install`; the shared commands then wait for the
+   * listener to connect and say the setup verdict (`Setup: <state> — …`).
+   * Absent (a front door with no service of its own to place, such as the
+   * `agentchat` CLI): no listener is placed, waited for or judged.
+   */
+  ensureListener?(): ListenerEnsure | Promise<ListenerEnsure>
   /**
    * Undo `place` for the identity being signed out: remove the key from the
    * tool server registration and anything else that would still authenticate
@@ -126,9 +188,11 @@ export interface HostProfile {
   /**
    * Host-specific `status` lines (placement, probes), printed after the shared
    * ones in text mode. The served identity line and manual come along so the
-   * host does not fetch `/v1/texts` a second time.
+   * host does not fetch `/v1/texts` a second time. May return the lines with
+   * the placement problem its checks found (`PlacementReport`), which the
+   * setup verdict says as `tools_missing`.
    */
-  extraStatus?(context: StatusContext): string[] | Promise<string[]>
+  extraStatus?(context: StatusContext): PlacementOutput | Promise<PlacementOutput>
   /** Extra lines printed after a successful logout. */
   logoutHints?(): string[]
 }

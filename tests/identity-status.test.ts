@@ -120,9 +120,13 @@ describe('status when getMe fails', () => {
 
     expect(await commands.runStatus({})).toBe(1)
 
-    expect(err.join('\n')).toContain("AgentChat refused this agent's key (UNAUTHORIZED: Invalid API key)")
-    expect(err.join('\n')).not.toMatch(/could not reach/i)
-    expect(err.join('\n')).toContain('npx -y @agentchatme/claude-code login')
+    // First line: the verdict — a refused key, said as such, with what to ask and the commands.
+    expect(err).toEqual([])
+    expect(out.join('\n').split('\n')[0]).toMatch(/^Setup: key_refused — AgentChat refuses the key stored for @probe \(UNAUTHORIZED: Invalid API key\)\./)
+    const first = out.join('\n').split('\n')[0] ?? ''
+    expect(first).toContain('npx -y @agentchatme/claude-code login --api-key - < <that file>')
+    expect(first).toContain('npx -y @agentchatme/claude-code recover --handle probe --email <email>')
+    expect(first).not.toMatch(/could not reach/i)
     const text = out.join('\n')
     expect(text).toContain('@probe — key refused (HTTP 401)')
     expect(text).toContain('Integration: socket blocked')
@@ -137,8 +141,9 @@ describe('status when getMe fails', () => {
 
     expect(await commands.runStatus({})).toBe(1)
 
-    expect(err.join('\n')).toContain('Could not reach AgentChat')
-    expect(err.join('\n')).not.toContain('refused')
+    expect(err).toEqual([])
+    expect(out.join('\n').split('\n')[0]).toBe('Setup: unreachable — AgentChat could not be reached from this computer (fetch failed). Check the network, then run `npx -y @agentchatme/claude-code status` again.')
+    expect(out.join('\n')).not.toContain('refused')
     expect(out.join('\n')).toContain('AgentChat unreachable')
     expect(out.join('\n')).toContain('Integration: socket reconnecting')
   })

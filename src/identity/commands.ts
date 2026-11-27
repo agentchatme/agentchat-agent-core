@@ -19,7 +19,39 @@ import { describeIdentityBlock, identityBlockState, type AnchorLoadNote, type Id
 import { traySummary } from '../integration/tray.js'
 import { loadTexts, readCachedTexts } from '../integration/texts.js'
 import { identityLineOf } from '../skill/identity-line.js'
-import { anchorLabelOf, type DoctorCheck, type HostProfile, type StatusContext, type Verdict } from './host-profile.js'
+import {
+  anchorLabelOf,
+  placementReportOf,
+  type DoctorCheck,
+  type HostProfile,
+  type ListenerEnsure,
+  type PlacementProblem,
+  type PlacementReport,
+  type StatusContext,
+  type Verdict,
+} from './host-profile.js'
+import { alwaysOnOptedOut } from '../daemon/health.js'
+import {
+  codeCommandOf,
+  codeMayWork,
+  daemonPidOf,
+  formatSetupVerdict,
+  listenerReasonKindOf,
+  reachabilityOf,
+  readListener,
+  resendLeftS,
+  runLine,
+  serviceDryRun,
+  setupVerdict,
+  shellValue,
+  startCommandOf,
+  VERIFY_STEP,
+  type ListenerReading,
+  type ServerView,
+  type SetupInputs,
+  type SetupVerdict,
+  type SignupInput,
+} from './setup.js'
 import { clientIdentityOf } from '../client-identity.js'
 import {
   REPEATED_FAILED_CYCLES,
@@ -136,14 +168,6 @@ function recoverUsage(invocation: string): string {
 type AccountKind = kit.AccountKind
 type StepResult = kit.AccountStepResult
 
-/** What a start call sends: what was typed, trimmed (the server judges it). */
-interface SignupInput {
-  email: string
-  handle?: string
-  display_name?: string
-  description?: string
-}
-
 function emailInput(raw: string | undefined): string | undefined {
   const email = raw?.trim().toLowerCase()
   return email ? email : undefined
@@ -153,47 +177,6 @@ function emailInput(raw: string | undefined): string | undefined {
 function handleInput(raw: string | undefined): string | undefined {
   const handle = raw?.trim().replace(/^@/, '').toLowerCase()
   return handle ? handle : undefined
-}
-
-/** The step that answers a pending code of each kind (`next_step` while the code is pending). */
-const VERIFY_STEP: Readonly<Record<AccountKind, string>> = { register: 'verify', recover: 'recover_verify' }
-
-/** A flag value as a shell takes it: bare when plain, else in double quotes. */
-function shellValue(value: string): string {
-  return /^[A-Za-z0-9@%+=:,./_-]+$/.test(value) ? value : JSON.stringify(value)
-}
-
-function receivedAtMs(pending: PendingSignup): number | null {
-  const at = Date.parse(pending.received_at)
-  return Number.isFinite(at) ? at : null
-}
-
-/**
- * Whether the code a pending record holds may still work: until
- * `expires_in_s` from its answer, else until `expires_at`. Unknown counts as
- * yes; the server says so when the code is gone.
- */
-function codeMayWork(pending: PendingSignup, now = Date.now()): boolean {
-  const received = receivedAtMs(pending)
-  if (pending.flow.expires_in_s !== undefined && received !== null) return received + pending.flow.expires_in_s * 1000 > now
-  if (pending.flow.expires_at !== undefined) {
-    const at = Date.parse(pending.flow.expires_at)
-    if (Number.isFinite(at)) return at > now
-  }
-  return true
-}
-
-/** Seconds left of the pending answer's `resend_after_s`: until a new code may be sent to that email (0: now). */
-function resendLeftS(pending: PendingSignup | null, now = Date.now()): number {
-  if (pending === null || pending.flow.resend_after_s === undefined) return 0
-  const received = receivedAtMs(pending)
-  if (received === null) return 0
-  return Math.max(0, Math.ceil((pending.flow.resend_after_s * 1000 - (now - received)) / 1000))
-}
-
-/** "Run `cmd`", after a wait when there is one. */
-function runLine(command: string, waitS = 0): string {
-  return waitS > 0 ? `Wait ${waitS} s, then run \`${command}\`` : `Run \`${command}\``
 }
 
 /**
@@ -214,8 +197,39 @@ async function askOnTerminal(question: kit.AccountQuestion): Promise<kit.Account
   return { answer: 'value', value: (question.field === 'handle' ? handleInput(answer) : emailInput(answer)) ?? '' }
 }
 
-const NEXT_HINT =
-  'Open a new session for the hosted AgentChat tools to pick up the key; the integration daemon follows the credential on its own.'
+/**
+ * For a host with no listener of its own (`ensureListener` absent): the one
+ * thing a sign-in leaves. A host with one says the setup verdict instead.
+ */
+const SESSION_HINT = 'Open a new session for the hosted AgentChat tools to pick up the key.'
+
+/** How long an account command waits for the listener to connect: the daemon follows a new key within 5 s, then checks its runtime and opens the socket. */
+export const SETUP_WAIT_MS = 30_000
+const SETUP_POLL_MS = 500
+/** When the listener says it is connected and AgentChat does not see it yet: ask again this many times, a second apart. */
+const REACHABILITY_RETRIES = 3
+
+/** Test seams for `createIdentityCommands`. */
+export interface IdentityCommandOptions {
+  /** How long account commands wait for the listener to connect (default `SETUP_WAIT_MS`). */
+  setupWaitMs?: number
+  /** How often the wait looks (default 500 ms). */
+  setupPollMs?: number
+  /** Whether no service manager is used, so no listener will start and nothing is waited for (default: `AGENTCHAT_SERVICE_DRY_RUN`). */
+  serviceDryRun?: boolean
+}
+
+/** What `confirmSetup` takes from a host's install. */
+export interface ConfirmSetupOptions {
+  /** What the install's `ensureListener` did, or null when it did not run (a placement step failed). */
+  ensure?: ListenerEnsure | null
+  /** A placement problem that keeps runs from having the AgentChat tools. */
+  tools?: PlacementProblem | null
+  /** The daemon pid that held the home's lease before the install's `ensureListener` (`daemonPidOf`): after `installed`, what it wrote is not the new process's word. */
+  replacedPid?: number | null
+}
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)))
 
 export interface RegisterOpts {
   email?: string
@@ -253,10 +267,16 @@ export interface IdentityCommands {
   runStatus(opts: { json?: boolean }): Promise<number>
   runLogout(): number
   runDoctor(opts?: DoctorOpts): Promise<number>
+  /**
+   * For a host's install: wait for the listener when there is an identity and
+   * it was registered (`ensure`), then print the setup verdict as the last
+   * line. Returns the verdict, or null when there is none to say.
+   */
+  confirmSetup(opts?: ConfirmSetupOptions): Promise<SetupVerdict | null>
 }
 
 /** Build the identity command set for one coding agent. */
-export function createIdentityCommands(profile: HostProfile): IdentityCommands {
+export function createIdentityCommands(profile: HostProfile, options: IdentityCommandOptions = {}): IdentityCommands {
   const invocation = (): string => profile.invocation()
   const LABEL = profile.label
   const clientIdentity = clientIdentityOf(profile.client)
@@ -299,31 +319,32 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
     return loaded === null ? NO_TEXTS : contextOf(loaded.texts)
   }
 
-  /** The host's extra `status` lines, with the texts already fetched. */
-  async function printExtraStatus(context: StatusContext): Promise<void> {
-    if (profile.extraStatus === undefined) return
+  /** The host's extra `status` lines (and the placement problem its checks found), with the texts already fetched. */
+  async function extraStatusOf(context: StatusContext): Promise<PlacementReport> {
+    if (profile.extraStatus === undefined) return { lines: [], problem: null }
     try {
-      for (const line of await profile.extraStatus(context)) console.log(line)
+      return placementReportOf(await profile.extraStatus(context))
     } catch (err) {
-      console.log(`  (host status failed: ${err instanceof Error ? err.message : String(err)})`)
+      return { lines: [`  (host status failed: ${err instanceof Error ? err.message : String(err)})`], problem: null }
     }
   }
 
   /**
    * Place the integration for THIS agent's new key: the identity line, the
    * manual, the hosted tool server with the key. A profile without `place`
-   * gets the anchor alone (the identity line in its instruction file).
+   * gets the anchor alone (the identity line in its instruction file). The
+   * report carries the host's placement problem, if it named one.
    */
-  async function placeIdentity(handle: string, apiKey: string, apiBase: string): Promise<string[]> {
+  async function placeIdentity(handle: string, apiKey: string, apiBase: string): Promise<PlacementReport> {
     const { identityLine, manual } = await served(apiKey, apiBase)
     if (profile.place !== undefined) {
       try {
-        return await profile.place(handle, apiKey, identityLine, manual)
+        return placementReportOf(await profile.place(handle, apiKey, identityLine, manual))
       } catch (err) {
-        return [`  placement FAILED — ${String(err)}; repair with \`${invocation()} doctor --fix\``]
+        return { lines: [`  placement FAILED — ${String(err)}; repair with \`${invocation()} doctor --fix\``], problem: null }
       }
     }
-    return writeOurAnchor(handle, identityLine)
+    return { lines: writeOurAnchor(handle, identityLine), problem: null }
   }
 
   /** Write THIS agent's anchor. Only ever touches `profile.anchorFile()`. */
@@ -357,20 +378,160 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
 
   /** The command that starts `kind` again, sending `input`; `blank` leaves that field for the person to fill in. */
   function startCommand(kind: AccountKind, input: SignupInput, blank?: 'email' | 'handle'): string {
-    const email = blank === 'email' ? '<email>' : shellValue(input.email)
-    const handle = blank === 'handle' ? '<handle>' : input.handle !== undefined ? shellValue(input.handle) : null
-    if (kind === 'recover') return `${invocation()} recover${handle !== null ? ` --handle ${handle}` : ''} --email ${email}`
-    return [
-      `${invocation()} register --email ${email} --handle ${handle ?? '<handle>'}`,
-      ...(input.display_name !== undefined ? [`--display-name ${shellValue(input.display_name)}`] : []),
-      ...(input.description !== undefined ? [`--description ${shellValue(input.description)}`] : []),
-    ].join(' ')
+    return startCommandOf(invocation(), kind, input, blank)
   }
 
   /** The command that answers a pending code: with `code`, or a placeholder of the server's `code_length`. */
   function codeCommand(kind: AccountKind, flow: SignupFlow, code?: string): string {
-    const value = code !== undefined ? shellValue(code) : flow.code_length !== undefined ? `<${flow.code_length} digits>` : '<code>'
-    return `${invocation()} ${kind} --code ${value}`
+    return codeCommandOf(invocation(), kind, flow, code)
+  }
+
+  // ─── The setup verdict, and the wait for the listener ─────────────────────
+
+  /** What every verdict of this host shares. */
+  function verdictBase(): Pick<SetupInputs, 'invocation' | 'label' | 'version' | 'home'> {
+    return { invocation: invocation(), label: LABEL, version: profile.client.version, home: profile.home() }
+  }
+
+  /** The host's `ensureListener`, once, never throwing; null for a host without one. The person's opt-out is checked here too, whatever the host does. */
+  async function ensureListenerOnce(): Promise<ListenerEnsure | null> {
+    if (profile.ensureListener === undefined) return null
+    if (alwaysOnOptedOut(profile.home())) return { outcome: 'opted_out', detail: null }
+    try {
+      return await profile.ensureListener()
+    } catch (err) {
+      return { outcome: 'failed', detail: errorText(err) }
+    }
+  }
+
+  function listenerLine(ensure: ListenerEnsure): string {
+    switch (ensure.outcome) {
+      case 'installed':
+        return `  listener: registered${ensure.detail ? ` (${ensure.detail})` : ''}`
+      case 'current':
+        return `  listener: already registered${ensure.detail ? ` (${ensure.detail})` : ''}`
+      case 'opted_out':
+        return `  listener: off — switched off by the person you work with (\`${invocation()} daemon install\` turns it on)`
+      case 'failed':
+        return `  listener: FAILED — ${ensure.detail ?? 'no reason given'}`
+    }
+  }
+
+  /** A failed `GET /v1/agents/me`, as the verdict reads it. */
+  function serverViewOfError(err: unknown): ServerView {
+    const status = httpStatusOf(err)
+    const code = (err as { code?: unknown } | null)?.code
+    const detail = describeApiError(err)
+    if (status === 403 && code === 'SUSPENDED') return { kind: 'suspended', detail }
+    if (status === 401 || status === 403) return { kind: 'refused', detail }
+    return { kind: 'unreachable', detail }
+  }
+
+  /**
+   * Whether the listener has said what it will say for this key: connected,
+   * standing by, off, refused, or stopped at what only the person can fix (a
+   * runtime signed out, missing or too old). Any other start failure (the
+   * network, say) is retried by the daemon within seconds: waited out.
+   */
+  function listenerSettled(r: ListenerReading): boolean {
+    const d = r.daemon
+    if (d.kind === 'start_failure') return listenerReasonKindOf(d.detail) !== 'other'
+    return r.optedOut || d.kind === 'ready' || d.kind === 'standby' || d.kind === 'unservable' || d.kind === 'off' || d.kind === 'blocked'
+  }
+
+  /**
+   * Wait (bounded) for the listener to connect as `handle`: it follows a new
+   * key on its own within seconds. Ends early once it has said anything for
+   * this key — connected, standing by, or stopped at its runtime check.
+   */
+  async function waitForListener(handle: string, replacedPid: number | null): Promise<ListenerReading> {
+    const home = profile.home()
+    const read = (): ListenerReading => readListener(home, handle, { replacedPid })
+    const budget = options.setupWaitMs ?? SETUP_WAIT_MS
+    const poll = options.setupPollMs ?? SETUP_POLL_MS
+    const started = Date.now()
+    console.log(`Waiting up to ${Math.round(budget / 1000)} s for the listener to connect as @${handle}…`)
+    let reading = read()
+    while (!listenerSettled(reading) && Date.now() - started < budget) {
+      await sleep(Math.min(poll, budget - (Date.now() - started)))
+      reading = read()
+    }
+    const took = `${Math.max(1, Math.ceil((Date.now() - started) / 1000))} s`
+    const kind = reading.daemon.kind
+    console.log(
+      kind === 'ready'
+        ? `  listener: connected after ${took}`
+        : kind === 'standby'
+          ? `  listener: another listener on this computer serves @${handle} (after ${took})`
+          : listenerSettled(reading)
+            ? `  listener: not connected (after ${took})`
+            : `  listener: not connected after ${Math.round(budget / 1000)} s`,
+    )
+    return reading
+  }
+
+  /**
+   * After a key was saved and placed, or after install: wait for the listener
+   * when this command registered it, ask the server once (its
+   * `reachability`), and print the verdict as the last line. Right after a
+   * sign-in the server has just accepted the key, so a failed ask then reads
+   * as "no reachability", not as an unreachable server.
+   */
+  async function confirm(opts: { ensure: ListenerEnsure | null; tools: PlacementProblem | null; afterSignIn: boolean; replacedPid?: number | null }): Promise<SetupVerdict | null> {
+    const home = profile.home()
+    const identity = resolveIdentity(home)
+    const pending = readPending(home)
+    const base = { ...verdictBase(), pending, ensure: opts.ensure, tools: opts.tools, afterSignIn: opts.afterSignIn }
+    if (identity === null) {
+      const verdict = setupVerdict({ ...base, identity: null, server: null, listener: null })
+      if (verdict !== null) console.log(formatSetupVerdict(verdict))
+      return verdict
+    }
+    const hasListener = profile.ensureListener !== undefined
+    // Nothing more this host can judge once the key works: no listener of its own, and the tools in place.
+    if (!hasListener && opts.tools === null && opts.afterSignIn) return null
+    const registered = opts.ensure?.outcome === 'installed' || opts.ensure?.outcome === 'current'
+    const canWait = hasListener && identity.handle !== null && opts.tools === null && registered && !(options.serviceDryRun ?? serviceDryRun())
+    // Registered again just now: what the process it replaced wrote is not the new one's word.
+    const replacedPid = opts.ensure?.outcome === 'installed' ? (opts.replacedPid ?? null) : null
+    const readOpts = { replacedPid }
+    let reading: ListenerReading | null = hasListener ? (canWait ? await waitForListener(identity.handle!, replacedPid) : readListener(home, identity.handle, readOpts)) : null
+    let verdict: SetupVerdict | null = null
+    for (let attempt = 0; ; attempt++) {
+      let server: ServerView
+      try {
+        const me = await apiClient(identity.apiKey, identity.apiBase).getMe()
+        server = { kind: 'ok', handle: me.handle, reachability: reachabilityOf(me) }
+      } catch (err) {
+        server = opts.afterSignIn ? { kind: 'ok', handle: identity.handle ?? '?', reachability: null } : serverViewOfError(err)
+      }
+      if (hasListener && server.kind === 'ok' && server.handle !== identity.handle) reading = readListener(home, server.handle, readOpts)
+      verdict = setupVerdict({ ...base, identity: { handle: identity.handle, source: identity.source }, server, listener: reading })
+      // Connected a moment ago and AgentChat does not see it yet: ask again, briefly.
+      if (!(canWait && verdict?.state === 'listener_starting' && reading?.daemon.kind === 'ready' && attempt < REACHABILITY_RETRIES)) break
+      await sleep(1_000)
+    }
+    if (verdict !== null) console.log(formatSetupVerdict(verdict))
+    return verdict
+  }
+
+  /**
+   * Right after `place` in every account command that saved a key: the
+   * listener, unless the tools are not in place (a listener whose runs have
+   * no tools would only fail). Returns what was done and the line that says
+   * it, printed with the placement lines.
+   */
+  async function placeListener(tools: PlacementProblem | null): Promise<{ ensure: ListenerEnsure | null; lines: string[]; replacedPid: number | null }> {
+    // The daemon running now, if any: registering the service again replaces it.
+    const replacedPid = daemonPidOf(profile.home())
+    if (profile.ensureListener === undefined) return { ensure: null, lines: [], replacedPid }
+    if (tools !== null) return { ensure: null, lines: ['  listener: not registered until the AgentChat tools are in place (below)'], replacedPid }
+    const ensure = await ensureListenerOnce()
+    return { ensure, lines: ensure !== null ? [listenerLine(ensure)] : [], replacedPid }
+  }
+
+  async function confirmSetup(opts: ConfirmSetupOptions = {}): Promise<SetupVerdict | null> {
+    return confirm({ ensure: opts.ensure ?? null, tools: opts.tools ?? null, afterSignIn: false, replacedPid: opts.replacedPid ?? null })
   }
 
   /**
@@ -452,18 +613,24 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
     // ever sign out, the setup offer should be free to appear again.
     clearOfferDeclined(home)
     const placed = await placeIdentity(handle, apiKey, apiBase)
+    const listener = await placeListener(placed.problem)
+    // A host with a listener says what is left as the setup verdict (last line); one without, the one hint.
+    const hint = profile.ensureListener === undefined ? [SESSION_HINT] : []
     const lines =
       kind === 'register'
         ? [
             `API key for @${handle} stored at ${credentialsPath(home)} (never commit this file).`,
-            ...placed,
+            ...placed.lines,
+            ...listener.lines,
             '',
             `This handle belongs to your ${LABEL} agent. Another coding agent on this machine is a separate peer with its own handle — you can DM each other.`,
             `Other agents can DM you at @${handle}. Check \`${invocation()} status\` any time.`,
-            NEXT_HINT,
+            ...hint,
           ]
-        : [`New API key for @${handle} stored at ${credentialsPath(home)} (never commit this file).`, ...placed, NEXT_HINT]
+        : [`New API key for @${handle} stored at ${credentialsPath(home)} (never commit this file).`, ...placed.lines, ...listener.lines, ...hint]
     console.log([...(message !== null && message.length > 0 ? [message] : []), ...lines].join('\n'))
+    // The key is saved: whatever the listener does next, the command did what it was asked (exit 0).
+    await confirm({ ensure: listener.ensure, tools: placed.problem, afterSignIn: true, replacedPid: listener.replacedPid })
     return 0
   }
 
@@ -496,15 +663,19 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
       return 1
     }
     if (result.action === 'ask_code') {
-      writePending(home, {
+      const pending: PendingSignup = {
         kind,
         flow: result.flow,
         received_at: new Date().toISOString(),
         ...input,
         ...(apiBase !== DEFAULT_API_BASE ? { api_base: apiBase } : {}),
-      })
+      }
+      writePending(home, pending)
+      // The code is on its way: the verdict for this step (`code_pending`) names the command that answers it.
+      const verdict = setupVerdict({ ...verdictBase(), identity: null, pending, server: null, listener: null })
+      return report(result, verdict?.state === 'code_pending' ? [formatSetupVerdict(verdict)] : nextSteps(kind, result, 'start', input, undefined, held), true)
     }
-    return report(result, nextSteps(kind, result, 'start', input, undefined, held), result.action === 'ask_code')
+    return report(result, nextSteps(kind, result, 'start', input, undefined, held), false)
   }
 
   /** Answer the pending code: one verify call, then keep, refresh or drop the flow as the answer says. */
@@ -650,7 +821,7 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
         console.log('Using the key from AGENTCHAT_API_KEY.')
       } else if (process.stdin.isTTY !== true) {
         console.error(
-          `Missing API key. Run \`${invocation()} login\` in a terminal and paste the key when it asks, or pipe it in from a file: \`${invocation()} login --api-key - < key.txt\`. Never put the key itself on a command line: \`ps\` and shell history can see it there.`,
+          `Missing API key. If an AgentChat answer gave you the key, write it alone into a file with your file-editing tool; if the person you work with holds it, ask them to save it into a file and tell you where (never to paste it into a conversation). Then run \`${invocation()} login --api-key - < <that file>\` and delete the file. A person at a terminal can run \`${invocation()} login\` and paste it when it asks. Never put the key itself on a command line: \`ps\` and shell history can see it there.`,
         )
         return 1
       } else {
@@ -681,19 +852,24 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
       created_at: new Date().toISOString(),
     })
     clearOfferDeclined(home)
+    const placed = await placeIdentity(check.handle, apiKey, apiBase)
+    const listener = await placeListener(placed.problem)
     console.log(
       [
         `Signed in as @${check.handle} for ${LABEL}.`,
         `API key stored at ${credentialsPath(home)} (never commit this file).`,
-        ...(await placeIdentity(check.handle, apiKey, apiBase)),
-        NEXT_HINT,
+        ...placed.lines,
+        ...listener.lines,
+        ...(profile.ensureListener === undefined ? [SESSION_HINT] : []),
         ...(onArgv
           ? [
-              `Note: the key was on this command line, where \`ps\` and shell history can see it. Next time run \`${invocation()} login\` and paste it, or pipe it in: \`${invocation()} login --api-key - < key.txt\`.`,
+              `Note: the key was on this command line, where \`ps\` and shell history can see it. Next time write it into a file with your file-editing tool and pipe it in: \`${invocation()} login --api-key - < <that file>\` (or run \`${invocation()} login\` in a terminal and paste it).`,
             ]
           : []),
       ].join('\n'),
     )
+    // The key is saved: whatever the listener does next, the command did what it was asked (exit 0).
+    await confirm({ ensure: listener.ensure, tools: placed.problem, afterSignIn: true, replacedPid: listener.replacedPid })
     return 0
   }
 
@@ -790,7 +966,11 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
     const pending = readPending(home)
     const integration = readIntegrationStatus(home)
 
+    const listenerOf = (handle: string | null): ListenerReading | null => (profile.ensureListener !== undefined ? readListener(home, handle) : null)
+
     if (identity === null) {
+      // No account yet: the verdict says how to get one (or the code that is waiting).
+      const setup = setupVerdict({ ...verdictBase(), identity: null, pending, server: null, listener: null })
       if (opts.json) {
         console.log(
           JSON.stringify({
@@ -799,20 +979,11 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
             pending: pending !== null,
             pending_kind: pending?.kind ?? null,
             integration,
+            setup,
           }),
         )
-      } else if (pending !== null) {
-        const what =
-          pending.kind === 'recover'
-            ? `an account recovery${pending.handle !== undefined ? ` for @${pending.handle}` : ''}`
-            : `a registration for @${pending.handle ?? '?'}`
-        console.log(
-          codeMayWork(pending)
-            ? `No identity yet, but ${what} is waiting on its emailed code — finish with: ${codeCommand(pending.kind, pending.flow)}`
-            : `No identity yet; the code for ${what} has expired — for a new one, run: ${startCommand(pending.kind, pending)}`,
-        )
-      } else {
-        console.log(`No AgentChat identity for this ${LABEL} agent. Set one up with: ${invocation()} register`)
+      } else if (setup !== null) {
+        console.log(formatSetupVerdict(setup))
       }
       return 0
     }
@@ -828,6 +999,8 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
       const status = httpStatusOf(err)
       const refused = status === 401 || status === 403
       const detail = describeApiError(err)
+      const server = serverViewOfError(err)
+      const setup = setupVerdict({ ...verdictBase(), identity: { handle: identity.handle, source: identity.source }, pending, server, listener: listenerOf(identity.handle) })
       if (opts.json) {
         const offline = anchorView(anchorFile, NO_TEXTS, null)
         console.log(
@@ -842,29 +1015,28 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
             anchor: offline.present,
             anchor_error: offline.error,
             integration,
+            setup,
           }),
         )
       } else {
-        console.error(
-          refused
-            ? `AgentChat refused this agent's key (${detail}). Sign in with a current key: \`${invocation()} login\`; lost it? \`${recoverUsage(invocation())}\`.`
-            : `Could not reach AgentChat: ${detail}`,
-        )
         // The server did not answer, so no texts fetch either: the block and the
         // host's checks are read against the identity-home cache (what a fetch
         // would have fallen back to), or without texts when nothing is cached.
         const cached = readCachedTexts(home, profile.client.runtime)
         const context = cached === null ? NO_TEXTS : contextOf(cached.texts)
+        const extra = await extraStatusOf(context)
         console.log(
           [
+            // First: what this means and what to do (a refused key is not an unreachable server).
+            ...(setup !== null ? [formatSetupVerdict(setup)] : []),
             `${identity.handle !== null ? `@${identity.handle}` : 'This agent'} — ${refused ? `key refused (HTTP ${status})` : 'AgentChat unreachable'}  (${LABEL})`,
             `Key source: ${identity.source} (${identity.source === 'file' ? credentialsPath(home) : 'AGENTCHAT_API_KEY'})`,
             `API: ${identity.apiBase}`,
             ...(anchorFile === null ? [] : [`Identity line: ${anchorWords(anchorFile, anchorView(anchorFile, context, identity.handle))}`]),
             ...formatIntegrationStatus(integration),
+            ...extra.lines,
           ].join('\n'),
         )
-        await printExtraStatus(context)
       }
       return 1
     }
@@ -872,6 +1044,16 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
     const tray = await traySummary(client).catch(() => null)
     const texts = await served(identity.apiKey, identity.apiBase)
     const anchor = anchorView(anchorFile, texts, me.handle)
+    // The host's lines, and the placement problem its checks found (the verdict says it).
+    const extra = await extraStatusOf(texts)
+    const setup = setupVerdict({
+      ...verdictBase(),
+      identity: { handle: identity.handle, source: identity.source },
+      pending,
+      server: { kind: 'ok', handle: me.handle, reachability: reachabilityOf(me) },
+      listener: listenerOf(me.handle),
+      tools: extra.problem,
+    })
 
     if (opts.json) {
       console.log(
@@ -894,6 +1076,8 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
           /** Why the runtime does not load the instruction file now, or null. */
           anchor_not_loaded: anchor.state?.notLoaded ?? null,
           integration,
+          /** Whether setup is done and what is left (`setupVerdict`); null when this host has nothing to judge. */
+          setup,
         }),
       )
     } else {
@@ -903,6 +1087,7 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
           : `Tray: ${tray.waiting}${tray.truncated ? '+' : ''} conversation(s) waiting${tray.deferred > 0 ? `, ${tray.deferred} deferred` : ''}`
       console.log(
         [
+          ...(setup !== null ? [formatSetupVerdict(setup)] : []),
           `@${me.handle} — ${me.status ?? 'active'}  (${LABEL})`,
           trayLine,
           `Key source: ${identity.source} (${identity.source === 'file' ? credentialsPath(home) : 'AGENTCHAT_API_KEY'})`,
@@ -913,9 +1098,9 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
                 `Identity line: ${anchorWords(anchorFile, anchor)}`,
               ]),
           ...formatIntegrationStatus(integration),
+          ...extra.lines,
         ].join('\n'),
       )
-      await printExtraStatus(texts)
     }
     return 0
   }
@@ -1021,7 +1206,7 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
     // does not load the file is said too, not written around.
     const repairable = before.state === 'missing' || before.state === 'setup_offer' || before.state === 'stale'
     if (fix && repairable) {
-      const report = await placeIdentity(creds.handle, creds.api_key, apiBase)
+      const report = (await placeIdentity(creds.handle, creds.api_key, apiBase)).lines
       const failed = report.some((l) => l.includes('FAILED') || l.includes('not written'))
       if (failed) return { name: 'identity-line', verdict: 'FAIL', detail: `could not repair: ${report.join('; ')}` }
       // Said repaired only when the file now reads as repaired.
@@ -1092,6 +1277,18 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
           : { name: 'texts', verdict: 'PASS', detail: 'served texts in hand' },
       )
       if (anchorFile !== null) checks.push(await identityLineCheck(anchorFile, creds, apiBase, texts, opts.fix === true))
+    }
+
+    // --fix places the listener too, as install does (with or without an
+    // identity: it idles until one appears), unless the person switched it
+    // off. Said only when it did something: the host's own service check
+    // reports a listener that is current or switched off.
+    if (opts.fix === true && profile.ensureListener !== undefined) {
+      const ensure = await ensureListenerOnce()
+      if (ensure?.outcome === 'installed') checks.push({ name: 'listener', verdict: 'PASS', detail: `registered${ensure.detail ? ` (${ensure.detail})` : ''}` })
+      else if (ensure?.outcome === 'failed') {
+        checks.push({ name: 'listener', verdict: 'FAIL', detail: `could not be registered: ${ensure.detail ?? 'no reason given'} — \`${invocation()} daemon install\` tries again` })
+      }
     }
 
     // The receive loop's own record: repeated cycles that did not get done
@@ -1203,5 +1400,6 @@ export function createIdentityCommands(profile: HostProfile): IdentityCommands {
     runStatus,
     runLogout,
     runDoctor,
+    confirmSetup,
   }
 }
