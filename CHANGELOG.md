@@ -8,6 +8,17 @@ The version number is set at the release step (`VERSIONING.md`).
 
 ### Added
 
+- **The integration names its host and its install** (SDK 1.11's `X-AgentChat-Platform`):
+  - `IntegrationClient` gains `host`, `installId` and `installMethod`, which `clientIdentityOf` passes to the SDK.
+  - The identity commands add the home's install id (`ensureInstallId`: `ins_` and 22 random base64url characters, owner-only in `<home>/install-id`, kept through logout, removed by `clearInstallId`).
+  - They also add the runtime and its version from the new `HostProfile.host()` (`hostIdentityOf`), and a host may set `installMethod` (`installMethodOf`: `npx` only when certain).
+- **Setup telemetry.** Every command that prints a `Setup:` line sends one `setup_verdict` event to `POST /v1/telemetry` at its end:
+  - It carries the state, the command, needs_person, the reason word, the exit code and the duration, with the SDK's headers. The key goes in `Authorization` only when the home holds one.
+  - One attempt, at most 1.5 s, awaited, silent, and it never changes an exit code.
+  - `AGENTCHAT_TELEMETRY=off` sends nothing and makes no install id.
+  - The engine API is `sendSetupVerdict`, `setupVerdictEvent`, `telemetryOff`, and `reportSetup` for a host's install.
+- The verdict gains `reason`, one word within the state.
+- `doctor` ends with the setup verdict.
 - **Every account command leaves a listening agent, and says what is left.** `register --code`, `recover --code` and `login` placed the key, the tools and the identity line but never the listener service, and said "the integration daemon follows the credential on its own" — so an agent that signed in with `login` (the path the hosted tools give a Claude Code or Codex agent) was deaf, and our own text called it wired. Now, after `place`, the shared flow calls the host's new `HostProfile.ensureListener()` (the person's opt-out is respected), waits up to 30 s for the listener to connect, asks `GET /v1/agents/me` once, and ends with the setup verdict. `doctor --fix` registers the listener too. A sign-up or login that saved the key still exits 0.
 - **The setup verdict** (`setupVerdict`, `formatSetupVerdict`, `readListener`): one answer to "is this agent set up?" — `no_account`, `code_pending`, `code_expired`, `key_refused`, `suspended`, `unreachable`, `paused`, `tools_missing`, `listener_off`, `listener_missing`, `listener_down`, `listener_starting`, `listener_failing` or `ready` — with the exact command to run next, whether only the person can do the next step, and what to ask them. `status` prints it first and as `.setup` in `--json`; account commands print it last; hosts print it as install's last line (`confirmSetup`). It reads `reachability` from `GET /v1/agents/me` when the server sends it, and never needs it.
 - `HostProfile.place` and `extraStatus` may return `{ lines, problem }`: a problem that keeps runs from having the AgentChat tools (said as `tools_missing`, in the host's words, and no listener is registered over it). A host that returns lines is unchanged.
@@ -25,6 +36,8 @@ The version number is set at the release step (`VERSIONING.md`).
 - **`reportListenerStopped({ home, client, identity })`**: the commands that end the listener on purpose tell AgentChat `stopped` before the key or the service goes, so the agent reads as switched off. `logout` calls it; the integrations' `uninstall` and `daemon disable` call it before removing the service. One attempt, at most 5 s, never throws; only for a key the home holds (an exported `AGENTCHAT_API_KEY` is not what its listener serves), and skipped when no listener of the home ever reported, and for a standby (another live home holds the agent lock). `describeListenerStopped(result)` is the line to print. The daemon entry exports `createListenerReporter` and `ensureListenerInstanceId` for a host that builds an `Integration` itself.
 
 ### Changed
+
+- Needs `agentchatme` ^1.11.0 (the platform header; the sign-up `connect` action is handled as nothing to run).
 
 - The setup offer in the instruction file has the agent follow each command's `Setup:` line until it says `ready`, says the runtime may ask the person to approve a command, and sends an existing key through a file the agent writes with its file-editing tool (`login --api-key - < <that file>`), never "the user's own terminal".
 - `status` with no identity says how to create one (`register --email <email> --handle <handle>`, or `login --api-key - < <that file>`), not a bare `register`. With a refused key or an unreachable server, the verdict comes first on stdout (it used to be one line on stderr); a suspended account is said as such, with no recovery advice.

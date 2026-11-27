@@ -1,3 +1,4 @@
+import * as fs from 'node:fs'
 import * as readline from 'node:readline'
 import { AgentChatClient, integration as kit, type SignupFlow, type Texts } from 'agentchatme'
 import {
@@ -11,6 +12,8 @@ import {
   readPending,
   writePending,
   clearPending,
+  ensureInstallId,
+  rememberHost,
   type PendingSignup,
 } from './credentials.js'
 import { clearOfferDeclined } from './state.js'
@@ -53,7 +56,8 @@ import {
   type SetupVerdict,
   type SignupInput,
 } from './setup.js'
-import { clientIdentityOf } from '../client-identity.js'
+import { clientIdentityOf, type IntegrationClient } from '../client-identity.js'
+import { sendSetupVerdict, telemetryOff, type SetupCommand, type TelemetrySender } from './telemetry.js'
 import {
   REPEATED_FAILED_CYCLES,
   describeCouldNotProcessCounts,
@@ -218,7 +222,20 @@ export interface IdentityCommandOptions {
   setupPollMs?: number
   /** Whether no service manager is used, so no listener will start and nothing is waited for (default: `AGENTCHAT_SERVICE_DRY_RUN`). */
   serviceDryRun?: boolean
+  /** Where setup telemetry goes (default: the network, or nowhere under AGENTCHAT_SERVICE_DRY_RUN). */
+  telemetrySender?: TelemetrySender
 }
+
+/** What a host's install hands `reportSetup` (its own command, measured by it). */
+export interface ReportSetupOptions {
+  command: SetupCommand
+  exitCode: number
+  /** When the command started (ms since the epoch). */
+  startedAt: number
+}
+
+/** How long the host's `host()` may take before the command goes on without it. */
+const HOST_DEADLINE_MS = 3_000
 
 /** What `confirmSetup` takes from a host's install. */
 export interface ConfirmSetupOptions {
@@ -275,13 +292,88 @@ export interface IdentityCommands {
    * line. Returns the verdict, or null when there is none to say.
    */
   confirmSetup(opts?: ConfirmSetupOptions): Promise<SetupVerdict | null>
+  /**
+   * For a host's install, after it knows its exit code: send setup telemetry
+   * for the verdict this process said last (`confirmSetup`), if any. Never
+   * prints, never throws, bounded (`TELEMETRY_TIMEOUT_MS`).
+   */
+  reportSetup(opts: ReportSetupOptions): Promise<void>
 }
 
 /** Build the identity command set for one coding agent. */
 export function createIdentityCommands(profile: HostProfile, options: IdentityCommandOptions = {}): IdentityCommands {
   const invocation = (): string => profile.invocation()
   const LABEL = profile.label
-  const clientIdentity = clientIdentityOf(profile.client)
+  // The client this process names itself as: the profile's, with the home's
+  // install id and the host runtime added once per process (`prepareClient`).
+  let client: IntegrationClient = profile.client
+  let prepared: Promise<void> | null = null
+  const clientIdentityNow = () => clientIdentityOf(client)
+
+  /**
+   * Once per process, before the first request: the install id (made once
+   * per home; none under AGENTCHAT_TELEMETRY=off) and the host runtime
+   * (`host()`, bounded). Neither is ever a reason to fail.
+   */
+  function prepareClient(): Promise<void> {
+    prepared ??= (async () => {
+      const installId = telemetryOff() ? null : ensureInstallId(profile.home())
+      let host: string | null = null
+      if (profile.host !== undefined) {
+        let timer: NodeJS.Timeout | undefined
+        try {
+          const late = new Promise<null>((resolve) => {
+            timer = setTimeout(() => resolve(null), HOST_DEADLINE_MS)
+            timer.unref?.()
+          })
+          host = await Promise.race([Promise.resolve(profile.host()), late])
+        } catch {
+          host = null
+        } finally {
+          if (timer !== undefined) clearTimeout(timer)
+        }
+      }
+      // The daemon names the host from what a command last read (it does not run `--version` before it starts).
+      if (host !== null && fs.existsSync(profile.home())) rememberHost(profile.home(), host)
+      client = { ...profile.client, ...(installId !== null ? { installId } : {}), ...(host !== null ? { host } : {}) }
+    })()
+    return prepared
+  }
+
+  /** The verdict this process said last: what setup telemetry reports. */
+  let said: SetupVerdict | null = null
+  /** The verdict's line, and remember it was said. */
+  function say(verdict: SetupVerdict): string {
+    said = verdict
+    return formatSetupVerdict(verdict)
+  }
+
+  /** Tell AgentChat what this command said, if it said a verdict (bounded, silent). */
+  async function reportSetup(opts: ReportSetupOptions): Promise<void> {
+    const verdict = said
+    if (verdict === null) return
+    said = null
+    const identity = resolveIdentity(profile.home())
+    await sendSetupVerdict(verdict, {
+      ...opts,
+      apiBase: identity?.apiBase ?? process.env['AGENTCHAT_API_BASE']?.trim() ?? DEFAULT_API_BASE,
+      apiKey: identity?.apiKey ?? null,
+      clientIdentity: clientIdentityNow(),
+      ...(options.telemetrySender !== undefined ? { sender: options.telemetrySender } : {}),
+    })
+  }
+
+  /** A command, measured: its client prepared first, its verdict (if any) reported last with its exit code. */
+  function tracked<A extends unknown[]>(command: SetupCommand, run: (...args: A) => Promise<number>): (...args: A) => Promise<number> {
+    return async (...args: A): Promise<number> => {
+      const startedAt = Date.now()
+      said = null
+      await prepareClient()
+      const code = await run(...args)
+      await reportSetup({ command, exitCode: code, startedAt })
+      return code
+    }
+  }
 
   /**
    * The refusal when an exported `AGENTCHAT_API_KEY` is not the key this
@@ -303,10 +395,10 @@ export function createIdentityCommands(profile: HostProfile, options: IdentityCo
    * attempts of up to 15 s).
    */
   const apiClient = (apiKey: string, apiBase: string): AgentChatClient =>
-    new AgentChatClient({ apiKey, baseUrl: apiBase, clientIdentity, timeoutMs: 5_000, retry: { maxRetries: 0, baseDelayMs: 0, maxDelayMs: 0 } })
+    new AgentChatClient({ apiKey, baseUrl: apiBase, clientIdentity: clientIdentityNow(), timeoutMs: 5_000, retry: { maxRetries: 0, baseDelayMs: 0, maxDelayMs: 0 } })
 
   /** How the sign-up calls reach the server (never retried: a second call could send a second code). */
-  const accountOptions = (apiBase: string): kit.AccountCallOptions => ({ clientIdentity, apiBase, timeoutMs: 15_000 })
+  const accountOptions = (apiBase: string): kit.AccountCallOptions => ({ clientIdentity: clientIdentityNow(), apiBase, timeoutMs: 15_000 })
 
   /**
    * The served texts for this agent: fetched now (one attempt, 5 s), else the
@@ -486,7 +578,7 @@ export function createIdentityCommands(profile: HostProfile, options: IdentityCo
     const base = { ...verdictBase(), pending, ensure: opts.ensure, tools: opts.tools, afterSignIn: opts.afterSignIn }
     if (identity === null) {
       const verdict = setupVerdict({ ...base, identity: null, server: null, listener: null })
-      if (verdict !== null) console.log(formatSetupVerdict(verdict))
+      if (verdict !== null) console.log(say(verdict))
       return verdict
     }
     const hasListener = profile.ensureListener !== undefined
@@ -513,7 +605,7 @@ export function createIdentityCommands(profile: HostProfile, options: IdentityCo
       if (!(canWait && verdict?.state === 'listener_starting' && reading?.daemon.kind === 'ready' && attempt < REACHABILITY_RETRIES)) break
       await sleep(1_000)
     }
-    if (verdict !== null) console.log(formatSetupVerdict(verdict))
+    if (verdict !== null) console.log(say(verdict))
     return verdict
   }
 
@@ -533,6 +625,7 @@ export function createIdentityCommands(profile: HostProfile, options: IdentityCo
   }
 
   async function confirmSetup(opts: ConfirmSetupOptions = {}): Promise<SetupVerdict | null> {
+    await prepareClient()
     return confirm({ ensure: opts.ensure ?? null, tools: opts.tools ?? null, afterSignIn: false, replacedPid: opts.replacedPid ?? null })
   }
 
@@ -584,6 +677,9 @@ export function createIdentityCommands(profile: HostProfile, options: IdentityCo
       }
       case 'stop':
         return heldCode
+      // A connector sign-in's last answer (a flow started with `finish: "connector"`): this package never starts one, so there is nothing to run next.
+      case 'connect':
+        return []
     }
   }
 
@@ -677,7 +773,7 @@ export function createIdentityCommands(profile: HostProfile, options: IdentityCo
       writePending(home, pending)
       // The code is on its way: the verdict for this step (`code_pending`) names the command that answers it.
       const verdict = setupVerdict({ ...verdictBase(), identity: null, pending, server: null, listener: null })
-      return report(result, verdict?.state === 'code_pending' ? [formatSetupVerdict(verdict)] : nextSteps(kind, result, 'start', input, undefined, held), true)
+      return report(result, verdict?.state === 'code_pending' ? [say(verdict)] : nextSteps(kind, result, 'start', input, undefined, held), true)
     }
     return report(result, nextSteps(kind, result, 'start', input, undefined, held), false)
   }
@@ -986,8 +1082,9 @@ export function createIdentityCommands(profile: HostProfile, options: IdentityCo
             setup,
           }),
         )
+        if (setup !== null) say(setup)
       } else if (setup !== null) {
-        console.log(formatSetupVerdict(setup))
+        console.log(say(setup))
       }
       return 0
     }
@@ -1022,6 +1119,7 @@ export function createIdentityCommands(profile: HostProfile, options: IdentityCo
             setup,
           }),
         )
+        if (setup !== null) say(setup)
       } else {
         // The server did not answer, so no texts fetch either: the block and the
         // host's checks are read against the identity-home cache (what a fetch
@@ -1032,7 +1130,7 @@ export function createIdentityCommands(profile: HostProfile, options: IdentityCo
         console.log(
           [
             // First: what this means and what to do (a refused key is not an unreachable server).
-            ...(setup !== null ? [formatSetupVerdict(setup)] : []),
+            ...(setup !== null ? [say(setup)] : []),
             `${identity.handle !== null ? `@${identity.handle}` : 'This agent'} — ${refused ? `key refused (HTTP ${status})` : 'AgentChat unreachable'}  (${LABEL})`,
             `Key source: ${identity.source} (${identity.source === 'file' ? credentialsPath(home) : 'AGENTCHAT_API_KEY'})`,
             `API: ${identity.apiBase}`,
@@ -1084,6 +1182,7 @@ export function createIdentityCommands(profile: HostProfile, options: IdentityCo
           setup,
         }),
       )
+      if (setup !== null) say(setup)
     } else {
       const trayLine =
         tray === null
@@ -1091,7 +1190,7 @@ export function createIdentityCommands(profile: HostProfile, options: IdentityCo
           : `Tray: ${tray.waiting}${tray.truncated ? '+' : ''} conversation(s) waiting${tray.deferred > 0 ? `, ${tray.deferred} deferred` : ''}`
       console.log(
         [
-          ...(setup !== null ? [formatSetupVerdict(setup)] : []),
+          ...(setup !== null ? [say(setup)] : []),
           `@${me.handle} — ${me.status ?? 'active'}  (${LABEL})`,
           trayLine,
           `Key source: ${identity.source} (${identity.source === 'file' ? credentialsPath(home) : 'AGENTCHAT_API_KEY'})`,
@@ -1247,6 +1346,8 @@ export function createIdentityCommands(profile: HostProfile, options: IdentityCo
     if (refusal !== null) checks.push({ name: 'env-key', verdict: 'FAIL', detail: refusal })
 
     const creds = readCredentials(home)
+    // What the server said, for the verdict at the end.
+    let server: ServerView | null = null
     if (creds === null) {
       checks.push({
         name: 'credentials',
@@ -1261,6 +1362,7 @@ export function createIdentityCommands(profile: HostProfile, options: IdentityCo
           const client = apiClient(identity.apiKey, identity.apiBase)
           const started = Date.now()
           const me = await client.getMe()
+          server = { kind: 'ok', handle: me.handle, reachability: reachabilityOf(me) }
           const verdict: Verdict = (me.status ?? 'active') === 'active' ? 'PASS' : 'WARN'
           checks.push({
             name: 'api-auth',
@@ -1275,6 +1377,7 @@ export function createIdentityCommands(profile: HostProfile, options: IdentityCo
             })
           }
         } catch (err) {
+          server = serverViewOfError(err)
           checks.push({ name: 'api-auth', verdict: 'FAIL', detail: `getMe failed: ${String(err)}` })
         }
       }
@@ -1297,8 +1400,9 @@ export function createIdentityCommands(profile: HostProfile, options: IdentityCo
     // identity: it idles until one appears), unless the person switched it
     // off. Said only when it did something: the host's own service check
     // reports a listener that is current or switched off.
+    let ensure: ListenerEnsure | null = null
     if (opts.fix === true && profile.ensureListener !== undefined) {
-      const ensure = await ensureListenerOnce()
+      ensure = await ensureListenerOnce()
       if (ensure?.outcome === 'installed') checks.push({ name: 'listener', verdict: 'PASS', detail: `registered${ensure.detail ? ` (${ensure.detail})` : ''}` })
       else if (ensure?.outcome === 'failed') {
         checks.push({ name: 'listener', verdict: 'FAIL', detail: `could not be registered: ${ensure.detail ?? 'no reason given'} — \`${invocation()} daemon install\` tries again` })
@@ -1404,16 +1508,31 @@ export function createIdentityCommands(profile: HostProfile, options: IdentityCo
     }
 
     console.log(checks.map((c) => `${c.verdict.padEnd(4)} ${c.name}: ${c.detail}`).join('\n'))
+    // Last, what it all means: the setup verdict (not with a split identity: whose would it be?).
+    if (refusal === null) {
+      const identity = resolveIdentity(home)
+      const handle = server?.kind === 'ok' ? server.handle : (identity?.handle ?? null)
+      const verdict = setupVerdict({
+        ...verdictBase(),
+        identity: identity === null ? null : { handle: identity.handle, source: identity.source },
+        pending: readPending(home),
+        server: identity === null ? null : server,
+        listener: profile.ensureListener !== undefined ? readListener(home, handle) : null,
+        ensure,
+      })
+      if (verdict !== null) console.log(say(verdict))
+    }
     return checks.some((c) => c.verdict === 'FAIL') ? 1 : 0
   }
 
   return {
-    runRegister,
-    runLogin,
-    runRecover,
-    runStatus,
+    runRegister: tracked('register', runRegister),
+    runLogin: tracked('login', runLogin),
+    runRecover: tracked('recover', runRecover),
+    runStatus: tracked('status', runStatus),
     runLogout,
-    runDoctor,
+    runDoctor: tracked('doctor', runDoctor),
     confirmSetup,
+    reportSetup,
   }
 }
