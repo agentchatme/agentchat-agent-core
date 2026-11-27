@@ -1130,9 +1130,9 @@ export function createIdentityCommands(profile: HostProfile, options: IdentityCo
     // disk once the credential is deleted.
     const identity = resolveIdentity(home)
 
-    // Only for the key this home holds, the one deleted below (an exported
-    // key stays, and so does whatever serves it).
-    const stopped = await reportListenerStopped({ home, client: profile.client, identity: identity?.source === 'file' ? identity : null })
+    // For the key this home holds, the one deleted below (an exported key
+    // stays, and so does whatever serves it: `reportListenerStopped` skips it).
+    const stopped = await reportListenerStopped({ home, client: profile.client, identity })
     const stoppedLine = describeListenerStopped(stopped)
     if (stoppedLine !== null) reports.push(`  ${stoppedLine}`)
 

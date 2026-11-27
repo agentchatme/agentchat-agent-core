@@ -97,7 +97,7 @@ class ScriptedRunner implements RunRunner {
   constructor(
     public pre: RunPreflight = { ok: true },
     public outcome: RunOutcome = OK_RUN,
-    public check: RunPreflight | 'hang' | null = null,
+    public check: RunPreflight | 'hang' | 'held' | null = null,
   ) {
     if (check !== null) this.checkRuntime = (options) => this.runCheck(options)
   }
@@ -109,9 +109,12 @@ class ScriptedRunner implements RunRunner {
     this.starts += 1
     return (request.conversationId !== undefined ? this.endings.get(request.conversationId) : undefined) ?? this.outcome
   }
+  /** A `held` check answers when this is called. */
+  release: ((answer: RunPreflight) => void) | null = null
   private async runCheck(options: RunPreflightOptions = {}): Promise<RunPreflight> {
     this.checks += 1
     const check = this.check
+    if (check === 'held') return new Promise<RunPreflight>((resolve) => (this.release = resolve))
     if (check !== 'hang' && check !== null) return check
     return new Promise<RunPreflight>((resolve) => options.signal?.addEventListener('abort', () => resolve({ ok: false, detail: 'stopped' }), { once: true }))
   }
@@ -152,7 +155,7 @@ describe('the integration says what is true', () => {
     return i
   }
 
-  it('connected with the runtime healthy → ok; a reconnect says nothing new', async () => {
+  it('connected with the runtime healthy → ok; a reconnect changes nothing', async () => {
     double = await startServerDouble({ tray: { waiting: 0 } })
     const sink = new FakeSink()
     const i = build(new ScriptedRunner(), sink)
@@ -257,6 +260,25 @@ describe('the integration says what is true', () => {
     expect(i.snapshot().could_not_process).toMatchObject({ runtime_checks_failed: 1, runtime_checks_ok: 1 })
   }, 20_000)
 
+  it('a check that fails after another run completed meanwhile is older news: it changes nothing', async () => {
+    double = await startServerDouble({ tray: { waiting: 1 }, conversationRunTemplate: 'RUN <conversation_id>' })
+    const sink = new FakeSink()
+    const runner = new ScriptedRunner({ ok: true }, OK_RUN, 'held')
+    runner.endings.set('conv_0', FAILED_RUN)
+    const i = build(runner, sink)
+    await i.start()
+    await until(() => runner.checks === 1, 5_000)
+    // Another conversation's run completes while the check is out.
+    const starts = runner.starts
+    double.setTray({ waiting: 2 })
+    wake('m1', 'conv_1')
+    await until(() => runner.starts > starts && i.snapshot().runs_ok >= 1, 5_000)
+    runner.release?.({ ok: false, detail: 'scripted: usage limit reached' })
+    await until(() => i.snapshot().could_not_process?.runtime_checks_failed === 1, 5_000)
+    await pause(100)
+    expect(sink.changes).toEqual(['ok'])
+  }, 20_000)
+
   it('stopping says nothing more: a check cut short by the stop is not a failed check', async () => {
     double = await startServerDouble({ tray: { waiting: 1 }, conversationRunTemplate: 'RUN <conversation_id>' })
     const sink = new FakeSink()
@@ -344,6 +366,27 @@ describe('the supervisor: one reporter per identity, only while this home holds 
       await d.stop()
     }
   }, 40_000)
+
+  it('the status file is rewritten on every start retry itself, not only by the refresh while waiting', async () => {
+    double = await startServerDouble({ tray: { waiting: 0 } })
+    const home = path.join(sandbox, 'home')
+    signIn(home, double.apiBase)
+    const runner = new ScriptedRunner({ ok: false, detail: SIGNED_OUT })
+    // The refresh while waiting is out of the picture here: only the retries write.
+    const d = daemon(home, runner, { pollMs: 100, offStatusRefreshMs: 600_000 })
+    try {
+      const written: string[] = []
+      for (const count of [2, 3, 4]) {
+        await until(() => runner.preflights >= count, 10_000)
+        await until(() => (readIntegrationStatus(home)?.updated_at ?? '') > (written[written.length - 1] ?? ''), 2_000)
+        written.push(readIntegrationStatus(home)?.updated_at ?? '')
+      }
+      expect(new Set(written).size).toBe(3)
+      expect(readIntegrationStatus(home)?.pid).toBe(process.pid)
+    } finally {
+      await d.stop()
+    }
+  }, 30_000)
 
   it('a standby reports nothing (it makes no listener id); the holder\'s stop sends no stopped; the standby takes over and reports ok under its own id', async () => {
     double = await startServerDouble({ tray: { waiting: 0 } })
@@ -459,12 +502,16 @@ describe('reportListenerStopped: the commands that end the listener on purpose',
     expect(describeListenerStopped(result)).toBe('listener: AgentChat was told it stopped on purpose')
   })
 
-  it('nothing to stop: no identity, or no listener of this home ever reported (no id file) — no request, no line', async () => {
+  it('nothing to stop: no key the home holds (none, or only an exported one), or no listener of this home ever reported (no id file) — no request, no line', async () => {
     double = await startServerDouble()
     const home = path.join(sandbox, 'home')
     fs.mkdirSync(home, { recursive: true })
     const identity = { apiKey: KEY, apiBase: double.apiBase, handle: 'probe' }
     expect(await reportListenerStopped({ home, client: CLIENT, identity: null })).toEqual({ outcome: 'skipped', reason: 'no_identity' })
+    // An exported key is not what the home's listener serves, even with a listener id there.
+    fs.writeFileSync(listenerIdPath(home), `${ID}\n`)
+    expect(await reportListenerStopped({ home, client: CLIENT, identity: { ...identity, handle: null, source: 'env' } })).toEqual({ outcome: 'skipped', reason: 'no_identity' })
+    fs.rmSync(listenerIdPath(home))
     expect(await reportListenerStopped({ home, client: CLIENT, identity })).toEqual({ outcome: 'skipped', reason: 'no_listener' })
     // A damaged id file is no id.
     fs.writeFileSync(listenerIdPath(home), 'not an id!\n')

@@ -25,10 +25,14 @@ import type { IntegrationListenerReport } from './status.js'
 //   `logout`, `uninstall`, `daemon disable`                      → stopped, sent by that command
 //                                                                   before the key or the service goes
 //
-// Only the process that holds the agent lock reports: a standby, a home that
-// gave the agent up and a daemon switched off report nothing. A shutdown
-// (SIGTERM: a service stop, a reboot) reports nothing either: a machine that
-// comes back must read as offline meanwhile, not as uninstalled.
+// Only the home that holds the agent lock reports: a standby, a home that
+// gave the agent up and a daemon switched off report nothing. (A start that
+// failed its preflight decided `not_ready` while it held the lock; the report
+// goes out just after, while that home waits out its retry with the lock free,
+// and the reporter is dropped as soon as a retry finds another home holding
+// the agent.) A shutdown (SIGTERM: a service stop, a reboot) reports nothing
+// either: a machine that comes back must read as offline meanwhile, not as
+// uninstalled.
 //
 // One instance id per identity home (`listener-id`, made by the first
 // listener there that reports), so a restarted daemon is the same install to
@@ -149,8 +153,13 @@ export interface ReportListenerStoppedOptions {
   readonly home: string
   /** How the integration names itself to the server. */
   readonly client: IntegrationClient
-  /** The agent that home's listener serves (its key, base and handle); null: nothing to report. */
-  readonly identity: (KeyedIdentity & { readonly handle: string | null }) | null
+  /**
+   * The agent that home's listener serves (its key, base and handle, as
+   * `resolveIdentity` gives it); null: nothing to report. Only a key the home
+   * holds counts (`source: 'file'`): an exported key is not what the home's
+   * listener serves (a service never carries one).
+   */
+  readonly identity: (KeyedIdentity & { readonly handle: string | null; readonly source?: 'file' | 'env' }) | null
   /** The one attempt's bound (default `STOPPED_REPORT_TIMEOUT_MS`). */
   readonly timeoutMs?: number
   /** Test seam: what sends the report. */
@@ -160,7 +169,8 @@ export interface ReportListenerStoppedOptions {
 /**
  * What came of a `stopped` report: `reported` (AgentChat holds it),
  * `failed` (it does not: `detail` says why; it then reads the listener as
- * offline once its socket is gone), or `skipped`: `no_identity` (no key),
+ * offline once its socket is gone), or `skipped`: `no_identity` (no key
+ * the home holds),
  * `no_listener` (no listener of this home ever reported: there is nothing
  * to stop), `standby` (another home's listener serves this agent: a
  * standby reports nothing).
@@ -181,7 +191,7 @@ export type ListenerStoppedResult =
  */
 export async function reportListenerStopped(options: ReportListenerStoppedOptions): Promise<ListenerStoppedResult> {
   const { home, identity } = options
-  if (identity === null) return { outcome: 'skipped', reason: 'no_identity' }
+  if (identity === null || identity.source === 'env') return { outcome: 'skipped', reason: 'no_identity' }
   const instanceId = readListenerInstanceId(home)
   if (instanceId === null) return { outcome: 'skipped', reason: 'no_listener' }
   if (identity.handle !== null) {

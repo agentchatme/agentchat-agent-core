@@ -718,7 +718,10 @@ export class Integration {
       // fail and the runtime's own check fails too. `health()` and the
       // hand-over to a standby do not change for it. A check cut short by the
       // stop says nothing.
-      if (!this.stopping) {
+      // A check that failed while another run completed is older news than
+      // that run: the runtime worked after it started.
+      const overtaken = !answer.ok && this.lastOkRunAt !== null && Date.parse(this.lastOkRunAt) >= startedAt
+      if (!this.stopping && !overtaken) {
         this.runtimeCheckFailing = !answer.ok
         this.reportListener()
       }

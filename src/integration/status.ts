@@ -636,7 +636,8 @@ function listenerReportLines(report: IntegrationListenerReport | null, now: numb
   if (report === null || report.state === null) return []
   const what = `${report.state}${report.reason_kind !== null ? ` (${report.reason_kind})` : ''}`
   if (!report.pending && report.reported !== null) {
-    return [`  listener report: ${what} — AgentChat has it (accepted ${ago(Math.max(0, now - Date.parse(report.reported.at)))})`]
+    const at = Date.parse(report.reported.at)
+    return [`  listener report: ${what} — AgentChat has it${Number.isNaN(at) ? '' : ` (accepted ${ago(Math.max(0, now - at))})`}`]
   }
   if (report.failures === 0) return [`  listener report: ${what} — being sent`]
   const next = report.next_attempt_at === null ? null : Date.parse(report.next_attempt_at) - now

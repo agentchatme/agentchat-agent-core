@@ -47,8 +47,12 @@ import { createListenerReporter, ensureListenerInstanceId, listenerReportStatusO
 // The listener report (contract v1 §3.13, `listener-report.ts`): one reporter
 // per identity, made when this home takes the agent lock and kept across its
 // start retries, so a runtime that keeps failing its preflight is one
-// `not_ready` (re-sent every 30 minutes by the kit), not one per retry. It is
-// stopped, with nothing sent, the moment this home does not hold the agent: a
+// `not_ready` (re-sent every 30 minutes by the kit), not one per retry. (Each
+// retry takes the agent lock and gives it back when the preflight fails, so
+// that report goes out while this home waits with the lock free: it was
+// decided while it held it, and nothing else holds it meanwhile, or the next
+// retry finds that and drops the reporter.) It is stopped, with nothing sent,
+// as soon as another listener serves the agent or this home lets it go: a
 // standby, a give-up, a lost lock, a new identity, and a shutdown. SIGTERM is
 // a service stop or a reboot, never an uninstall: `stopped` is sent only by
 // the commands that end the listener on purpose (`reportListenerStopped`).
@@ -246,7 +250,7 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
   if (opts.signal?.aborted === true) stopChecks.abort()
   else opts.signal?.addEventListener('abort', () => stopChecks.abort(), { once: true })
 
-  /** The listener report for the identity this home serves (its fingerprint), while this home holds the agent. */
+  /** The listener report for the identity this home serves (its fingerprint), while this home holds the agent or retries its start. */
   let listener: { readonly fp: string; readonly reporter: kit.ListenerReporter } | null = null
   /** This home's listener id: made on the first report; null when the home cannot keep one (then nothing is reported). */
   let instanceId: string | null | undefined
@@ -350,12 +354,10 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
     return count === 0 ? null : { count, last: agentLock?.lastRenewError ?? lock.lastRenewError }
   }
 
-  /** When the status file was last written while nothing is served, and for whom: what the refresh while waiting writes again. */
+  /** When the status file was last written while nothing is served (the refresh while waiting writes it again). */
   let offStatusAt = 0
-  let offStatusHandle: string | null = null
   const offStatus = (handle: string | null): void => {
     offStatusAt = Date.now()
-    offStatusHandle = handle
     writeIntegrationStatus(home, {
       version: 2,
       updated_at: new Date().toISOString(),
@@ -645,7 +647,8 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
       await sleepUnless(opts.tickMs ?? TICK_MS, opts.signal)
       // Nothing served (signed out, switched off, a start backing off): the
       // status file still says, every 30 s, that this daemon runs.
-      if (live === null && Date.now() - offStatusAt >= (opts.offStatusRefreshMs ?? OFF_STATUS_REFRESH_MS)) offStatus(offStatusHandle)
+      // The handle as the home names it now (the one a standby poll writes).
+      if (live === null && Date.now() - offStatusAt >= (opts.offStatusRefreshMs ?? OFF_STATUS_REFRESH_MS)) offStatus(observedFingerprint === null ? null : (cachedCfg?.cfg.handle ?? identityOf()?.handle ?? null))
     }
   }
 
