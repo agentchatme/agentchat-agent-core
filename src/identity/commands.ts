@@ -18,6 +18,7 @@ import { placeAnchorAt, removeAnchorAt, hasAnchorAt } from '../anchor/block.js'
 import { describeIdentityBlock, identityBlockState, type AnchorLoadNote, type IdentityBlockState } from '../anchor/follow.js'
 import { traySummary } from '../integration/tray.js'
 import { loadTexts, readCachedTexts } from '../integration/texts.js'
+import { describeListenerStopped, reportListenerStopped } from '../integration/listener-report.js'
 import { identityLineOf } from '../skill/identity-line.js'
 import {
   anchorLabelOf,
@@ -265,7 +266,8 @@ export interface IdentityCommands {
   runLogin(opts: { apiKey?: string; apiBase?: string }): Promise<number>
   runRecover(opts: RecoverOpts): Promise<number>
   runStatus(opts: { json?: boolean }): Promise<number>
-  runLogout(): number
+  /** Async: it tells AgentChat the listener stopped (contract v1 §3.13) before the key goes. */
+  runLogout(): Promise<number>
   runDoctor(opts?: DoctorOpts): Promise<number>
   /**
    * For a host's install: wait for the listener when there is an identity and
@@ -561,6 +563,8 @@ export function createIdentityCommands(profile: HostProfile, options: IdentityCo
         : []
     switch (result.action) {
       case 'done':
+      // A connector sign-up's answer (SDK 1.10+); these commands never start one. The server's sentence is all there is to say.
+      case 'connect':
         return []
       case 'ask_code':
         return [runLine(codeCommand(kind, result.flow))]
@@ -1110,8 +1114,12 @@ export function createIdentityCommands(profile: HostProfile, options: IdentityCo
    * separate lifecycles: logout must never silently remove the service or the
    * manual. It removes what authenticates as the old identity: the credential,
    * the identity line, and the key the hosted tool server was registered with.
+   * First, while the key is still here, AgentChat is told this home's
+   * listener stopped on purpose (contract v1 §3.13): the agent then reads as
+   * switched off, not as a computer that is off. One bounded attempt; the
+   * sign-out goes on whatever it answers.
    */
-  function runLogout(): number {
+  async function runLogout(): Promise<number> {
     const home = profile.home()
     const anchorFile = profile.anchorFile?.() ?? null
     const reports: string[] = []
@@ -1121,6 +1129,12 @@ export function createIdentityCommands(profile: HostProfile, options: IdentityCo
     // by the key and the API base that were placed, and both are gone from
     // disk once the credential is deleted.
     const identity = resolveIdentity(home)
+
+    // For the key this home holds, the one deleted below (an exported key
+    // stays, and so does whatever serves it: `reportListenerStopped` skips it).
+    const stopped = await reportListenerStopped({ home, client: profile.client, identity })
+    const stoppedLine = describeListenerStopped(stopped)
+    if (stoppedLine !== null) reports.push(`  ${stoppedLine}`)
 
     if (clearCredentials(home)) {
       any = true

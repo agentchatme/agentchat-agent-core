@@ -70,7 +70,7 @@ describe('an instruction file that cannot be read or rewritten', () => {
     const { home, anchor, unplaced, commands } = fixture()
     fs.writeFileSync(anchor, NOT_UTF8)
     const { out } = capture()
-    expect(commands.runLogout()).toBe(0)
+    expect(await commands.runLogout()).toBe(0)
     expect(readCredentials(home)).toBeNull()
     expect(unplaced).toHaveLength(1)
     const text = out.join('\n')
