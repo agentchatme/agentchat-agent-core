@@ -138,6 +138,32 @@ export interface IntegrationStatus {
    * before the first texts, or from an older daemon.
    */
   identity_line?: IntegrationIdentityLine | null
+  /**
+   * The listener report (contract v1 §3.13): what this listener tells
+   * AgentChat about itself, and whether AgentChat holds it. Null or absent
+   * while it reports nothing (a standby, a home that gave the agent up,
+   * switched off, signed out) or from an older daemon.
+   */
+  listener_report?: IntegrationListenerReport | null
+}
+
+/** The listener report as the status file keeps it (the kit reporter's `status()`). */
+export interface IntegrationListenerReport {
+  /** This install's id (`<home>/listener-id`). */
+  readonly instance_id: string
+  /** What the listener says now: `ok`, `runs_failing`, `not_ready`; null before it has said anything. */
+  readonly state: string | null
+  /** Its reason, for `runs_failing` and `not_ready`; null otherwise. */
+  readonly reason_kind: string | null
+  /** The last report AgentChat accepted, and when (this machine's clock); null before one. */
+  readonly reported: { readonly state: string; readonly reason_kind: string | null; readonly at: string } | null
+  /** True while AgentChat does not hold `state` yet. */
+  readonly pending: boolean
+  /** Attempts that failed since the last accepted report, and the last failure. */
+  readonly failures: number
+  readonly last_error: string | null
+  /** When the next attempt is due, or null when none is. */
+  readonly next_attempt_at: string | null
 }
 
 /** The identity block's last follow of the served identity line. */
@@ -350,8 +376,26 @@ const StatusSchema = z
       .object({ outcome: z.string(), path: z.string(), at: z.string(), texts_version: z.string(), detail: z.string(), not_loaded: z.string().nullable().optional() })
       .nullable()
       .optional(),
+    // Kept leniently: a reader never loses the whole file to a block it cannot read.
+    listener_report: z.unknown().optional(),
   })
   .passthrough()
+
+const ListenerReportSchema = z.object({
+  instance_id: z.string(),
+  state: z.string().nullable(),
+  reason_kind: z.string().nullable(),
+  reported: z.object({ state: z.string(), reason_kind: z.string().nullable(), at: z.string() }).nullable(),
+  pending: z.boolean(),
+  failures: z.number(),
+  last_error: z.string().nullable(),
+  next_attempt_at: z.string().nullable(),
+})
+
+function listenerReportOf(raw: unknown): IntegrationListenerReport | null {
+  const parsed = ListenerReportSchema.safeParse(raw)
+  return parsed.success ? parsed.data : null
+}
 
 function normalize(raw: z.infer<typeof StatusSchema>): IntegrationStatus {
   const lastRun: IntegrationLastRun | null =
@@ -405,6 +449,7 @@ function normalize(raw: z.infer<typeof StatusSchema>): IntegrationStatus {
     last_ok_run_at: raw.last_ok_run_at ?? null,
     could_not_process: raw.could_not_process ?? null,
     identity_line: raw.identity_line === undefined || raw.identity_line === null ? null : { ...raw.identity_line, not_loaded: raw.identity_line.not_loaded ?? null },
+    listener_report: listenerReportOf(raw.listener_report),
   }
 }
 
@@ -586,6 +631,23 @@ function textsLine(texts: TextsStatus | null, now: number): string {
     : `  texts: from the identity-home cache (${versions}${fetched}; the server has not answered since the daemon started)`
 }
 
+/** The listener report in one line (none before it says anything): what AgentChat holds, or why it does not yet. */
+function listenerReportLines(report: IntegrationListenerReport | null, now: number): string[] {
+  if (report === null || report.state === null) return []
+  const what = `${report.state}${report.reason_kind !== null ? ` (${report.reason_kind})` : ''}`
+  if (!report.pending && report.reported !== null) {
+    const at = Date.parse(report.reported.at)
+    return [`  listener report: ${what} — AgentChat has it${Number.isNaN(at) ? '' : ` (accepted ${ago(Math.max(0, now - at))})`}`]
+  }
+  if (report.failures === 0) return [`  listener report: ${what} — being sent`]
+  const next = report.next_attempt_at === null ? null : Date.parse(report.next_attempt_at) - now
+  return [
+    `  listener report: ${what} — not delivered yet (${report.failures} attempt(s) failed${report.last_error !== null ? `, last: ${report.last_error}` : ''})${
+      next === null || Number.isNaN(next) ? '' : next > 0 ? `; tried again ${fromNow(next)}` : '; tried again now'
+    }`,
+  ]
+}
+
 /** Human lines for `status`. Pure. */
 /** Follow outcomes only the daemon can tell (the file reads the same before and after). */
 const DAEMON_ONLY_OUTCOMES: ReadonlySet<string> = new Set(['failed', 'edited_meanwhile'])
@@ -627,6 +689,7 @@ export function formatIntegrationStatus(status: IntegrationStatus | null, now = 
     ...(status.lease_errors !== undefined && status.lease_errors !== null && status.lease_errors.count > 0
       ? [`  lock: ${status.lease_errors.count} renewal(s) failed${status.lease_errors.last ? ` (last: ${status.lease_errors.last})` : ''}; a lock that cannot be renewed for 45 s is given up`]
       : []),
+    ...listenerReportLines(status.listener_report ?? null, now),
     '  delivery: acknowledged on receipt by the SDK socket (delivered = this machine received it; read is the agent’s own verdict inside its run)',
     `  wakes: ${status.wakes} (${status.wakes_absorbed} absorbed into a pending run), invites: ${status.invites}`,
     `  runs: ${status.runs_started} started, ${status.runs_ok} ok, ${status.runs_failed} failed, ${status.runs_timed_out} timed out, ${status.runs_not_started} did not start; ${status.runs_skipped_empty} wake(s) found the tray empty (no run)`,

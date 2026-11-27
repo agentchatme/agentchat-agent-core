@@ -9,8 +9,8 @@ importers:
   .:
     dependencies:
       agentchatme:
-        specifier: ^1.8.0
-        version: 1.8.0(ws@8.21.1)
+        specifier: ^1.11.0
+        version: 1.11.0(ws@8.21.1)
       cross-spawn:
         specifier: ^7.0.6
         version: 7.0.6
@@ -557,8 +557,8 @@ packages:
     engines: {node: '>=0.4.0'}
     hasBin: true
 
-  agentchatme@1.8.0:
-    resolution: {integrity: sha512-nKNxyoih8TFUGcgUZcojjQa2tS2FsdorWXXgkRLgXuDAkoN1lLjEyK0oQZPp0aMI46mEctwXbZE3BZO08xI7VQ==}
+  agentchatme@1.11.0:
+    resolution: {integrity: sha512-SHWhDRVCbWnEirR6QDifwII/fap1ckvybtH6t7BJusVuBsu/02sMMPFRofSa5PzO7GV82fso3tRBJz1InrOaTQ==}
     engines: {node: '>=20.0.0'}
     peerDependencies:
       ws: '>=8.21.1'
@@ -1274,7 +1274,7 @@ snapshots:
 
   acorn@8.17.0: {}
 
-  agentchatme@1.8.0(ws@8.21.1):
+  agentchatme@1.11.0(ws@8.21.1):
     optionalDependencies:
       ws: 8.21.1
 

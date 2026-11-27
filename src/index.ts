@@ -219,6 +219,7 @@ export {
   type IntegrationCouldNotProcess,
   type IntegrationIdentityLine,
   type IntegrationPausedConversation,
+  type IntegrationListenerReport,
   describePausedConversations,
   describeCouldNotProcessCounts,
   repeatedFailedRuns,
@@ -252,6 +253,19 @@ export { isRunnerFactory } from './integration/runner.js'
 export { RUN_CONTEXT_ENV, runContextEnv } from './integration/run-context.js'
 // Could not process: the conversations paused for this agent, as the server answered.
 export { COULD_NOT_PROCESS_FILE, couldNotProcessPath, PausedConversations, type PausedConversation } from './integration/could-not-process.js'
+// The listener report (contract v1 §3.13): the commands that end the listener
+// on purpose (logout, uninstall, daemon disable) tell AgentChat it stopped,
+// BEFORE the key or the service goes; the daemon reports the rest itself.
+export {
+  reportListenerStopped,
+  describeListenerStopped,
+  readListenerInstanceId,
+  listenerIdPath,
+  LISTENER_ID_FILE,
+  STOPPED_REPORT_TIMEOUT_MS,
+  type ListenerStoppedResult,
+  type ReportListenerStoppedOptions,
+} from './integration/listener-report.js'
 
 // The identity command set. An integration describes itself once (HostProfile)
 // and gets register/login/recover/status/logout/doctor back.

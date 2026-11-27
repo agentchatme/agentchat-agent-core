@@ -15,6 +15,8 @@
 export { runIntegration, type RunIntegrationOpts } from './integration/run.js'
 export { Integration, RUNNER_DEADLINE_SLACK_MS, PREFLIGHT_DEADLINE_MS, RUNTIME_CHECK_DEADLINE_MS, type IntegrationOptions } from './integration/integration.js'
 export { socketStateOf, blockedDetail } from './integration/socket-state.js'
+// The listener report the integration keeps (contract v1 §3.13): its reporter and what it says.
+export { createListenerReporter, ensureListenerInstanceId, type CreateListenerReporterOptions, type ListenerReportSink, type ListenerReportTiming } from './integration/listener-report.js'
 export { spawnRun, redactDiagnostic, sweepWindowsDescendants, describeWindowsSweep, WINDOWS_SWEEP_TIMEOUT_MS, type SpawnRunSpec, type WindowsSweep } from './integration/spawn-run.js'
 export type {
   RunRunner,

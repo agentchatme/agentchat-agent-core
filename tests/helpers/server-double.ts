@@ -32,6 +32,9 @@ import { textsFor } from './served-texts.js'
 //   * POST /v1/conversations/{id}/processing-failures
 //                                  → recorded; answered from a scripted queue
 //                                    (default `none`)
+//   * PUT /v1/agents/me/listener   → recorded (the listener report, contract
+//                                    v1 §3.13); answered 200 with the record,
+//                                    or with `setListenerReportStatus`
 // and, with `manual`, the manual the texts announce, at `<apiBase>/skill.md`
 // (plain HTTP to loopback, which the manual download accepts for a local
 // development server).
@@ -73,6 +76,15 @@ export interface ProcessingFailurePost {
   conversationId: string
   body: { through_message_id?: unknown; outcome?: unknown; evidence?: unknown }
   idempotencyKey: string | undefined
+}
+
+/** One `PUT /v1/agents/me/listener` the double received. */
+export interface ListenerReportPut {
+  readonly body: { instance_id?: unknown; state?: unknown; reason_kind?: unknown }
+  /** The bearer key it was sent with. */
+  readonly apiKey: string | undefined
+  /** When it arrived (this machine's clock). */
+  readonly at: number
 }
 
 /** What the double answers a processing-failure report with. */
@@ -124,6 +136,12 @@ export interface ServerDouble {
   readonly processingFailures: ProcessingFailurePost[]
   /** Answer the next reports with these, in order (then `none`). */
   answerProcessingFailures(...answers: ProcessingFailureAnswer[]): void
+  /** Every listener report, in order. */
+  readonly listenerReports: ListenerReportPut[]
+  /** Called as each listener report arrives, before it is answered (what was true at that moment). */
+  onListenerReport(fn: (put: ListenerReportPut) => void): void
+  /** Answer listener reports with this HTTP status from now on (200: the record); `hang` never answers. */
+  setListenerReportStatus(status: number | 'hang'): void
   /** Push a frame to the most recent live socket. */
   send(frame: unknown): void
   /** From now on, refuse a hello with this key (close 1008 'Invalid token'), as for a key rotated elsewhere. */
@@ -148,6 +166,9 @@ export async function startServerDouble(options: ServerDoubleOptions = {}): Prom
   const dismissed: string[] = []
   const processingFailures: ProcessingFailurePost[] = []
   const failureAnswers: ProcessingFailureAnswer[] = []
+  const listenerReports: ListenerReportPut[] = []
+  const listenerReportHooks: Array<(put: ListenerReportPut) => void> = []
+  let listenerReportStatus: number | 'hang' = 200
   const conversationRunTemplate = options.conversationRunTemplate
   const served: Served[] = []
   const requests: string[] = []
@@ -173,6 +194,44 @@ export async function startServerDouble(options: ServerDoubleOptions = {}): Prom
         const key = req.headers['idempotency-key']
         processingFailures.push({ conversationId: decodeURIComponent(failure[1] ?? ''), body, idempotencyKey: Array.isArray(key) ? key[0] : key })
         res.end(JSON.stringify(failureAnswers.shift() ?? { action: 'none', attempts: 1, hidden_message_ids: [], paused_until: null }))
+      })
+      return
+    }
+    if (url.pathname === '/v1/agents/me/listener' && req.method === 'PUT') {
+      let raw = ''
+      req.on('data', (chunk: Buffer) => {
+        raw += chunk.toString('utf-8')
+      })
+      req.on('end', () => {
+        let body: ListenerReportPut['body'] = {}
+        try {
+          body = JSON.parse(raw) as ListenerReportPut['body']
+        } catch {
+          /* recorded as empty */
+        }
+        const auth = req.headers.authorization
+        const put: ListenerReportPut = { body, apiKey: typeof auth === 'string' ? auth.replace(/^Bearer /, '') : undefined, at: Date.now() }
+        listenerReports.push(put)
+        for (const hook of listenerReportHooks) hook(put)
+        if (listenerReportStatus === 'hang') return
+        if (listenerReportStatus !== 200) {
+          res.statusCode = listenerReportStatus
+          res.end(JSON.stringify({ code: listenerReportStatus === 503 ? 'LISTENER_REPORTS_UNAVAILABLE' : 'INTERNAL_ERROR', message: `listener report ${listenerReportStatus}` }))
+          return
+        }
+        const at = new Date().toISOString()
+        const state = typeof body.state === 'string' ? body.state : 'ok'
+        res.end(
+          JSON.stringify({
+            listener: {
+              instance_id: body.instance_id,
+              state,
+              reason_kind: state === 'ok' || state === 'stopped' ? null : (body.reason_kind ?? 'other'),
+              state_since: at,
+              reported_at: at,
+            },
+          }),
+        )
       })
       return
     }
@@ -281,6 +340,13 @@ export async function startServerDouble(options: ServerDoubleOptions = {}): Prom
     answerProcessingFailures: (...answers) => {
       failureAnswers.push(...answers)
     },
+    listenerReports,
+    onListenerReport: (fn) => {
+      listenerReportHooks.push(fn)
+    },
+    setListenerReportStatus: (status) => {
+      listenerReportStatus = status
+    },
     refuseKey: (apiKey) => {
       refusedKeys.add(apiKey)
     },
@@ -299,6 +365,8 @@ export async function startServerDouble(options: ServerDoubleOptions = {}): Prom
     close: async () => {
       for (const entry of served) entry.socket.terminate()
       await new Promise<void>((resolve) => wss.close(() => resolve()))
+      // A request held open (a listener report set to `hang`) would hold the close.
+      server.closeAllConnections()
       await new Promise<void>((resolve) => server.close(() => resolve()))
     },
   }

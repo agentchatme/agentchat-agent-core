@@ -157,24 +157,24 @@ describe('logout takes out only this agent\'s block', () => {
     return out
   }
 
-  it('removes this agent\'s block (read with the kept texts), keeps the user\'s text', () => {
+  it('removes this agent\'s block (read with the kept texts), keeps the user\'s text', async () => {
     const { home, anchor, commands } = fixture()
     // An unmarked block in the served words: this agent's only by the kept texts' exact line.
     writeTextsCacheFile(home, 'generic', { ...textsFor('probe'), identity_line: 'Probe speaks here as @probe on AgentChat.', identity_line_template: 'Probe speaks here as @<handle> on AgentChat.' }, new Date())
     fs.writeFileSync(anchor, `${USER_BEFORE}\n\n<!-- agentchat:start -->\nProbe speaks here as @probe on AgentChat.\n<!-- agentchat:end -->\n`)
     const out = capture()
-    expect(commands.runLogout()).toBe(0)
+    expect(await commands.runLogout()).toBe(0)
     expect(fs.readFileSync(anchor, 'utf-8')).toBe(`${USER_BEFORE}\n`)
     expect(out.join('\n')).toContain('identity line removed')
   })
 
-  it('leaves a block the user wrote, and another agent\'s, and says so', () => {
+  it('leaves a block the user wrote, and another agent\'s, and says so', async () => {
     for (const block of [['<!-- agentchat:start -->', 'I am @probe here, and these are my rules.', '<!-- agentchat:end -->'].join('\n'), renderAnchorBlock(servedLine('someone-else'), 'someone-else')]) {
       const { anchor, commands } = fixture()
       const text = `${USER_BEFORE}\n\n${block}\n`
       fs.writeFileSync(anchor, text)
       const out = capture()
-      expect(commands.runLogout()).toBe(0)
+      expect(await commands.runLogout()).toBe(0)
       expect(fs.readFileSync(anchor, 'utf-8')).toBe(text)
       expect(out.join('\n')).toMatch(/left (your edited|@someone-else's) AgentChat block in .*; remove it by hand if you no longer want it/)
       vi.restoreAllMocks()

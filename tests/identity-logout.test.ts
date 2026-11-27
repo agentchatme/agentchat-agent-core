@@ -44,22 +44,22 @@ afterEach(() => {
 })
 
 describe('logout', () => {
-  it('passes the pre-clear identity — key AND non-default api_base — to unplace, then the credential is gone', () => {
+  it('passes the pre-clear identity — key AND non-default api_base — to unplace, then the credential is gone', async () => {
     const { home, seen, commands } = fixture()
     const apiKey = `ac_${'u'.repeat(32)}`
     writeCredentials(home, { api_key: apiKey, handle: 'probe', api_base: 'https://api.staging.example' })
     vi.spyOn(console, 'log').mockImplementation(() => undefined)
 
-    expect(commands.runLogout()).toBe(0)
+    expect(await commands.runLogout()).toBe(0)
 
     expect(seen).toEqual([{ apiKey, apiBase: 'https://api.staging.example', handle: 'probe', source: 'file' }])
     expect(readCredentials(home)).toBeNull()
   })
 
-  it('passes null when there was no identity, and still lets the host undo a stray placement', () => {
+  it('passes null when there was no identity, and still lets the host undo a stray placement', async () => {
     const { seen, commands } = fixture()
     vi.spyOn(console, 'log').mockImplementation(() => undefined)
-    expect(commands.runLogout()).toBe(0)
+    expect(await commands.runLogout()).toBe(0)
     expect(seen).toEqual([null])
   })
 })

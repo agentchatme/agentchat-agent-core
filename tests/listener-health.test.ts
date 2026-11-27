@@ -963,7 +963,8 @@ describe('one agent, one listener: the supervisor', () => {
       await until(() => readIntegrationStatus(home1)?.socket === 'ready', 10_000)
       b = daemon(home2, okRunner())
       await until(() => (readIntegrationStatus(home2)?.standby ?? null) !== null, 10_000)
-      const asks = (): number => double.requests.filter((r) => r.startsWith('/v1/agents/me')).length
+      // Who it is (`GET /v1/agents/me`), not the listener report the holder sends (`/v1/agents/me/listener`).
+      const asks = (): number => double.requests.filter((r) => r === '/v1/agents/me' || r.startsWith('/v1/agents/me?')).length
       const before = asks()
       const t0 = readIntegrationStatus(home2)?.updated_at ?? ''
       // Several standby polls later: the status moved on, the server was not asked again.
