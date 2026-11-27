@@ -190,6 +190,32 @@ export function ensureInstallId(home: string): string | null {
   }
 }
 
+// The runtime this integration last found itself in (`<runtime>/<version>`),
+// as a command read it (`HostProfile.host()`): the daemon names it on its
+// socket without running the runtime's `--version` before it starts.
+export const HOST_FILE = 'runtime-host'
+const HOST_SHAPE = /^[A-Za-z0-9][A-Za-z0-9._+/-]{0,63}$/
+
+/** The host a command last read here, or null. */
+export function readRememberedHost(home: string): string | null {
+  try {
+    const host = fs.readFileSync(path.join(home, HOST_FILE), 'utf-8').trim()
+    return HOST_SHAPE.test(host) ? host : null
+  } catch {
+    return null
+  }
+}
+
+/** Keep the host a command read (when it changed). Never throws. */
+export function rememberHost(home: string, host: string): void {
+  if (!HOST_SHAPE.test(host) || readRememberedHost(home) === host) return
+  try {
+    atomicWriteFile(path.join(home, HOST_FILE), `${host}\n`, 0o600)
+  } catch {
+    /* a host not kept is read again next time */
+  }
+}
+
 /** Remove the home's install id (uninstall). True when there was one. */
 export function clearInstallId(home: string): boolean {
   try {

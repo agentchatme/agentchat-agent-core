@@ -1,3 +1,4 @@
+import * as fs from 'node:fs'
 import * as readline from 'node:readline'
 import { AgentChatClient, integration as kit, type SignupFlow, type Texts } from 'agentchatme'
 import {
@@ -12,6 +13,7 @@ import {
   writePending,
   clearPending,
   ensureInstallId,
+  rememberHost,
   type PendingSignup,
 } from './credentials.js'
 import { clearOfferDeclined } from './state.js'
@@ -329,6 +331,8 @@ export function createIdentityCommands(profile: HostProfile, options: IdentityCo
           if (timer !== undefined) clearTimeout(timer)
         }
       }
+      // The daemon names the host from what a command last read (it does not run `--version` before it starts).
+      if (host !== null && fs.existsSync(profile.home())) rememberHost(profile.home(), host)
       client = { ...profile.client, ...(installId !== null ? { installId } : {}), ...(host !== null ? { host } : {}) }
     })()
     return prepared

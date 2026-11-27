@@ -5,7 +5,7 @@ import * as os from 'node:os'
 import * as path from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { clientIdentityOf, hostIdentityOf, installMethodOf } from '../src/client-identity.js'
-import { clearCredentials, clearInstallId, ensureInstallId, installIdPath, readInstallId, writeCredentials } from '../src/identity/credentials.js'
+import { clearCredentials, clearInstallId, ensureInstallId, installIdPath, readInstallId, readRememberedHost, rememberHost, writeCredentials } from '../src/identity/credentials.js'
 import {
   httpTelemetrySender,
   sendSetupVerdict,
@@ -68,6 +68,16 @@ describe('the install id', () => {
     const id = ensureInstallId(home)
     expect(id).toMatch(INSTALL_ID)
     expect(readInstallId(home)).toBe(id)
+  })
+})
+
+describe('the remembered host (what the daemon names without probing)', () => {
+  it('keeps a host of the platform shape, and nothing else', () => {
+    expect(readRememberedHost(home)).toBeNull()
+    rememberHost(home, 'claude-code/2.1.332')
+    expect(readRememberedHost(home)).toBe('claude-code/2.1.332')
+    rememberHost(home, 'not a host value')
+    expect(readRememberedHost(home)).toBe('claude-code/2.1.332')
   })
 })
 
