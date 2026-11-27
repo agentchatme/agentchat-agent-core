@@ -39,6 +39,9 @@ export const SETUP_GRACE_MS = 90_000
  */
 const KEY_FOLLOW_MS = 15_000
 
+/** How far a file's time may run ahead of this process's clock and still count as now. */
+const CLOCK_SLACK_MS = 2_000
+
 export const SETUP_STATES = [
   'no_account',
   'code_pending',
@@ -299,7 +302,9 @@ export function readListener(home: string, handle: string | null, options: ReadL
     else if (status.socket === 'idle' && status.last_error !== null) daemon = { kind: 'start_failure', detail: status.last_error }
     else daemon = { kind: 'connecting' }
   }
-  const withinGrace = alwaysOnState(home) === 'starting' || (keySavedAt !== null && now - keySavedAt >= 0 && now - keySavedAt <= SETUP_GRACE_MS)
+  // A file's mtime has sub-millisecond precision and `now` does not: a key saved this instant can read as a hair in the future.
+  const sinceSaved = keySavedAt === null ? null : now - keySavedAt
+  const withinGrace = alwaysOnState(home) === 'starting' || (sinceSaved !== null && sinceSaved > -CLOCK_SLACK_MS && sinceSaved <= SETUP_GRACE_MS)
   return {
     optedOut: alwaysOnOptedOut(home),
     wanted: alwaysOnWanted(home),
