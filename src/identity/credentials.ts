@@ -1,3 +1,4 @@
+import * as crypto from 'node:crypto'
 import * as fs from 'node:fs'
 import * as path from 'node:path'
 import { z } from 'zod'
@@ -129,8 +130,79 @@ export function writeCredentials(home: string, creds: Credentials): void {
   atomicWriteFile(credentialsPath(home), JSON.stringify(creds, null, 2) + '\n', 0o600)
 }
 
+// ─── The install id ──────────────────────────────────────────────────────────
+//
+// One random id per identity home: `ins_` and 22 base64url characters (16
+// random bytes), never derived from the machine, the user or a path. It names
+// this install to the server (`install` in X-AgentChat-Platform, and the
+// setup telemetry) so an install can be followed from before its sign-up to
+// its agent, and nothing else. Kept beside the credentials (owner-only); it
+// survives logout (the same install signs in again) and goes with uninstall
+// (`clearInstallId`). Under AGENTCHAT_TELEMETRY=off none is made or sent.
+
+export const INSTALL_ID_FILE = 'install-id'
+const INSTALL_ID_SHAPE = /^ins_[A-Za-z0-9_-]{22}$/
+
+export function installIdPath(home: string): string {
+  return path.join(home, INSTALL_ID_FILE)
+}
+
+/** The home's install id, or null when there is none (or the file holds something else). Never creates one. */
+export function readInstallId(home: string): string | null {
+  try {
+    const id = fs.readFileSync(installIdPath(home), 'utf-8').trim()
+    return INSTALL_ID_SHAPE.test(id) ? id : null
+  } catch {
+    return null
+  }
+}
+
+/** A new install id: `ins_` and 22 base64url characters from 16 random bytes. */
+export function newInstallId(): string {
+  return `ins_${crypto.randomBytes(16).toString('base64url')}`
+}
+
+/**
+ * The home's install id, made once: created with an exclusive open, so two
+ * commands starting at the same moment agree on one (the second reads the
+ * first's). A file that holds something else is replaced. Null when the home
+ * cannot be written; never throws.
+ */
+export function ensureInstallId(home: string): string | null {
+  const existing = readInstallId(home)
+  if (existing !== null) return existing
+  try {
+    fs.mkdirSync(home, { recursive: true, mode: 0o700 })
+    const id = newInstallId()
+    try {
+      fs.writeFileSync(installIdPath(home), `${id}\n`, { flag: 'wx', mode: 0o600 })
+      return id
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') return null
+      // Another command made it first, or what is there is not an id: read it, else replace it.
+      const theirs = readInstallId(home)
+      if (theirs !== null) return theirs
+      atomicWriteFile(installIdPath(home), `${id}\n`, 0o600)
+      return id
+    }
+  } catch {
+    return null
+  }
+}
+
+/** Remove the home's install id (uninstall). True when there was one. */
+export function clearInstallId(home: string): boolean {
+  try {
+    fs.unlinkSync(installIdPath(home))
+    return true
+  } catch {
+    return false
+  }
+}
+
 /** Delete the credential and any half-finished registration in `home`.
- *  Touches nothing outside `home` — that is the caller's whole agent. */
+ *  Touches nothing outside `home` — that is the caller's whole agent.
+ *  The install id stays: the same install may sign in again. */
 export function clearCredentials(home: string): boolean {
   let removed = false
   for (const p of [credentialsPath(home), pendingPath(home)]) {

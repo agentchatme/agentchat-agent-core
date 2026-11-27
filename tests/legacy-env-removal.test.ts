@@ -50,6 +50,7 @@ const CURRENT = new Set([
   'AGENTCHAT_RUN_MAX_BUDGET_USD',
   'AGENTCHAT_LISTENER_API_KEY',
   'AGENTCHAT_SERVICE_DRY_RUN',
+  'AGENTCHAT_TELEMETRY',
   // A run's context, set for a command the owner configured (`runContextEnv`), never read here.
   'AGENTCHAT_WAKE_KIND',
   'AGENTCHAT_RUN_ID',

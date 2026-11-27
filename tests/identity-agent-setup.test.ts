@@ -8,11 +8,13 @@ import { createIdentityCommands, type IdentityCommandOptions } from '../src/iden
 import { renderAnchorBlock } from '../src/anchor/block.js'
 import { readCredentials, writeCredentials, writePending } from '../src/identity/credentials.js'
 import type { HostProfile, ListenerEnsure, PlacementProblem } from '../src/identity/host-profile.js'
+import type { TelemetryRequest } from '../src/identity/telemetry.js'
+import { readInstallId } from '../src/identity/credentials.js'
 import { markAlwaysOnInstalledVersion, markAlwaysOnOptOut, markAlwaysOnWanted } from '../src/daemon/health.js'
 import { DAEMON_LOCK_FILE } from '../src/daemon/leader-lock.js'
 import { writeIntegrationStatus, type IntegrationStatus } from '../src/integration/status.js'
 import { mockServedTexts } from './helpers/served-texts.js'
-import { fakeKey, me, recovered, registered, signupServer } from './helpers/signup-server.js'
+import { askParam, codeSent, fakeKey, me, recovered, registered, signupServer } from './helpers/signup-server.js'
 
 // ─── Every account command leaves a listening agent, and says so ────────────
 //
@@ -434,6 +436,7 @@ describe('status says the verdict first, and as `.setup`', () => {
       needs_person: false,
       ask: null,
       detail: null,
+      reason: null,
     })
   })
 
@@ -518,5 +521,109 @@ describe('install’s last line (confirmSetup)', () => {
     const verdict = await commands.confirmSetup({ ensure: { outcome: 'installed', detail: 'svc' } })
     expect(verdict?.state).toBe('ready')
     expect(last(out)).toMatch(/^Setup: ready — @probe is listening on this computer: a peer's message starts a Example run here\. A new Example session/)
+  })
+})
+
+describe('setup telemetry: one event per command that says a verdict', () => {
+  function recording(o: FixtureOptions = {}): Fixture & { sent: TelemetryRequest[] } {
+    const sent: TelemetryRequest[] = []
+    const f = fixture({ ...o, options: { ...o.options, telemetrySender: async (r) => void sent.push(r) } })
+    return { ...f, sent }
+  }
+  const saved = process.env['AGENTCHAT_TELEMETRY']
+  afterEach(() => {
+    if (saved === undefined) delete process.env['AGENTCHAT_TELEMETRY']
+    else process.env['AGENTCHAT_TELEMETRY'] = saved
+  })
+
+  it('status with no account: anonymous (no key), named by the install id made for this home', async () => {
+    const { home, commands, sent } = recording()
+    capture()
+    expect(await commands.runStatus({})).toBe(0)
+    expect(sent).toHaveLength(1)
+    expect(sent[0]!.apiKey).toBeNull()
+    expect(sent[0]!.clientIdentity.installId).toBe(readInstallId(home))
+    expect(sent[0]!.clientIdentity.installId).toMatch(/^ins_[A-Za-z0-9_-]{22}$/)
+    expect(sent[0]!.body.events[0]).toMatchObject({ name: 'setup_verdict', props: { state: 'no_account', command: 'status', needs_person: false, exit_code: 0 } })
+  })
+
+  it('login: the event carries the new key, the reason word and exit 0; every request names the install and the host', async () => {
+    const host = vi.fn(() => 'example/9.8.7')
+    const sent: TelemetryRequest[] = []
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'agentchat-agent-setup-'))
+    homes.push(home)
+    const profile: HostProfile = {
+      label: 'Example',
+      id: 'example',
+      client: { runtime: 'generic', version: '0.8.0' },
+      home: () => home,
+      invocation: () => INVOKE,
+      renderAnchor: renderAnchorBlock,
+      ensureListener: () => ({ outcome: 'opted_out', detail: null }),
+      host,
+    }
+    const commands = createIdentityCommands(profile, { serviceDryRun: false, telemetrySender: async (r) => void sent.push(r) })
+    const key = fakeKey('t')
+    const server = signupServer().on('GET /v1/agents/me', me('login-agent'), me('login-agent'))
+    keyOnStdin(key)
+    capture()
+
+    expect(await commands.runLogin({ apiKey: '-' })).toBe(0)
+
+    expect(host).toHaveBeenCalledTimes(1)
+    expect(server.calls[0]!.headers['x-agentchat-platform']).toContain('host="example/9.8.7"')
+    expect(server.calls[0]!.headers['x-agentchat-platform']).toContain(`install="${readInstallId(home)}"`)
+    expect(sent).toHaveLength(1)
+    expect(sent[0]!.apiKey).toBe(key)
+    expect(sent[0]!.body.events[0]!.props).toMatchObject({ state: 'listener_off', command: 'login', reason: 'opted_out', exit_code: 0 })
+    expect(JSON.stringify(sent[0]!.body)).not.toContain(key)
+  })
+
+  it('register that sent a code: one event (code_pending); a step that failed says no verdict and sends nothing', async () => {
+    const { commands, sent } = recording()
+    signupServer()
+      .on('POST /v1/register', codeSent('register', 'pnd_t', 'We sent a 6-digit code to owner@example.com.'))
+    capture()
+    expect(await commands.runRegister({ email: 'owner@example.com', handle: 'new-agent' })).toBe(0)
+    expect(sent.map((r) => r.body.events[0]!.props)).toEqual([expect.objectContaining({ state: 'code_pending', command: 'register', exit_code: 0 })])
+    expect(JSON.stringify(sent[0]!.body)).not.toMatch(/owner@example\.com|new-agent/)
+
+    const again = recording()
+    signupServer().on('POST /v1/register', askParam('register', 409, 'HANDLE_TAKEN', 'That handle is taken.', 'handle'))
+    capture()
+    expect(await again.commands.runRegister({ email: 'owner@example.com', handle: 'taken-agent' })).toBe(1)
+    expect(again.sent).toEqual([])
+  })
+
+  it('AGENTCHAT_TELEMETRY=off: nothing sent, and no install id made or named', async () => {
+    process.env['AGENTCHAT_TELEMETRY'] = 'off'
+    const { home, commands, sent } = recording()
+    const server = signupServer().on('GET /v1/agents/me', me('login-agent'), me('login-agent'))
+    keyOnStdin(fakeKey('x'))
+    capture()
+    expect(await commands.runLogin({ apiKey: '-' })).toBe(0)
+    expect(sent).toEqual([])
+    expect(readInstallId(home)).toBeNull()
+    expect(server.calls[0]!.headers['x-agentchat-platform'] ?? '').not.toContain('install=')
+  })
+
+  it('doctor ends with the verdict and reports it; install reports through reportSetup with its own exit code', async () => {
+    const { home, commands, sent } = recording()
+    writeCredentials(home, { api_key: fakeKey('d'), handle: 'probe' })
+    mockServedTexts('probe')
+    vi.spyOn(AgentChatClient.prototype, 'getMe').mockResolvedValue({ handle: 'probe', status: 'active' } as never)
+    const { out } = capture()
+
+    await commands.runDoctor()
+    expect(last(out)).toMatch(/^Setup: listener_missing — /)
+    expect(sent.map((r) => r.body.events[0]!.props.command)).toEqual(['doctor'])
+
+    const startedAt = Date.now() - 20
+    await commands.confirmSetup({ ensure: { outcome: 'failed', detail: 'nope' } })
+    await commands.reportSetup({ command: 'install', exitCode: 1, startedAt })
+    expect(sent[1]!.body.events[0]!.props).toMatchObject({ command: 'install', exit_code: 1, state: 'listener_missing', reason: 'register_failed' })
+    // Said once, reported once.
+    await commands.reportSetup({ command: 'install', exitCode: 1, startedAt })
+    expect(sent).toHaveLength(2)
   })
 })

@@ -32,7 +32,7 @@
 // What belongs to each integration: where its home is, which file its anchor
 // lives in, and where its runtime keeps skills.
 
-export { clientIdentityOf, clientHeadersOf, clientNameOf, type IntegrationClient } from './client-identity.js'
+export { clientIdentityOf, clientHeadersOf, clientNameOf, hostIdentityOf, installMethodOf, type IntegrationClient } from './client-identity.js'
 export { VERSION } from './version.js'
 
 // Counts on the tray (through the SDK), for `status`.
@@ -71,6 +71,12 @@ export {
   readPending,
   writePending,
   clearPending,
+  INSTALL_ID_FILE,
+  installIdPath,
+  readInstallId,
+  ensureInstallId,
+  newInstallId,
+  clearInstallId,
   type Credentials,
   type ResolvedIdentity,
   type ResolveIdentityOptions,
@@ -252,6 +258,7 @@ export {
   type IdentityCommands,
   type IdentityCommandOptions,
   type ConfirmSetupOptions,
+  type ReportSetupOptions,
   type RegisterOpts,
   type RecoverOpts,
   type DoctorOpts,
@@ -293,6 +300,23 @@ export {
   type DaemonWord,
   type ListenerReasonKind,
 } from './identity/setup.js'
+// Setup telemetry: one `setup_verdict` event per command that says a verdict (POST /v1/telemetry).
+export {
+  sendSetupVerdict,
+  setupVerdictEvent,
+  httpTelemetrySender,
+  telemetryOff,
+  TELEMETRY_ENV,
+  TELEMETRY_PATH,
+  TELEMETRY_TIMEOUT_MS,
+  TELEMETRY_VERSION,
+  type SetupCommand,
+  type SetupVerdictEvent,
+  type TelemetryBody,
+  type TelemetryRequest,
+  type TelemetrySender,
+  type SendSetupVerdictOptions,
+} from './identity/telemetry.js'
 
 // Service plumbing: always-on markers, heartbeat, leader lock, service units.
 export {

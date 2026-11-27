@@ -72,6 +72,13 @@ export interface SetupVerdict {
   readonly ask: string | null
   /** The facts behind it, as found: the listener's own error, the server's words, a note. Null when none. */
   readonly detail: string | null
+  /**
+   * One word for why, within the state (`^[a-z][a-z0-9_]{0,31}$`): the
+   * runtime's reason kind (`not_signed_in`, `runtime_missing`, …),
+   * `opted_out`, `standby`, `older_listener`, `not_seen`, …; null when the
+   * state says it all. What setup telemetry sends beside the state.
+   */
+  readonly reason: string | null
 }
 
 /** The verdict in one line. */
@@ -364,7 +371,15 @@ export interface SetupInputs {
 const PERSON = 'the person you work with'
 
 function verdict(state: SetupState, next: string, extra: Partial<Omit<SetupVerdict, 'state' | 'next'>> = {}): SetupVerdict {
-  return { state, next, command: extra.command ?? null, needs_person: extra.needs_person ?? false, ask: extra.ask ?? null, detail: extra.detail ?? null }
+  return {
+    state,
+    next,
+    command: extra.command ?? null,
+    needs_person: extra.needs_person ?? false,
+    ask: extra.ask ?? null,
+    detail: extra.detail ?? null,
+    reason: extra.reason ?? null,
+  }
 }
 
 /** `1.2.3` as numbers, or null. */
@@ -449,7 +464,7 @@ export function setupVerdict(i: SetupInputs): SetupVerdict | null {
       return verdict(
         'key_refused',
         `AgentChat refuses the key stored for ${who} (${server.detail}), and a recovery code was emailed to ${pending.email}: run \`${command}\` with it. If you cannot read that inbox, ask ${PERSON} for the code.`,
-        { command, ask: `AgentChat emailed a code to ${pending.email}. What is it?`, detail: server.detail },
+        { command, ask: `AgentChat emailed a code to ${pending.email}. What is it?`, detail: server.detail, reason: 'recovery_code_waiting' },
       )
     }
     const recover = `${inv} recover --handle ${handle ?? '<handle>'} --email <email>`
@@ -507,6 +522,7 @@ function listenerVerdict(i: SetupInputs, r: ListenerReading, who: string, reach:
         command: enable,
         needs_person: true,
         ask: `AgentChat's listener is off on this computer, so other agents' messages to ${who} wait unanswered. May I turn it back on? It starts a ${label} run here when one of them writes.`,
+        reason: 'opted_out',
       },
     )
   }
@@ -518,6 +534,7 @@ function listenerVerdict(i: SetupInputs, r: ListenerReading, who: string, reach:
         command: enable,
         needs_person: true,
         ask: `AgentChat's listener on this computer was installed switched off (${INTEGRATION_ENV}=off), so other agents' messages to ${who} wait unanswered. May I turn it on?`,
+        reason: 'switched_off',
       },
     )
   }
@@ -525,18 +542,18 @@ function listenerVerdict(i: SetupInputs, r: ListenerReading, who: string, reach:
     return verdict(
       'listener_missing',
       `the listener could not be installed (${ensure.detail ?? 'no reason given'}). Run \`${enable}\` to try again; if it fails the same way, show ${PERSON} this line (${label} may ask them to approve the command).`,
-      { command: enable, detail: ensure.detail },
+      { command: enable, detail: ensure.detail, reason: 'register_failed' },
     )
   }
   if (!r.wanted) {
-    return verdict('listener_missing', `nothing on this computer listens for ${who}, so a peer's message cannot start a run here. Run \`${inv}\` to install the listener.`, { command: inv })
+    return verdict('listener_missing', `nothing on this computer listens for ${who}, so a peer's message cannot start a run here. Run \`${inv}\` to install the listener.`, { command: inv, reason: 'not_registered' })
   }
   if (i.identity?.source === 'env') {
     const command = `printenv AGENTCHAT_API_KEY | ${inv} login --api-key -`
     return verdict(
       'listener_failing',
       `the key is only in AGENTCHAT_API_KEY, and the listener reads only ${credentialsPath(i.home)}. Save it there: run \`${command}\`.`,
-      { command },
+      { command, reason: 'env_key_only' },
     )
   }
 
@@ -548,34 +565,34 @@ function listenerVerdict(i: SetupInputs, r: ListenerReading, who: string, reach:
       if (d.runsFailing !== null) {
         // The runtime's own words first (signed out, missing, too old); a failed model check only explains what they do not.
         const kind = listenerReasonKindOf(d.runsFailing.reason)
-        return failing(i, who, kind === 'other' && d.runtimeCheckFailing ? 'runtime_check_failed' : kind, d.runsFailing.reason, true, d.runsFailing.since)
+        return failing(i, who, kind === 'other' && d.runtimeCheckFailing ? 'runtime_check_failed' : kind, d.runsFailing.reason, true, d.runsFailing.since, 'runs_failing')
       }
       const server = serverSays(i, who, reach)
       if (server !== null) return server
-      return verdict('ready', `${who} is listening on this computer: a peer's message starts a ${label} run here.${staleNote !== null ? ` (${staleNote}.)` : ''}${readyTail(i)}`, { detail: staleNote })
+      return verdict('ready', `${who} is listening on this computer: a peer's message starts a ${label} run here.${staleNote !== null ? ` (${staleNote}.)` : ''}${readyTail(i)}`, { detail: staleNote, reason: staleNote !== null ? 'older_listener' : null })
     }
     case 'standby': {
       const other = `${d.home ?? 'another identity home'}${d.pid !== null ? `, pid ${d.pid}` : ''}`
       // Ready only when that listener says it is connected (its own status), and the server does not say otherwise.
       const holder = d.home !== null ? readListener(d.home, i.server?.kind === 'ok' ? i.server.handle : (i.identity?.handle ?? null), { now: i.now ?? Date.now() }).daemon : null
       if (holder === null || holder.kind !== 'ready') {
-        return starting(i, who, ` (another listener on this computer holds it, ${other}, and does not say it is connected)`, `another listener on this computer holds ${who}: ${other}`)
+        return starting(i, who, ` (another listener on this computer holds it, ${other}, and does not say it is connected)`, `another listener on this computer holds ${who}: ${other}`, 'standby_unconfirmed')
       }
       const server = serverSays(i, who, reach)
       if (server !== null) return server
       return verdict(
         'ready',
         `${who} is listening on this computer through another listener (${other}): a peer's message starts a run there, and this ${label} listener stands by until it stops.${readyTail(i)}`,
-        { detail: [`another listener on this computer serves ${who} from ${d.home}`, ...(staleNote !== null ? [staleNote] : [])].join('; ') },
+        { detail: [`another listener on this computer serves ${who} from ${d.home}`, ...(staleNote !== null ? [staleNote] : [])].join('; '), reason: 'standby' },
       )
     }
     case 'unservable':
       // This home gave the agent up and holds no socket: never "connected".
-      return failing(i, who, d.reason === 'runs_failing' ? listenerReasonKindOf(d.detail) : 'other', d.detail, false, null)
+      return failing(i, who, d.reason === 'runs_failing' ? listenerReasonKindOf(d.detail) : 'other', d.detail, false, null, 'unservable')
     case 'start_failure':
-      return failing(i, who, listenerReasonKindOf(d.detail), d.detail, false, null)
+      return failing(i, who, listenerReasonKindOf(d.detail), d.detail, false, null, 'start_failed')
     case 'blocked':
-      return failing(i, who, 'other', d.detail ?? 'the server refused its connection', false, null)
+      return failing(i, who, 'other', d.detail ?? 'the server refused its connection', false, null, 'blocked')
     case 'connecting':
       return starting(i, who, '', null)
     case 'none': {
@@ -584,7 +601,7 @@ function listenerVerdict(i: SetupInputs, r: ListenerReading, who: string, reach:
         return verdict(
           'listener_missing',
           `the listener installed here is from an older release (${r.installedVersion}; this is ${i.version}) and is not connected. Run \`${inv}\` to update it.`,
-          { command: inv, detail: staleNote },
+          { command: inv, detail: staleNote, reason: 'older_listener' },
         )
       }
       return verdict(
@@ -620,22 +637,24 @@ function serverSays(i: SetupInputs, who: string, reach: ReachabilityView | null)
       needs_person: true,
       ask: `AgentChat says about the listener on this computer: "${text}" Could you look at it?`,
       detail: text,
+      reason: reach.problemKind !== null && /^[a-z][a-z0-9_]{0,31}$/.test(reach.problemKind) ? reach.problemKind : 'server_failing',
     })
   }
-  return starting(i, who, ' (it says it is connected; AgentChat does not see the connection yet)', reach.text)
+  return starting(i, who, ' (it says it is connected; AgentChat does not see the connection yet)', reach.text, 'not_seen')
 }
 
-function starting(i: SetupInputs, who: string, why: string, detail: string | null): SetupVerdict {
+function starting(i: SetupInputs, who: string, why: string, detail: string | null, reason: string | null = null): SetupVerdict {
   const inv = i.invocation
   return verdict(
     'listener_starting',
     `the listener is connecting as ${who}${why}. Wait 10 s, then run \`${inv} status\`; if it still says starting after a minute, run \`${inv} doctor\`.`,
-    { command: `${inv} status`, detail },
+    { command: `${inv} status`, detail, reason },
   )
 }
 
 /** The listener cannot start runs: what only the person can do, by reason; anything else is `doctor`'s to explain. */
-function failing(i: SetupInputs, who: string, kind: ListenerReasonKind, detail: string, connected: boolean, since: string | null): SetupVerdict {
+/** `otherReason`: the word for an `other` kind (where it failed: `runs_failing`, `unservable`, `start_failed`, `blocked`). */
+function failing(i: SetupInputs, who: string, kind: ListenerReasonKind, detail: string, connected: boolean, since: string | null, otherReason: string): SetupVerdict {
   const inv = i.invocation
   const label = i.label
   const status = `${inv} status`
@@ -650,13 +669,14 @@ function failing(i: SetupInputs, who: string, kind: ListenerReasonKind, detail: 
           needs_person: true,
           ask: `${label} is not signed in for AgentChat's listener on this computer, so it cannot answer other agents. Could you sign it in? Its check says: ${detail}`,
           detail,
+          reason: kind,
         },
       )
     case 'runtime_missing':
       return verdict(
         'listener_failing',
         `the listener for ${who} cannot find ${label} (${detail}). Ask ${PERSON} to install ${label} where the listener finds it, then run \`${inv} daemon install\`.`,
-        { command: `${inv} daemon install`, needs_person: true, ask: `AgentChat's listener cannot find ${label} on this computer. Could you install it, or tell me where it is?`, detail },
+        { command: `${inv} daemon install`, needs_person: true, ask: `AgentChat's listener cannot find ${label} on this computer. Could you install it, or tell me where it is?`, detail, reason: kind },
       )
     case 'runtime_outdated':
       return verdict('listener_failing', `${label} on this computer is older than AgentChat needs (${detail}). Ask ${PERSON} to update ${label}, then run \`${status}\`.`, {
@@ -664,6 +684,7 @@ function failing(i: SetupInputs, who: string, kind: ListenerReasonKind, detail: 
         needs_person: true,
         ask: `AgentChat needs a newer ${label} on this computer. Could you update it?`,
         detail,
+        reason: kind,
       })
     case 'runtime_check_failed':
     case 'other':
@@ -671,10 +692,10 @@ function failing(i: SetupInputs, who: string, kind: ListenerReasonKind, detail: 
         return verdict(
           'listener_failing',
           `the listener for ${who} is connected, but ${label} runs fail (${detail}${since !== null ? `; since ${since}` : ''}), which usually means a usage limit or a provider outage. Ask ${PERSON} to check ${label}'s account and limits on this computer.`,
-          { command: status, needs_person: true, ask: `Runs of ${label} started by AgentChat keep failing on this computer (${detail}). Could you check its account and usage limits?`, detail },
+          { command: status, needs_person: true, ask: `Runs of ${label} started by AgentChat keep failing on this computer (${detail}). Could you check its account and usage limits?`, detail, reason: kind === 'runtime_check_failed' ? kind : otherReason },
         )
       }
-      return verdict('listener_failing', `the listener for ${who} cannot start runs: ${detail}. Run \`${inv} doctor\` and follow what it says.`, { command: `${inv} doctor`, detail })
+      return verdict('listener_failing', `the listener for ${who} cannot start runs: ${detail}. Run \`${inv} doctor\` and follow what it says.`, { command: `${inv} doctor`, detail, reason: kind === 'runtime_check_failed' ? kind : otherReason })
   }
 }
 

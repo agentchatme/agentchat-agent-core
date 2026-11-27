@@ -171,6 +171,13 @@ export interface HostProfile {
    */
   ensureListener?(): ListenerEnsure | Promise<ListenerEnsure>
   /**
+   * The runtime this integration runs inside and its version,
+   * `<runtime>/<version>` (`hostIdentityOf(runtime, <its --version output>)`),
+   * or null when it cannot be read. Asked once per command (bounded); it is
+   * the `host` member of X-AgentChat-Platform and nothing else.
+   */
+  host?(): string | null | Promise<string | null>
+  /**
    * Undo `place` for the identity being signed out: remove the key from the
    * tool server registration and anything else that would still authenticate
    * as the old identity. The anchor is removed by the shared flow. Returns
