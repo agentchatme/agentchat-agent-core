@@ -65,8 +65,11 @@ class FakeTimers implements RecheckTimers {
   now = 0
   private seq = 0
   private readonly timers = new Map<number, { due: number; ms: number; fn: () => void }>()
+  /** Every wait ever armed, in order. */
+  readonly history: number[] = []
   setTimeout(fn: () => void, ms: number): RecheckTimerHandle {
     const id = ++this.seq
+    this.history.push(ms)
     this.timers.set(id, { due: this.now + ms, ms, fn })
     return id as unknown as RecheckTimerHandle
   }
@@ -147,8 +150,25 @@ class Runner implements RunRunner {
   /** While true, a run stays open until `finish()` (or its stop). */
   hold = false
   private open: ((outcome: RunOutcome) => void) | null = null
+  private heldPreflight: ((answer: RunPreflight) => void) | null = null
+  private holdPreflight = false
+  /** The next preflight stays open until the returned function answers it. */
+  holdNextPreflight(): (answer: RunPreflight) => void {
+    this.holdPreflight = true
+    return (answer) => {
+      this.holdPreflight = false
+      const held = this.heldPreflight
+      this.heldPreflight = null
+      held?.(answer)
+    }
+  }
+  /** A held preflight has been asked and not answered yet. */
+  get preflightOpen(): boolean {
+    return this.heldPreflight !== null
+  }
   async preflight(): Promise<RunPreflight> {
     this.preflights += 1
+    if (this.holdPreflight && this.heldPreflight === null) return new Promise<RunPreflight>((resolve) => (this.heldPreflight = resolve))
     return this.pre
   }
   async start(request: RunRequest): Promise<RunOutcome> {
@@ -271,7 +291,7 @@ describe('while the report says runs_failing, the integration looks again', () =
   afterEach(async () => {
     for (const i of integrations) await i.stopAndWait(5_000)
   })
-  const build = (runner: RunRunner, sink: FakeSink, timers: FakeTimers): Integration => {
+  const build = (runner: RunRunner, sink: FakeSink, timers: FakeTimers, extra: Partial<ConstructorParameters<typeof Integration>[0]> = {}): Integration => {
     const i = new Integration({
       cfg: { apiKey: KEY, handle: 'me', apiBase: double!.apiBase, wsBase: double!.wsBase, home, workdir: path.join(home, 'w') },
       runner,
@@ -286,6 +306,7 @@ describe('while the report says runs_failing, the integration looks again', () =
       runtimeRecheckMs: 0,
       listenerReport: sink,
       recheckTimers: timers,
+      ...extra,
     })
     integrations.push(i)
     return i
@@ -297,13 +318,13 @@ describe('while the report says runs_failing, the integration looks again', () =
   }
 
   /** Connected; conv_0's run failed and so did the runtime check (a usage limit): runs_failing (runtime_check_failed). */
-  const usageLimited = async (): Promise<{ i: Integration; runner: Runner; sink: FakeSink; timers: FakeTimers }> => {
+  const usageLimited = async (extra: Partial<ConstructorParameters<typeof Integration>[0]> = {}): Promise<{ i: Integration; runner: Runner; sink: FakeSink; timers: FakeTimers }> => {
     double = await startServerDouble({ tray: { waiting: 1 }, conversationRunTemplate: 'RUN <conversation_id>' })
     const sink = new FakeSink()
     const runner = new Runner()
     runner.endings.set('conv_0', FAILED_RUN)
     const timers = new FakeTimers()
-    const i = build(runner, sink, timers)
+    const i = build(runner, sink, timers, extra)
     await i.start()
     await until(() => sink.now === 'runs_failing/runtime_check_failed', 5_000)
     await i.idle()
@@ -442,6 +463,68 @@ describe('while the report says runs_failing, the integration looks again', () =
     runner.finish(OK_RUN)
     await until(() => sink.now === 'ok', 5_000)
     expect(timers.armed).toEqual([])
+  }, 20_000)
+
+  it('a wake waiting out its quiet window (a cycle starts within seconds): that re-check is skipped, before its preflight', async () => {
+    const { i, runner, timers } = await usageLimited({ quietMs: 1_500, maxMs: 3_000 })
+    const preflights = runner.preflights
+    wake('m1')
+    await until(() => i.snapshot().wakes >= 2, 5_000)
+    expect(await timers.advance(30 * MIN, settled(i))).toBe(1)
+    expect(runner.preflights).toBe(preflights)
+    expect(runner.checks).toBe(1)
+    expect(timers.armed).toEqual([HOUR])
+  }, 20_000)
+
+  it('the kit\'s own runtime check under way: that re-check is skipped (never two model calls at once)', async () => {
+    const { i, runner, timers } = await usageLimited()
+    runner.check = 'hang'
+    wake('m1') // conv_0 fails again; the kit asks its own check, which stays out
+    await until(() => runner.checks === 2, 5_000)
+    const preflights = runner.preflights
+    expect(await timers.advance(30 * MIN, settled(i))).toBe(1)
+    expect(runner.checks).toBe(2)
+    expect(runner.preflights).toBe(preflights)
+    expect(timers.armed).toEqual([HOUR])
+  }, 20_000)
+
+  it('the kit asking its own check while the re-check\'s model call is out stops that call first: one model call at a time', async () => {
+    const { i, runner, sink, timers } = await usageLimited()
+    runner.check = 'hang'
+    expect(await timers.advance(30 * MIN)).toBe(1)
+    await until(() => runner.checks === 2, 5_000)
+    runner.check = USAGE_LIMIT
+    // The kit's seam (what `ReceiveLoop` calls after a failed run).
+    const kitCheck = (i as unknown as { checkRuntime(): Promise<RunPreflight> }).checkRuntime()
+    expect(runner.checkAborts).toBe(1)
+    expect(await kitCheck).toMatchObject({ ok: false })
+    expect(runner.checks).toBe(3)
+    await i.runsFailingRecheckDone()
+    expect(sink.now).toBe('runs_failing/runtime_check_failed')
+    expect(timers.armed).toEqual([HOUR])
+  }, 20_000)
+
+  it.each([
+    ['fails', FAILED_RUN, 'runs_failing/runtime_check_failed'],
+    ['completes', OK_RUN, 'ok'],
+  ] as const)('a run that starts (and %s) while the re-check\'s preflight is out: that older answer is dropped', async (_what, ending, after) => {
+    const { i, runner, sink, timers } = await usageLimited()
+    const answer = runner.holdNextPreflight()
+    expect(await timers.advance(30 * MIN)).toBe(1)
+    await until(() => runner.preflightOpen, 5_000)
+    runner.endings.set('conv_0', ending)
+    wake('m1')
+    await until(() => runner.starts === 2, 5_000)
+    await i.idle()
+    await i.runtimeCheckDone()
+    await until(() => sink.now === after, 5_000)
+    const checks = runner.checks
+    answer({ ok: false, detail: SIGNED_OUT }) // older than the run: it must not bring not_signed_in back
+    await i.runsFailingRecheckDone()
+    await flush()
+    expect(sink.now).toBe(after)
+    expect(runner.checks).toBe(checks)
+    expect(timers.armed).toEqual(after === 'ok' ? [] : [HOUR])
   }, 20_000)
 
   it('a completed run ends the episode; the next failure is a new one, from 30 min again', async () => {
@@ -588,7 +671,8 @@ describe('the supervisor: only the home that holds the agent re-checks', () => {
       wake('m1', 'conv_1')
       await until(() => readIntegrationStatus(home2)?.socket === 'ready', 15_000)
       expect(changesOf(states(home1))).toEqual(['ok', 'runs_failing/not_signed_in'])
-      expect(timers.armed).toEqual([])
+      expect(timers.history).toEqual([30 * MIN]) // armed while it held the agent
+      expect(timers.armed).toEqual([]) // and cleared when it gave it up
       broken.pre = { ok: true }
       const preflights = broken.preflights
       expect(await timers.advance(10 * HOUR)).toBe(0)
@@ -623,6 +707,33 @@ describe('the supervisor: only the home that holds the agent re-checks', () => {
     expect(timers.armed).toEqual([])
     await pause(200)
     expect(states(home)).not.toContain('stopped')
+    expect(changesOf(states(home))).toEqual(['ok', 'runs_failing/runtime_check_failed'])
+  }, 30_000)
+})
+
+describe('the supervisor: SIGTERM with a re-check under way', () => {
+  it('its preflight answers after the signal: no model call starts', async () => {
+    double = await startServerDouble({ tray: { waiting: 1 }, conversationRunTemplate: 'RUN <conversation_id>' })
+    const home = path.join(sandbox, 'home')
+    signIn(home, double.apiBase)
+    const runner = new Runner()
+    runner.endings.set('conv_0', FAILED_RUN)
+    const timers = new FakeTimers()
+    const exits: number[] = []
+    const done = runIntegration({ home, client: CLIENT, manualPointer: '(POINTER)', workdir: path.join(home, 'w'), env: {}, runner, listenerReportTiming: FAST, recheckTimers: timers, exit: (code) => exits.push(code) })
+    await until(() => states(home).includes('runs_failing/runtime_check_failed'), 10_000)
+    await until(() => timers.armed.length === 1, 5_000)
+    await pause(300) // the recheck after the failed run is over
+    runner.check = { ok: true }
+    const answer = runner.holdNextPreflight()
+    expect(await timers.advance(30 * MIN)).toBe(1)
+    await until(() => runner.preflightOpen, 5_000)
+    process.emit('SIGTERM')
+    answer({ ok: true }) // in the same tick: the loop has not looked yet
+    expect(await done).toBe(0)
+    expect(exits).toEqual([0])
+    expect(runner.checks).toBe(1)
+    await pause(200)
     expect(changesOf(states(home))).toEqual(['ok', 'runs_failing/runtime_check_failed'])
   }, 30_000)
 })

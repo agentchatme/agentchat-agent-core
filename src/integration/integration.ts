@@ -910,9 +910,17 @@ export class Integration {
     return this.options.runsFailingRecheckMs ?? RUNS_FAILING_RECHECK_MS
   }
 
-  /** A run, a check, or a wake cycle (which may start a run at any moment) is under way: it says sooner than a re-check. */
+  /**
+   * A run, a check, or the kit's work around a run is under way: it says
+   * sooner than a re-check would. The kit holds a run's slot past the run
+   * itself (after a failed one it reads the tray, then asks its own check),
+   * a turn may wait for its slot, and a wake waiting out its quiet window
+   * starts a cycle within seconds.
+   */
   private busyForRecheck(): boolean {
-    return this.runsInFlight > 0 || this.recheckInFlight !== null || this.runtimeCheckInFlight !== null || this.loop.status().coalescer.state === 'running'
+    if (this.runsInFlight > 0 || this.recheckInFlight !== null || this.runtimeCheckInFlight !== null) return true
+    const loop = this.loop.status()
+    return loop.coalescer.state !== 'idle' || loop.counters.turnsActive > 0 || loop.counters.turnsWaiting > 0
   }
 
   /**
@@ -927,11 +935,14 @@ export class Integration {
    *
    * Never while a run, another check or a wake cycle is under way: that one
    * says sooner, so this due time is skipped and the next one kept. A run
-   * that starts during the model call stops it, and so do the kit's own
-   * check and a failure that ended otherwise: a check cut short says
-   * nothing. Only while this integration reports: not once stopping, and not
-   * once the supervisor stopped the reporter (lost lock, hand-over, standby,
-   * shutdown).
+   * that starts during the re-check makes its answer stale (the run, and
+   * the recheck after it, are newer): a preflight answer is then dropped,
+   * and the model call is stopped, as it is by the kit's own check and by a
+   * failure that ended otherwise; a check cut short says nothing. Only while
+   * this integration reports: not once stopping, and not once the supervisor
+   * stopped the reporter (lost lock, hand-over, standby, SIGTERM), so no
+   * model call starts after any of those (one already out at SIGTERM is
+   * stopped with the integration, a tick later).
    *
    * The report's, not the hand-over's: `health()` does not change for it
    * (the status line's reason follows it only while runs already fail).
@@ -949,8 +960,14 @@ export class Integration {
       log.info(`listener report: runs_failing (${reason}) not checked again now — a run or a check is under way and says sooner; ${next()}`)
       return
     }
+    const runsBefore = this.runsStarted
+    // Whether this re-check's answer still counts.
+    const counts = (): boolean => !this.stopping && this.failingRecheck.current(episode) && !sink.status().stopped && this.runsStarted === runsBefore
     const pre = await this.preflightNow()
-    if (this.stopping || !this.failingRecheck.current(episode)) return
+    if (!counts()) {
+      if (!this.stopping && !sink.status().stopped && this.runsStarted !== runsBefore) log.info(`listener report: a run started while runs_failing was checked again; that run says instead; ${next()}`)
+      return
+    }
     const checkedAt = new Date().toISOString()
     if (!pre.ok) {
       const kind = listenerReasonKindOf(pre.detail ?? '')
