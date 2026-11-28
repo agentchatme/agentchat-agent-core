@@ -16,7 +16,8 @@ import { isRunnerFactory, type RunRunner, type RunnerSource } from './runner.js'
 import { writeIntegrationStatus, type IntegrationRunsFailing, type IntegrationStandby, type IntegrationStatus, type IntegrationUnservable } from './status.js'
 import type { ManualPointer } from '../skill/manual.js'
 import type { AnchorLoadNote, AnchorServedLine } from '../anchor/follow.js'
-import { createListenerReporter, ensureListenerInstanceId, listenerReportStatusOf, type ListenerReportTiming } from './listener-report.js'
+import { createListenerReporter, describeListenerStopped, ensureListenerInstanceId, listenerReportStatusOf, reportListenerStopped, type ListenerReportTiming } from './listener-report.js'
+import type { RecheckTimers } from './failing-recheck.js'
 
 // ─── The resident supervisor ────────────────────────────────────────────────
 //
@@ -53,9 +54,19 @@ import { createListenerReporter, ensureListenerInstanceId, listenerReportStatusO
 // decided while it held it, and nothing else holds it meanwhile, or the next
 // retry finds that and drops the reporter.) It is stopped, with nothing sent,
 // as soon as another listener serves the agent or this home lets it go: a
-// standby, a give-up, a lost lock, a new identity, and a shutdown. SIGTERM is
-// a service stop or a reboot, never an uninstall: `stopped` is sent only by
-// the commands that end the listener on purpose (`reportListenerStopped`).
+// standby, a give-up, a lost lock, a new identity, and a shutdown (at the
+// signal, not when the loop next looks). The integration's re-check while
+// runs fail goes with it: only the home that holds the agent re-checks.
+// SIGTERM is a service stop or a reboot, never an uninstall: `stopped` is
+// sent only by the commands that end the listener on purpose
+// (`reportListenerStopped`), and by a daemon that starts switched off
+// (`AGENTCHAT_INTEGRATION=off`): once per identity in this process, from
+// when it finds one in its home (up to five attempts over about five
+// minutes, for a network that is not up yet at boot, until AgentChat takes
+// it), so the agent reads as switched off rather than as a computer that is
+// off. It is skipped where it always is: no key the home holds, no listener
+// id there (AgentChat never knew this listener), another live home holding
+// the agent.
 
 /** How often to re-read the identity. A `stat`; the watcher usually beats it. */
 const POLL_MS = 5_000
@@ -83,6 +94,14 @@ const OFF_STATUS_REFRESH_MS = 30_000
  * `ExitTimeOut` (15 s in the plist this package writes).
  */
 const SHUTDOWN_GRACE_MS = 10_000
+/**
+ * A daemon switched off tells AgentChat so (`stopped`) in up to this many
+ * attempts, at about these times after it finds the identity: a network
+ * that is not up yet at boot gets five minutes. Each wait is measured from
+ * the end of the attempt before, so a machine that slept through them tries
+ * once, not all at once.
+ */
+export const SWITCHED_OFF_REPORT_AT_MS: readonly number[] = [10_000, 30_000, 60_000, 120_000, 300_000]
 const MAX_LOG_BYTES = 5 * 1024 * 1024
 const KEEP_LOG_BYTES = 1024 * 1024
 
@@ -163,6 +182,11 @@ export interface RunIntegrationOpts {
   listenerReportTiming?: ListenerReportTiming
   /** Test seam: while nothing is served, how often the status file is rewritten (30 s). */
   offStatusRefreshMs?: number
+  /** Test seams: `IntegrationOptions.runsFailingRecheckMs` and `recheckTimers` (the re-check while runs fail). */
+  runsFailingRecheckMs?: readonly number[]
+  recheckTimers?: RecheckTimers
+  /** Test seam: when a daemon switched off tries its `stopped` report (`SWITCHED_OFF_REPORT_AT_MS`). */
+  switchedOffReportAtMs?: readonly number[]
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
@@ -264,7 +288,8 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
     if (listener !== null && listener.fp === fp) return listener.reporter
     dropListener()
     if (instanceId === undefined) instanceId = await ensureListenerInstanceId(home)
-    if (instanceId === null) return null
+    // A shutdown that came meanwhile reports nothing.
+    if (instanceId === null || shuttingDown) return null
     const reporter = createListenerReporter({
       apiKey: cfg.apiKey,
       apiBase: cfg.apiBase,
@@ -311,6 +336,64 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
   let failures = 0
   let lastFailure: string | null = null
   let shuttingDown = false
+  /** Switched off: the identities AgentChat is told so (`stopped`), once each in this process. */
+  const toldSwitchedOff = new Set<string>()
+  const identityKey = (identity: { readonly apiKey: string; readonly handle: string | null }): string => `${identity.apiKey}:${identity.handle ?? ''}`
+  /**
+   * Switched off with an identity in the home: AgentChat is told this
+   * listener is off on purpose (`stopped`), once per identity in this
+   * process, never again on a later poll. Up to
+   * `SWITCHED_OFF_REPORT_AT_MS.length` bounded attempts (one at a time,
+   * unref'd timers, never a throw, never waited on), ending at the first
+   * that AgentChat takes or `reportListenerStopped` skips (no key the home
+   * holds, no listener id there, another live home holding the agent), at a
+   * stop or SIGTERM, or when the home names another identity (that one is
+   * told on its own).
+   */
+  const tellSwitchedOff = (): void => {
+    const identity = identityOf()
+    if (identity === null) return
+    const told = identityKey(identity)
+    if (toldSwitchedOff.has(told)) return
+    toldSwitchedOff.add(told)
+    const at = opts.switchedOffReportAtMs ?? SWITCHED_OFF_REPORT_AT_MS
+    let attempts = 0
+    let timer: ReturnType<typeof setTimeout> | null = null
+    const cancel = (): void => {
+      if (timer !== null) clearTimeout(timer)
+      timer = null
+    }
+    const done = (): void => {
+      cancel()
+      stopChecks.signal.removeEventListener('abort', cancel)
+    }
+    const armNext = (): void => {
+      if (attempts >= at.length || stopChecks.signal.aborted) return done()
+      const waitMs = Math.max(0, (at[attempts] ?? 0) - (at[attempts - 1] ?? 0))
+      timer = setTimeout(attempt, waitMs)
+      timer.unref?.()
+    }
+    const attempt = (): void => {
+      timer = null
+      const now = identityOf()
+      if (shuttingDown || stopChecks.signal.aborted || now === null || identityKey(now) !== told) return done()
+      attempts += 1
+      void reportListenerStopped({ home, client: opts.client, identity: now }).then((result) => {
+        if (shuttingDown || stopChecks.signal.aborted) return done()
+        const line = describeListenerStopped(result)
+        if (result.outcome === 'failed' && attempts < at.length) {
+          const waitS = Math.round(((at[attempts] ?? 0) - (at[attempts - 1] ?? 0)) / 1000)
+          log.info(`${line ?? 'listener: could not tell AgentChat it stopped'} — attempt ${attempts} of ${at.length}, trying again in ${waitS} s`)
+          return armNext()
+        }
+        if (result.outcome === 'reported') log.info(`${line} (${disabledBy ?? INTEGRATION_ENV}=off)`)
+        else if (line !== null) log.warn(`${line} — ${attempts} attempt(s), not tried again by this process`)
+        done()
+      })
+    }
+    stopChecks.signal.addEventListener('abort', cancel, { once: true })
+    armNext()
+  }
   /** The agent lock (one agent, one listener), held for as long as an integration is live. */
   let agentLock: Lease | null = null
   /** Set by the lease when a renewal finds it no longer this process's: stand down at once. */
@@ -408,6 +491,8 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
     if (shuttingDown) return
     shuttingDown = true
     stopChecks.abort()
+    // Nothing more is reported from here, a report under way included (and no re-check while runs fail starts).
+    dropListener()
     log.info(`${sig} — shutting down`)
   }
   const onSigint = (): void => shutdown('SIGINT')
@@ -467,7 +552,8 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
     if (fp === null) {
       // Signed out, or never signed in. Idle.
     } else if (disabled) {
-      // Signed in, switched off. Resident, silent.
+      // Signed in, switched off. Resident, holding nothing; AgentChat is told once.
+      tellSwitchedOff()
     } else if (live !== null && fp === liveFingerprint) {
       // Serving. Stand down at once if the agent lock is no longer ours, and
       // give the agent up while this home cannot serve it — so a healthy
@@ -585,6 +671,8 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
           ...(opts.quietMs !== undefined ? { quietMs: opts.quietMs } : {}),
           ...(opts.maxMs !== undefined ? { maxMs: opts.maxMs } : {}),
           ...(opts.paceMs !== undefined ? { paceMs: opts.paceMs } : {}),
+          ...(opts.runsFailingRecheckMs !== undefined ? { runsFailingRecheckMs: opts.runsFailingRecheckMs } : {}),
+          ...(opts.recheckTimers !== undefined ? { recheckTimers: opts.recheckTimers } : {}),
           ...(listenerReport !== null ? { listenerReport } : {}),
           statusExtra: () => ({ lease_errors: leaseErrors() }),
         })
