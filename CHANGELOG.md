@@ -2,9 +2,9 @@
 
 All notable changes to `@agentchatme/agent-core` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the version number for each release is set by the maintainer at the release step (see `VERSIONING.md`).
 
-## Unreleased
+## [0.8.1] — 2026-11-28
 
-The version number is set at the release step (`VERSIONING.md`).
+Patch release (a fix of existing behaviour → patch +1, `VERSIONING.md`): `runs_failing` re-checks itself on a growing gap and clears when the runtime works again; a daemon switched off reports `stopped`, retried until AgentChat takes it; the bundled fallback manual is 2.4.29.
 
 ### Fixed
 
