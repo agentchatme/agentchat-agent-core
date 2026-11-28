@@ -5,7 +5,7 @@ import * as path from 'node:path'
 import { spawn, type ChildProcess } from 'node:child_process'
 import type { integration as kit, ListenerReasonKind, ListenerState } from 'agentchatme'
 import { Integration } from '../src/integration/integration.js'
-import { runIntegration } from '../src/integration/run.js'
+import { runIntegration, SWITCHED_OFF_REPORT_AT_MS } from '../src/integration/run.js'
 import { RecheckSchedule, RUNS_FAILING_RECHECK_MS, type RecheckTimerHandle, type RecheckTimers } from '../src/integration/failing-recheck.js'
 import { listenerIdPath, readListenerInstanceId, type ListenerReportSink, type ListenerReportTiming } from '../src/integration/listener-report.js'
 import { readIntegrationStatus } from '../src/integration/status.js'
@@ -25,7 +25,8 @@ import { pause, startServerDouble, until, type ListenerReportPut, type ServerDou
 //   3  the supervisor: a lost lock, a hand-over and SIGTERM end it
 //   4  AGENTCHAT_INTEGRATION=off: one `stopped` at start, under the home's id
 //      and key; none without an id, for an exported key, or as a standby;
-//      never again in the same process, never on SIGTERM
+//      never again in the same process, never on SIGTERM; a failed attempt
+//      tried again, at most five in all, until AgentChat takes it
 
 const CLIENT = { runtime: 'generic' as const, version: '0.0.0-test' }
 const KEY = 'ac_' + 'k'.repeat(40)
@@ -745,6 +746,9 @@ function changesOf(list: string[]): string[] {
 
 // ─── 4. the off switch ──────────────────────────────────────────────────────
 
+/** The off switch's attempts at test speed: the first at 20 ms, then 100 ms apart. */
+const OFF_AT: readonly number[] = [20, 120, 220, 320, 420]
+
 describe('AGENTCHAT_INTEGRATION=off: AgentChat is told the listener is off on purpose, once', () => {
   const ID = 'dddddddddddddddddddddd'
   const withListenerId = (home: string): void => {
@@ -759,7 +763,7 @@ describe('AGENTCHAT_INTEGRATION=off: AgentChat is told the listener is off on pu
     withListenerId(home)
     signIn(home, double.apiBase)
     const runner = new Runner()
-    const d = daemon(home, runner, { env: { [name]: 'off' }, pollMs: 50, tickMs: 10 })
+    const d = daemon(home, runner, { env: { [name]: 'off' }, pollMs: 50, tickMs: 10, switchedOffReportAtMs: OFF_AT })
     try {
       await until(() => double!.listenerReports.length === 1, 5_000)
       expect(double.listenerReports.map((r) => r.body)).toEqual([{ instance_id: ID, state: 'stopped' }])
@@ -784,7 +788,7 @@ describe('AGENTCHAT_INTEGRATION=off: AgentChat is told the listener is off on pu
     double = await startServerDouble()
     const home = path.join(sandbox, 'home')
     signIn(home, double.apiBase)
-    const d = daemon(home, new Runner(), { env: { AGENTCHAT_INTEGRATION: 'off' }, pollMs: 50, tickMs: 10 })
+    const d = daemon(home, new Runner(), { env: { AGENTCHAT_INTEGRATION: 'off' }, pollMs: 50, tickMs: 10, switchedOffReportAtMs: OFF_AT })
     try {
       await until(() => readIntegrationStatus(home)?.socket === 'off', 5_000)
       await pause(400)
@@ -801,7 +805,7 @@ describe('AGENTCHAT_INTEGRATION=off: AgentChat is told the listener is off on pu
     withListenerId(home)
     vi.stubEnv('AGENTCHAT_API_KEY', KEY)
     vi.stubEnv('AGENTCHAT_API_BASE', double.apiBase)
-    const d = daemon(home, new Runner(), { env: { AGENTCHAT_INTEGRATION: 'off' }, pollMs: 50, tickMs: 10 })
+    const d = daemon(home, new Runner(), { env: { AGENTCHAT_INTEGRATION: 'off' }, pollMs: 50, tickMs: 10, switchedOffReportAtMs: OFF_AT })
     try {
       await until(() => readIntegrationStatus(home)?.socket === 'off', 5_000)
       await pause(400)
@@ -818,7 +822,7 @@ describe('AGENTCHAT_INTEGRATION=off: AgentChat is told the listener is off on pu
     signIn(home, double.apiBase)
     const other = await acquireAgentLock({ apiBase: double.apiBase, handle: 'probe', home: path.join(sandbox, 'other-home') })
     expect(other.ok).toBe(true)
-    const d = daemon(home, new Runner(), { env: { AGENTCHAT_INTEGRATION: 'off' }, pollMs: 50, tickMs: 10 })
+    const d = daemon(home, new Runner(), { env: { AGENTCHAT_INTEGRATION: 'off' }, pollMs: 50, tickMs: 10, switchedOffReportAtMs: OFF_AT })
     try {
       await until(() => readIntegrationStatus(home)?.socket === 'off', 5_000)
       await pause(400)
@@ -835,7 +839,7 @@ describe('AGENTCHAT_INTEGRATION=off: AgentChat is told the listener is off on pu
     withListenerId(home)
     signIn(home, double.apiBase)
     const exits: number[] = []
-    const done = runIntegration({ home, client: CLIENT, manualPointer: '(POINTER)', workdir: path.join(home, 'w'), env: { AGENTCHAT_INTEGRATION: 'off' }, runner: new Runner(), pollMs: 50, tickMs: 10, exit: (code) => exits.push(code) })
+    const done = runIntegration({ home, client: CLIENT, manualPointer: '(POINTER)', workdir: path.join(home, 'w'), env: { AGENTCHAT_INTEGRATION: 'off' }, runner: new Runner(), pollMs: 50, tickMs: 10, switchedOffReportAtMs: OFF_AT, exit: (code) => exits.push(code) })
     await until(() => stoppedReports().length === 1, 5_000)
     process.emit('SIGTERM')
     expect(await done).toBe(0)
@@ -844,11 +848,92 @@ describe('AGENTCHAT_INTEGRATION=off: AgentChat is told the listener is off on pu
     expect(stoppedReports()).toHaveLength(1)
   }, 20_000)
 
+  it('five attempts at about 10 s, 30 s, 1 min, 2 min and 5 min', () => {
+    expect(SWITCHED_OFF_REPORT_AT_MS).toEqual([10_000, 30_000, 60_000, 120_000, 300_000])
+  })
+
+  it('the network not up yet at boot: a failed first attempt is tried again, and exactly one stopped is taken', async () => {
+    double = await startServerDouble()
+    const home = path.join(sandbox, 'home')
+    withListenerId(home)
+    signIn(home, double.apiBase)
+    double.setListenerReportStatus(503)
+    let taken = 0
+    double.onListenerReport(() => {
+      if (double!.listenerReports.length >= 2) taken += 1 // answered 200 from the second on
+    })
+    const d = daemon(home, new Runner(), { env: { AGENTCHAT_INTEGRATION: 'off' }, pollMs: 50, tickMs: 10, switchedOffReportAtMs: OFF_AT })
+    try {
+      await until(() => double!.listenerReports.length === 1, 5_000)
+      double.setListenerReportStatus(200)
+      await until(() => double!.listenerReports.length === 2, 5_000)
+      await pause(700) // past every later attempt
+      expect(double.listenerReports.map((r) => r.body)).toEqual([
+        { instance_id: ID, state: 'stopped' },
+        { instance_id: ID, state: 'stopped' },
+      ])
+      expect(taken).toBe(1)
+      expect(double.listenerReports.every((r) => r.apiKey === KEY)).toBe(true)
+    } finally {
+      await d.stop()
+    }
+  }, 20_000)
+
+  it('every attempt fails: five, then nothing more', async () => {
+    double = await startServerDouble()
+    const home = path.join(sandbox, 'home')
+    withListenerId(home)
+    signIn(home, double.apiBase)
+    double.setListenerReportStatus(503)
+    const d = daemon(home, new Runner(), { env: { AGENTCHAT_INTEGRATION: 'off' }, pollMs: 50, tickMs: 10, switchedOffReportAtMs: OFF_AT })
+    try {
+      await until(() => double!.listenerReports.length === 5, 5_000)
+      await pause(800)
+      expect(stoppedReports()).toHaveLength(5)
+    } finally {
+      await d.stop()
+    }
+  }, 20_000)
+
+  it('SIGTERM cancels the attempts still to come', async () => {
+    double = await startServerDouble()
+    const home = path.join(sandbox, 'home')
+    withListenerId(home)
+    signIn(home, double.apiBase)
+    double.setListenerReportStatus(503)
+    const exits: number[] = []
+    const done = runIntegration({ home, client: CLIENT, manualPointer: '(POINTER)', workdir: path.join(home, 'w'), env: { AGENTCHAT_INTEGRATION: 'off' }, runner: new Runner(), pollMs: 50, tickMs: 10, switchedOffReportAtMs: OFF_AT, exit: (code) => exits.push(code) })
+    await until(() => double!.listenerReports.length === 1, 5_000)
+    await pause(30) // that attempt answered: the next one waits on its timer
+    process.emit('SIGTERM')
+    expect(await done).toBe(0)
+    expect(exits).toEqual([0])
+    await pause(800)
+    expect(stoppedReports()).toHaveLength(1)
+  }, 20_000)
+
+  it('signed out during the attempts: the rest are not made (the identity is no longer the home\'s)', async () => {
+    double = await startServerDouble()
+    const home = path.join(sandbox, 'home')
+    withListenerId(home)
+    signIn(home, double.apiBase)
+    double.setListenerReportStatus(503)
+    const d = daemon(home, new Runner(), { env: { AGENTCHAT_INTEGRATION: 'off' }, pollMs: 50, tickMs: 10, switchedOffReportAtMs: OFF_AT })
+    try {
+      await until(() => double!.listenerReports.length === 1, 5_000)
+      fs.rmSync(path.join(home, 'credentials'))
+      await pause(800)
+      expect(stoppedReports()).toHaveLength(1)
+    } finally {
+      await d.stop()
+    }
+  }, 20_000)
+
   it('signed in only after the start, still switched off: told once then', async () => {
     double = await startServerDouble()
     const home = path.join(sandbox, 'home')
     withListenerId(home)
-    const d = daemon(home, new Runner(), { env: { AGENTCHAT_INTEGRATION: 'off' }, pollMs: 50, tickMs: 10 })
+    const d = daemon(home, new Runner(), { env: { AGENTCHAT_INTEGRATION: 'off' }, pollMs: 50, tickMs: 10, switchedOffReportAtMs: OFF_AT })
     try {
       await until(() => readIntegrationStatus(home)?.socket === 'off', 5_000)
       await pause(200)

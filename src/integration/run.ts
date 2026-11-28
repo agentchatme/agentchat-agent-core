@@ -60,11 +60,13 @@ import type { RecheckTimers } from './failing-recheck.js'
 // SIGTERM is a service stop or a reboot, never an uninstall: `stopped` is
 // sent only by the commands that end the listener on purpose
 // (`reportListenerStopped`), and by a daemon that starts switched off
-// (`AGENTCHAT_INTEGRATION=off`): once per identity in this process, as soon
-// as it finds one in its home, so the agent reads as switched off rather
-// than as a computer that is off. It is skipped where it always is: no key
-// the home holds, no listener id there (AgentChat never knew this
-// listener), another live home holding the agent.
+// (`AGENTCHAT_INTEGRATION=off`): once per identity in this process, from
+// when it finds one in its home (up to five attempts over about five
+// minutes, for a network that is not up yet at boot, until AgentChat takes
+// it), so the agent reads as switched off rather than as a computer that is
+// off. It is skipped where it always is: no key the home holds, no listener
+// id there (AgentChat never knew this listener), another live home holding
+// the agent.
 
 /** How often to re-read the identity. A `stat`; the watcher usually beats it. */
 const POLL_MS = 5_000
@@ -92,6 +94,14 @@ const OFF_STATUS_REFRESH_MS = 30_000
  * `ExitTimeOut` (15 s in the plist this package writes).
  */
 const SHUTDOWN_GRACE_MS = 10_000
+/**
+ * A daemon switched off tells AgentChat so (`stopped`) in up to this many
+ * attempts, at about these times after it finds the identity: a network
+ * that is not up yet at boot gets five minutes. Each wait is measured from
+ * the end of the attempt before, so a machine that slept through them tries
+ * once, not all at once.
+ */
+export const SWITCHED_OFF_REPORT_AT_MS: readonly number[] = [10_000, 30_000, 60_000, 120_000, 300_000]
 const MAX_LOG_BYTES = 5 * 1024 * 1024
 const KEEP_LOG_BYTES = 1024 * 1024
 
@@ -175,6 +185,8 @@ export interface RunIntegrationOpts {
   /** Test seams: `IntegrationOptions.runsFailingRecheckMs` and `recheckTimers` (the re-check while runs fail). */
   runsFailingRecheckMs?: readonly number[]
   recheckTimers?: RecheckTimers
+  /** Test seam: when a daemon switched off tries its `stopped` report (`SWITCHED_OFF_REPORT_AT_MS`). */
+  switchedOffReportAtMs?: readonly number[]
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
@@ -324,27 +336,63 @@ export async function runIntegration(opts: RunIntegrationOpts): Promise<number> 
   let failures = 0
   let lastFailure: string | null = null
   let shuttingDown = false
-  /** Switched off: the identities AgentChat was told so (`stopped`), once each in this process. */
+  /** Switched off: the identities AgentChat is told so (`stopped`), once each in this process. */
   const toldSwitchedOff = new Set<string>()
+  const identityKey = (identity: { readonly apiKey: string; readonly handle: string | null }): string => `${identity.apiKey}:${identity.handle ?? ''}`
   /**
    * Switched off with an identity in the home: AgentChat is told this
    * listener is off on purpose (`stopped`), once per identity in this
-   * process, never again on a later poll. `reportListenerStopped` skips it
-   * with no key the home holds, no listener id there, or another live home
-   * holding the agent; one bounded attempt, never a throw, never waited on.
+   * process, never again on a later poll. Up to
+   * `SWITCHED_OFF_REPORT_AT_MS.length` bounded attempts (one at a time,
+   * unref'd timers, never a throw, never waited on), ending at the first
+   * that AgentChat takes or `reportListenerStopped` skips (no key the home
+   * holds, no listener id there, another live home holding the agent), at a
+   * stop or SIGTERM, or when the home names another identity (that one is
+   * told on its own).
    */
   const tellSwitchedOff = (): void => {
     const identity = identityOf()
     if (identity === null) return
-    const told = `${identity.apiKey}:${identity.handle ?? ''}`
+    const told = identityKey(identity)
     if (toldSwitchedOff.has(told)) return
     toldSwitchedOff.add(told)
-    void reportListenerStopped({ home, client: opts.client, identity }).then((result) => {
-      const line = describeListenerStopped(result)
-      if (line === null) return
-      if (result.outcome === 'reported') log.info(`${line} (${disabledBy ?? INTEGRATION_ENV}=off)`)
-      else log.warn(line)
-    })
+    const at = opts.switchedOffReportAtMs ?? SWITCHED_OFF_REPORT_AT_MS
+    let attempts = 0
+    let timer: ReturnType<typeof setTimeout> | null = null
+    const cancel = (): void => {
+      if (timer !== null) clearTimeout(timer)
+      timer = null
+    }
+    const done = (): void => {
+      cancel()
+      stopChecks.signal.removeEventListener('abort', cancel)
+    }
+    const armNext = (): void => {
+      if (attempts >= at.length || stopChecks.signal.aborted) return done()
+      const waitMs = Math.max(0, (at[attempts] ?? 0) - (at[attempts - 1] ?? 0))
+      timer = setTimeout(attempt, waitMs)
+      timer.unref?.()
+    }
+    const attempt = (): void => {
+      timer = null
+      const now = identityOf()
+      if (shuttingDown || stopChecks.signal.aborted || now === null || identityKey(now) !== told) return done()
+      attempts += 1
+      void reportListenerStopped({ home, client: opts.client, identity: now }).then((result) => {
+        if (shuttingDown || stopChecks.signal.aborted) return done()
+        const line = describeListenerStopped(result)
+        if (result.outcome === 'failed' && attempts < at.length) {
+          const waitS = Math.round(((at[attempts] ?? 0) - (at[attempts - 1] ?? 0)) / 1000)
+          log.info(`${line ?? 'listener: could not tell AgentChat it stopped'} — attempt ${attempts} of ${at.length}, trying again in ${waitS} s`)
+          return armNext()
+        }
+        if (result.outcome === 'reported') log.info(`${line} (${disabledBy ?? INTEGRATION_ENV}=off)`)
+        else if (line !== null) log.warn(`${line} — ${attempts} attempt(s), not tried again by this process`)
+        done()
+      })
+    }
+    stopChecks.signal.addEventListener('abort', cancel, { once: true })
+    armNext()
   }
   /** The agent lock (one agent, one listener), held for as long as an integration is live. */
   let agentLock: Lease | null = null
