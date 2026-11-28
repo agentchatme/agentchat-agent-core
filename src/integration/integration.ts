@@ -23,6 +23,7 @@ import { describeManualSync, type ManualFetch } from '../skill/served-manual.js'
 import { followIdentityAnchor, type AnchorLoadNote, type AnchorServedLine } from '../anchor/follow.js'
 import { listenerReasonKindOf, type ListenerReasonKind } from '../identity/setup.js'
 import { listenerReportStatusOf, tellListener, type ListenerReportSink } from './listener-report.js'
+import { RecheckSchedule, RUNS_FAILING_RECHECK_MS, type RecheckTimers } from './failing-recheck.js'
 
 // ─── The integration: the SDK kit's receive loop, and one runtime's runner ──
 //
@@ -78,7 +79,12 @@ import { listenerReportStatusOf, tellListener, type ListenerReportSink } from '.
 // runtime healthy, `runs_failing` while the recheck after a failed run fails
 // (its reason) or the runtime check after a failed run fails
 // (`runtime_check_failed`, which changes neither `health()` nor the
-// hand-over), back to `ok` when a run completes or that check passes.
+// hand-over), back to `ok` when a run completes or that check passes. While
+// it says `runs_failing`, it looks again on its own (`RecheckSchedule`: 30
+// minutes, 1 hour, 2 hours, then every 4 hours), since without a message no
+// run would: the start preflight first (no model call), then, when the
+// runtime check is what failed, that check once (one minimal model call),
+// never while a run is under way; passing, `ok`.
 
 const HEARTBEAT_MS = 30_000
 const STATUS_MS = 30_000
@@ -184,6 +190,10 @@ export interface IntegrationOptions {
   readonly runtimeCheckDeadlineMs?: number
   /** Injectable for tests: how soon the served texts are fetched again after a fetch (the kit's 24 h). */
   readonly textsRefreshMs?: number
+  /** Injectable for tests: the gaps of the re-check while the report says `runs_failing` (`RUNS_FAILING_RECHECK_MS`). */
+  readonly runsFailingRecheckMs?: readonly number[]
+  /** Injectable for tests: what that re-check waits with (a fake clock). */
+  readonly recheckTimers?: RecheckTimers
   /**
    * The listener report for this agent (contract v1 §3.13): what this
    * integration tells AgentChat about itself. The supervisor owns it, so it
@@ -226,6 +236,14 @@ function reasonOf(source: kit.WakeSource, frameReason: string | undefined): stri
     default:
       return null
   }
+}
+
+/** A gap for the log: `30 min`, `1 h`, `4 h` (`45 s` below a minute). */
+function describeGap(ms: number | null): string {
+  if (ms === null) return '?'
+  if (ms < 60_000) return `${Math.round(ms / 1000)} s`
+  if (ms < 3_600_000) return `${Math.round(ms / 60_000)} min`
+  return `${Math.round((ms / 3_600_000) * 10) / 10} h`
 }
 
 /** `work`, or `onTimeout()` once `ms` have passed — whichever first. A late result is dropped. */
@@ -310,11 +328,22 @@ export class Integration {
   private recheckFailing: ListenerReasonKind | null = null
   /** The runtime check after a failed run failed, and nothing has passed or completed since. */
   private runtimeCheckFailing = false
+  /** Runs under way (the runner's `start` not yet returned). */
+  private runsInFlight = 0
+  /** While the report says `runs_failing`: the re-check on a growing gap. */
+  private readonly failingRecheck: RecheckSchedule
+  /** Stops the model call of a re-check under way: a run started, the kit asked its own check, or the failure ended (a stop aborts it through `recheckAbort`). */
+  private failingRecheckCancel: AbortController | null = null
 
   constructor(private readonly options: IntegrationOptions) {
     const { cfg, client } = options
     const identity = clientIdentityOf(client)
     this.paused = new PausedConversations(cfg.home, cfg.handle)
+    this.failingRecheck = new RecheckSchedule({
+      recheck: (episode) => this.recheckWhileFailing(episode),
+      ...(options.runsFailingRecheckMs !== undefined ? { gapsMs: options.runsFailingRecheckMs } : {}),
+      ...(options.recheckTimers !== undefined ? { timers: options.recheckTimers } : {}),
+    })
     this.api =
       options.api ??
       new AgentChatClient({ apiKey: cfg.apiKey, baseUrl: cfg.apiBase, clientIdentity: identity, timeoutMs: HTTP_TIMEOUT_MS, retry: { maxRetries: 0, baseDelayMs: 0, maxDelayMs: 0 } })
@@ -461,8 +490,10 @@ export class Integration {
     this.stopping = true
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer)
     if (this.statusTimer) clearInterval(this.statusTimer)
+    // No re-check after a stop; one under way is stopped with the checks below (and says nothing).
+    this.failingRecheck.stop()
     this.recheckAbort.abort()
-    this.stopped = Promise.all([this.loop.stop(), this.recheckInFlight ?? Promise.resolve(), this.follows]).then(() => undefined)
+    this.stopped = Promise.all([this.loop.stop(), this.recheckInFlight ?? Promise.resolve(), this.failingRecheck.done(), this.follows]).then(() => undefined)
     this.texts.stop()
     this.manual?.stop()
     this.socket = 'closed'
@@ -593,6 +624,10 @@ export class Integration {
       log.warn(`run pointer: the integration's pointer function threw (${err instanceof Error ? err.message : String(err)}); the run starts without the line`)
     }
     let outcome: RunOutcome
+    // A run under way says more than a re-check would: none starts its model
+    // call meanwhile, and one under way stops for it.
+    this.runsInFlight += 1
+    this.failingRecheckCancel?.abort()
     try {
       outcome = await withDeadline(
         this.options.runner.start({
@@ -621,6 +656,7 @@ export class Integration {
       // The runner contract is "never throws"; a throw is a bug in the runner.
       outcome = { state: 'not_started', exitCode: null, durationMs: Date.now() - startedAt, detail: `runner threw: ${err instanceof Error ? err.message : String(err)}` }
     } finally {
+      this.runsInFlight -= 1
       request.signal.removeEventListener('abort', onAbort)
     }
 
@@ -688,6 +724,8 @@ export class Integration {
    * come back.
    */
   private checkRuntime(): Promise<RunPreflight> {
+    // The kit's own ask comes first: a re-check's model call under way stops for it (never two at once).
+    this.failingRecheckCancel?.abort()
     this.runtimeCheckInFlight ??= this.runRuntimeCheck().finally(() => {
       this.runtimeCheckInFlight = null
       // The kit counts the answer once it has it: the status file follows
@@ -697,14 +735,23 @@ export class Integration {
     return this.runtimeCheckInFlight
   }
 
-  private async runRuntimeCheck(): Promise<RunPreflight> {
+  /**
+   * One runtime check, and what it means for the report. `cancel` (the
+   * re-check while runs fail) cuts it short like a stop does: a check that
+   * did not pass then says nothing.
+   */
+  private async runRuntimeCheck(cancel?: AbortSignal): Promise<RunPreflight> {
     const check = this.options.runner.checkRuntime
     if (check === undefined) return { ok: false, detail: 'this runtime has no runtime check' }
     if (this.stopping) return { ok: false, detail: 'the integration is stopping' }
+    // A function, not a read: the signal can abort while the check is out.
+    const cancelled = (): boolean => cancel?.aborted === true
+    if (cancelled()) return { ok: false, detail: 'the runtime check was cut short' }
     const deadlineMs = this.options.runtimeCheckDeadlineMs ?? RUNTIME_CHECK_DEADLINE_MS
     const controller = new AbortController()
     const onStop = (): void => controller.abort()
     this.recheckAbort.signal.addEventListener('abort', onStop, { once: true })
+    cancel?.addEventListener('abort', onStop, { once: true })
     const startedAt = Date.now()
     try {
       const answer = await withDeadline(check.call(this.options.runner, { signal: controller.signal }), deadlineMs, () => {
@@ -712,22 +759,29 @@ export class Integration {
         return { ok: false, detail: `the runtime check did not answer within ${Math.round(deadlineMs / 1000)} s (stopped)` }
       }).catch((err: unknown) => ({ ok: false, detail: `the runtime check threw: ${err instanceof Error ? err.message : String(err)}` }))
       const took = `${Math.round((Date.now() - startedAt) / 1000)} s`
+      // A check cut short (the stop; for a re-check, a run that started or a failure that ended) is not a failed check.
+      const cut = this.stopping || (!answer.ok && cancelled())
       if (answer.ok) log.info(`runtime check ok (${this.options.runner.name}: the model answered, ${took}; output discarded)`)
-      else if (!this.stopping) log.warn(`runtime check failed (${this.options.runner.name}, ${took}): ${answer.detail ?? 'no detail'} — a failed run is not reported as this conversation's`)
+      else if (!cut) {
+        log.warn(
+          `runtime check failed (${this.options.runner.name}, ${took}): ${answer.detail ?? 'no detail'} — ${cancel === undefined ? "a failed run is not reported as this conversation's" : 'the listener report stays runs_failing'}`,
+        )
+      }
       // The listener report only (a usage limit, a provider outage): runs
       // fail and the runtime's own check fails too. `health()` and the
-      // hand-over to a standby do not change for it. A check cut short by the
-      // stop says nothing.
+      // hand-over to a standby do not change for it. A check cut short says
+      // nothing.
       // A check that failed while another run completed is older news than
       // that run: the runtime worked after it started.
       const overtaken = !answer.ok && this.lastOkRunAt !== null && Date.parse(this.lastOkRunAt) >= startedAt
-      if (!this.stopping && !overtaken) {
+      if (!cut && !overtaken) {
         this.runtimeCheckFailing = !answer.ok
         this.reportListener()
       }
       return answer.ok ? { ok: true } : { ok: false, ...(answer.detail !== undefined ? { detail: answer.detail } : {}) }
     } finally {
       this.recheckAbort.signal.removeEventListener('abort', onStop)
+      cancel?.removeEventListener('abort', onStop)
     }
   }
 
@@ -784,12 +838,17 @@ export class Integration {
     }
   }
 
-  private async recheckRuntime(): Promise<void> {
-    this.lastRecheckAt = Date.now()
-    const pre = await withDeadline(this.options.runner.preflight({ signal: this.recheckAbort.signal }), PREFLIGHT_DEADLINE_MS, () => ({
+  /** The runner's start preflight (a `--version`, a sign-in probe; no model call), bounded, and stopped with the integration. */
+  private preflightNow(): Promise<RunPreflight> {
+    return withDeadline(this.options.runner.preflight({ signal: this.recheckAbort.signal }), PREFLIGHT_DEADLINE_MS, () => ({
       ok: false,
       detail: `preflight did not answer within ${Math.round(PREFLIGHT_DEADLINE_MS / 1000)} s`,
     })).catch((err: unknown) => ({ ok: false, detail: `preflight threw: ${err instanceof Error ? err.message : String(err)}` }))
+  }
+
+  private async recheckRuntime(): Promise<void> {
+    this.lastRecheckAt = Date.now()
+    const pre = await this.preflightNow()
     // A run succeeded while it was being checked: nothing to say.
     if (this.failingSince === null || this.stopping) return
     const checkedAt = new Date().toISOString()
@@ -815,19 +874,119 @@ export class Integration {
     this.writeStatus()
   }
 
+  /** Why the report says `runs_failing` now, or null when it does not. */
+  private failingReason(): ListenerReasonKind | null {
+    return this.recheckFailing ?? (this.runtimeCheckFailing ? 'runtime_check_failed' : null)
+  }
+
   /**
    * What the listener report says now, from what this integration knows:
    * `runs_failing` while the recheck after a failed run fails (its reason)
    * or the runtime check after one fails (`runtime_check_failed`), else
    * `ok` once connected; before the first hello nothing new is said. Nothing
    * once stopping: a stop is the supervisor's to report, or not.
+   *
+   * `runs_failing` starts the re-check on a growing gap (a new episode: from
+   * 30 minutes; one under way keeps its place when only the reason changes),
+   * unless the supervisor has stopped the reporter (this home no longer
+   * holds the agent). Anything else ends it, and stops a re-check's model
+   * call under way.
    */
   private reportListener(): void {
     const sink = this.options.listenerReport
     if (sink === undefined || this.stopping) return
-    if (this.recheckFailing !== null) tellListener(sink, 'runs_failing', this.recheckFailing)
-    else if (this.runtimeCheckFailing) tellListener(sink, 'runs_failing', 'runtime_check_failed')
+    const failing = this.failingReason()
+    if (failing !== null) tellListener(sink, 'runs_failing', failing)
     else if (this.connected) tellListener(sink, 'ok')
+    if (failing === null) {
+      this.failingRecheckCancel?.abort()
+      this.failingRecheck.stop()
+    } else if (!sink.status().stopped && this.failingRecheck.start()) {
+      log.info(`listener report: runs_failing (${failing}) is checked again in ${describeGap(this.failingRecheck.nextInMs)}, then on a growing gap (to every ${describeGap(this.failingRecheckGapsMs().at(-1) ?? null)}) while it lasts`)
+    }
+  }
+
+  private failingRecheckGapsMs(): readonly number[] {
+    return this.options.runsFailingRecheckMs ?? RUNS_FAILING_RECHECK_MS
+  }
+
+  /** A run, a check, or a wake cycle (which may start a run at any moment) is under way: it says sooner than a re-check. */
+  private busyForRecheck(): boolean {
+    return this.runsInFlight > 0 || this.recheckInFlight !== null || this.runtimeCheckInFlight !== null || this.loop.status().coalescer.state === 'running'
+  }
+
+  /**
+   * One re-check while the report says `runs_failing` (the clock is
+   * `RecheckSchedule`'s): a failure that ended on its own must not read as
+   * failing until someone writes. First the start preflight, the one the
+   * recheck after a failed run uses (no model call). Failing: `runs_failing`
+   * stays, with the reason it gives now. Passing, what a preflight said is
+   * over; when the runtime check is what failed, that check is asked once
+   * (one minimal model call on the person's own account). Passing: `ok`, and
+   * the schedule ends.
+   *
+   * Never while a run, another check or a wake cycle is under way: that one
+   * says sooner, so this due time is skipped and the next one kept. A run
+   * that starts during the model call stops it, and so do the kit's own
+   * check and a failure that ended otherwise: a check cut short says
+   * nothing. Only while this integration reports: not once stopping, and not
+   * once the supervisor stopped the reporter (lost lock, hand-over, standby,
+   * shutdown).
+   *
+   * The report's, not the hand-over's: `health()` does not change for it
+   * (the status line's reason follows it only while runs already fail).
+   */
+  private async recheckWhileFailing(episode: number): Promise<void> {
+    const sink = this.options.listenerReport
+    const reason = this.failingReason()
+    if (this.stopping || sink === undefined || sink.status().stopped || reason === null) {
+      this.failingRecheck.stop()
+      return
+    }
+    const name = this.options.runner.name
+    const next = (): string => `next in ${describeGap(this.failingRecheck.upcomingGapMs())}`
+    if (this.busyForRecheck()) {
+      log.info(`listener report: runs_failing (${reason}) not checked again now — a run or a check is under way and says sooner; ${next()}`)
+      return
+    }
+    const pre = await this.preflightNow()
+    if (this.stopping || !this.failingRecheck.current(episode)) return
+    const checkedAt = new Date().toISOString()
+    if (!pre.ok) {
+      const kind = listenerReasonKindOf(pre.detail ?? '')
+      log.info(`listener report: runs_failing checked again — ${name}: ${pre.detail ?? 'its check failed'}; it stays (${kind}); ${next()}`)
+      this.recheckFailing = kind
+      if (this.runsFailing !== null) this.runsFailing = { ...this.runsFailing, reason: `${name}: ${pre.detail ?? 'its check failed'}`, checked_at: checkedAt }
+      this.reportListener()
+      this.writeStatus()
+      return
+    }
+    // What a preflight said is over (the recheck after a failed run does the same).
+    this.recheckFailing = null
+    if (this.runsFailing !== null) {
+      this.runsFailing = { ...this.runsFailing, reason: `${name} checks out now, but runs still fail${this.lastRun?.detail ? ` (last: ${this.lastRun.detail})` : ''}`, checked_at: checkedAt }
+    }
+    if (this.runtimeCheckFailing) {
+      if (this.busyForRecheck()) {
+        log.info(`listener report: runs_failing (runtime_check_failed): ${name} checks out, the runtime check is not asked now — a run or a check is under way and says sooner; ${next()}`)
+      } else {
+        const cancel = new AbortController()
+        this.failingRecheckCancel = cancel
+        try {
+          // Passing clears it (`ok`, the schedule ends); failing keeps it; cut short, it says nothing.
+          await this.runRuntimeCheck(cancel.signal)
+        } finally {
+          if (this.failingRecheckCancel === cancel) this.failingRecheckCancel = null
+        }
+        if (this.stopping) return
+        if (cancel.signal.aborted && this.runtimeCheckFailing) log.info(`listener report: the runtime check was cut short (a run, or the kit's own check, started); runs_failing stays until that one says otherwise; ${next()}`)
+        else if (this.runtimeCheckFailing) log.info(`listener report: runs_failing (runtime_check_failed) stays; ${next()}`)
+      }
+    } else {
+      log.info(`listener report: runs_failing checked again — ${name} checks out`)
+    }
+    this.reportListener()
+    this.writeStatus()
   }
 
   /**
@@ -845,6 +1004,11 @@ export class Integration {
   /** Test seam: resolves when a runtime check started by a failed run has finished. */
   async runtimeCheckDone(): Promise<void> {
     await this.recheckInFlight
+  }
+
+  /** Test seam: resolves when no re-check while runs fail is under way. */
+  async runsFailingRecheckDone(): Promise<void> {
+    await this.failingRecheck.done()
   }
 
   private onEvent(event: kit.ReceiveLoopEvent): void {

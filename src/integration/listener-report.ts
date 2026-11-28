@@ -22,11 +22,16 @@ import type { IntegrationListenerReport } from './status.js'
 //   the recheck after a failed run fails                         → runs_failing, its reason
 //   the runtime check after a failed run fails (a usage limit,
 //   a provider outage; health and the hand-over are unchanged)   → runs_failing, runtime_check_failed
+//   while runs_failing: checked again after 30 min, 1 h, 2 h,
+//   then every 4 h (the preflight; the runtime check only when
+//   that is what failed), passing                                → ok
 //   `logout`, `uninstall`, `daemon disable`                      → stopped, sent by that command
 //                                                                   before the key or the service goes
+//   a daemon that starts with AGENTCHAT_INTEGRATION=off          → stopped, once per identity it finds
 //
-// Only the home that holds the agent lock reports: a standby, a home that
-// gave the agent up and a daemon switched off report nothing. (A start that
+// Only the home that holds the agent lock reports: a standby and a home that
+// gave the agent up report nothing, and a daemon switched off nothing but
+// that one `stopped` (none when another live home holds the agent). (A start that
 // failed its preflight decided `not_ready` while it held the lock; the report
 // goes out just after, while that home waits out its retry with the lock free,
 // and the reporter is dropped as soon as a retry finds another home holding
@@ -185,7 +190,8 @@ export type ListenerStoppedResult =
  * v1 §3.13), so the agent reads as switched off rather than as a computer
  * that is off. For the commands that end it — `logout`, `uninstall`, `daemon
  * disable` — and called BEFORE the key or the service goes: the report needs
- * the key, and it must come before the listener closes its socket. One
+ * the key, and it must come before the listener closes its socket. And for a
+ * daemon that starts switched off (`AGENTCHAT_INTEGRATION=off`), once. One
  * attempt, bounded by `timeoutMs`; never throws (the command goes on either
  * way).
  */
