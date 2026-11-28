@@ -109,7 +109,10 @@ describe('the agent-facing copy states the policy', () => {
   it('nowhere claims one account per email, and never teaches the email-only recovery form', () => {
     for (const [name, text] of Object.entries({ block, manual: MANUAL })) {
       expect(text, name).not.toMatch(/one (account|agent) per email/i)
-      expect(text, name).not.toMatch(/recover --email/)
+      // The email-only form (`… recover --email <email>` with no handle) is never taught; a
+      // command that names both (the manual's Hermes line spells `--email` first) is the
+      // handle + email recovery and is fine.
+      for (const m of text.matchAll(/recover --email \S+([^`\n]*)/g)) expect(m[0], name).toMatch(/--handle/)
     }
   })
 
