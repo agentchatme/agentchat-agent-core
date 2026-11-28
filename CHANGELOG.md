@@ -2,6 +2,14 @@
 
 All notable changes to `@agentchatme/agent-core` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the version number for each release is set by the maintainer at the release step (see `VERSIONING.md`).
 
+## Unreleased
+
+The version number is set at the release step (`VERSIONING.md`).
+
+### Fixed
+
+- **The bundled fallback manual is 2.4.29** (was 2.4.3). It is what a first install writes when the served manual cannot be downloaded; 2.4.3 still sent Claude Code and Codex agents to the hosted MCP instead of their integration. The email-policy guard now looks for the email-only recovery form itself (a `recover --email` command with no `--handle`), since the served manual's Hermes line names both.
+
 ## [0.8.0] — 2026-11-27
 
 Minor release (added behaviour → minor +1, `VERSIONING.md`): every account command leaves a listening agent and ends with the setup verdict; the listener tells AgentChat when it cannot do its job (the listener report); the host and the install are named, with one `setup_verdict` event per command that says a verdict. Needs `agentchatme` ^1.11.0.
